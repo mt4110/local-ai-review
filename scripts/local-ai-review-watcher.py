@@ -16,6 +16,7 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -89,6 +90,56 @@ def parse_bool(value: str, *, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise WatcherError(f"invalid boolean value: {value!r}")
+
+
+def env_key_is_valid(key: str) -> bool:
+    if not key:
+        return False
+    first = key[0]
+    if not (first == "_" or "A" <= first <= "Z" or "a" <= first <= "z"):
+        return False
+    return all(
+        char == "_" or "A" <= char <= "Z" or "a" <= char <= "z" or "0" <= char <= "9"
+        for char in key[1:]
+    )
+
+
+def parse_env_assignment(raw_line: str, *, lineno: int) -> tuple[str, str] | None:
+    stripped = raw_line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+
+    try:
+        tokens = shlex.split(raw_line, comments=True, posix=True)
+    except ValueError as exc:
+        raise WatcherError(f"invalid env file line {lineno}: {exc}") from exc
+
+    if not tokens:
+        return None
+    if tokens[0] == "export":
+        tokens = tokens[1:]
+
+    if len(tokens) != 1 or "=" not in tokens[0]:
+        raise WatcherError(f"invalid env file line {lineno}: expected KEY=value")
+
+    key, value = tokens[0].split("=", 1)
+    if not env_key_is_valid(key):
+        raise WatcherError(f"invalid env file line {lineno}: invalid key {key!r}")
+    return key, value
+
+
+def load_env_file(path: str) -> None:
+    expanded = os.path.expanduser(path)
+    try:
+        with open(expanded, encoding="utf-8") as handle:
+            for lineno, line in enumerate(handle, start=1):
+                assignment = parse_env_assignment(line, lineno=lineno)
+                if assignment is None:
+                    continue
+                key, value = assignment
+                os.environ.setdefault(key, value)
+    except OSError as exc:
+        raise WatcherError(f"failed to read env file {expanded!r}: {exc}") from exc
 
 
 def require_local_ollama_url(base_url: str) -> str:
@@ -785,6 +836,24 @@ def run_self_test() -> None:
     assert not verify_ed25519(public_key, b"x", signature)
     assert verify_discord_signature(public_key.hex(), signature.hex(), "", b"")
     assert not verify_discord_signature(public_key.hex(), signature.hex(), "1", b"")
+    assert parse_env_assignment("WATCH_REPOS=mt4110/local-ai-review", lineno=1) == (
+        "WATCH_REPOS",
+        "mt4110/local-ai-review",
+    )
+    assert parse_env_assignment('export OLLAMA_APP_NAME="Ollama"', lineno=1) == (
+        "OLLAMA_APP_NAME",
+        "Ollama",
+    )
+    assert parse_env_assignment("GITHUB_TOKEN=token # local secret", lineno=1) == (
+        "GITHUB_TOKEN",
+        "token",
+    )
+    try:
+        parse_env_assignment("BAD-NAME=value", lineno=1)
+    except WatcherError:
+        pass
+    else:
+        raise AssertionError("invalid env key was accepted")
 
     interaction = {
         "type": 2,
@@ -855,20 +924,43 @@ def run_self_test() -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Local AI review watcher")
+    env_parent = argparse.ArgumentParser(add_help=False)
+    env_parent.add_argument(
+        "--env-file",
+        default=argparse.SUPPRESS,
+        help="Load KEY=value settings from a local env file; process env values take precedence",
+    )
+
+    parser = argparse.ArgumentParser(
+        description="Local AI review watcher",
+        parents=[env_parent],
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    status = subparsers.add_parser("status", help="Report watcher, Ollama, and workflow status")
+    status = subparsers.add_parser(
+        "status",
+        parents=[env_parent],
+        help="Report watcher, Ollama, and workflow status",
+    )
     status.add_argument("--format", choices=("text", "json"), default="text")
 
-    wake = subparsers.add_parser("wake-if-down", help="Start Ollama only when it is down")
+    wake = subparsers.add_parser(
+        "wake-if-down",
+        parents=[env_parent],
+        help="Start Ollama only when it is down",
+    )
     wake.add_argument("--format", choices=("text", "json"), default="text")
 
     subparsers.add_parser(
         "serve-discord",
+        parents=[env_parent],
         help="Serve a Discord interactions endpoint for status and wake-if-down only",
     )
-    subparsers.add_parser("self-test", help="Run dependency-free watcher self tests")
+    subparsers.add_parser(
+        "self-test",
+        parents=[env_parent],
+        help="Run dependency-free watcher self tests",
+    )
 
     return parser.parse_args()
 
@@ -876,12 +968,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    if args.command == "self-test":
-        run_self_test()
-        print("OK: local AI review watcher self-test passed")
-        return 0
-
     try:
+        env_file = getattr(args, "env_file", None)
+        if env_file:
+            load_env_file(env_file)
+
+        if args.command == "self-test":
+            run_self_test()
+            print("OK: local AI review watcher self-test passed")
+            return 0
+
         config = load_config()
         if args.command == "status":
             result = collect_status(config)

@@ -25,8 +25,11 @@ Japanese version: [README.md](README.md)
 - `.github/workflows/local-llm-review.yml`: MVP GitHub Actions workflow.
 - `scripts/verify-workflow-policy.py`: static safety check for the workflow.
 - `scripts/local-ai-review-watcher.py`: watcher limited to `status` / `wake-if-down`.
+- `config/local-ai-review-watcher.env.example`: example local env file for the watcher.
+- `launchd/dev.local-ai-review.watcher.discord.plist.example`: launchd example for the Discord interactions endpoint.
 - `docs/local-llm-shutdown-runbook-en.md`: detailed runbook for stopping the local LLM.
 - `docs/local-llm-watcher-design-en.md`: watcher, Discord notification, and idle unload design.
+- `docs/local-llm-watcher-runtime-ops-en.md`: env file, Discord App, live status, and launchd operations.
 - `ai-review-infra-design/`: v0.1 design pack used as the implementation spec.
 
 ## Runner Setup
@@ -86,6 +89,15 @@ Local status:
 python3 scripts/local-ai-review-watcher.py status
 ```
 
+With an env file:
+
+```sh
+python3 scripts/local-ai-review-watcher.py status \
+  --env-file ~/.config/local-ai-review-watcher/env
+```
+
+The repo-local `.env` file can be used for manual local checks and is ignored by Git. For launchd operation, prefer `~/.config/local-ai-review-watcher/env` to reduce accidental commits.
+
 Wake Ollama only when it is down:
 
 ```sh
@@ -111,6 +123,8 @@ python3 scripts/local-ai-review-watcher.py serve-discord
 ```
 
 `DISCORD_ALLOWED_COMMANDS` fails startup if it contains anything other than `status` / `wake-if-down`. To include GitHub workflow state in `status`, set `WATCH_REPOS=owner/repo` and, if needed, `GITHUB_TOKEN` on the runner host.
+
+For production env file, Discord App slash command, launchd, and fail-closed checks, see [docs/local-llm-watcher-runtime-ops-en.md](docs/local-llm-watcher-runtime-ops-en.md).
 
 ## Usage
 
