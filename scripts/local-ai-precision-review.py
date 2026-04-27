@@ -398,13 +398,63 @@ def static_review(file_patch: FilePatch) -> tuple[list[Finding], list[WatchItem]
                 )
             )
 
+        uses_fixed_review_fence = (
+            posts_model_output
+            and "sanitize_review_output" in workflow_text
+            and "review_fence" in workflow_text
+            and re.search(r"return\s+f[\"']\{review_fence\}", added_text)
+        )
+        has_dynamic_review_fence = any(
+            token in workflow_text
+            for token in (
+                "_review_fence_for",
+                "safe_review_fence",
+                "longest_run",
+                "replace(review_fence",
+                "review_fence_for",
+            )
+        )
+        if uses_fixed_review_fence and not has_dynamic_review_fence:
+            line_no = next(
+                (
+                    candidate_line
+                    for candidate_line, candidate_text in lines
+                    if "def sanitize_review_output" in candidate_text
+                    or "{review_fence}text" in candidate_text
+                ),
+                None,
+            )
+            findings.append(
+                Finding(
+                    source="static",
+                    severity="P2",
+                    confidence="medium",
+                    path=path,
+                    line=line_no,
+                    title="Fixed Markdown fence can be escaped by model output",
+                    body=(
+                        "The sanitizer wraps untrusted model output in a fixed Markdown fence. "
+                        "If the model emits the same fence sequence, it can close the code block "
+                        "early and render the remainder as normal Markdown, partially defeating "
+                        "the attempt to make the automation comment inert."
+                    ),
+                    fix=(
+                        "Generate a fence longer than any run of the fence character in the "
+                        "escaped output, or neutralize occurrences of the fence sequence before wrapping."
+                    ),
+                )
+            )
+
         drops_http_status_from_failure_comment = (
             "def describe_error" in workflow_text
             and "urllib.error.httperror" in workflow_text
             and "error.code" in workflow_text
             and "failure_body" in workflow_text
             and re.search(r"return\s+message\b", added_text)
-            and not re.search(r"return\s+f[\"'].*\{error\.code\}", added_text)
+            and not re.search(
+                r"(?:return|message\s*=)\s+f[\"'].*\{error\.code\}",
+                added_text,
+            )
         )
         if drops_http_status_from_failure_comment:
             line_no = next(
@@ -462,6 +512,7 @@ Calibration from prior high-signal reviews:
 - Catch library/service paths that convert recoverable configuration errors into panics.
 - Catch hard-coded local service URLs in tests/helpers when a dummy valid value would work.
 - Catch untrusted AI/model output posted to GitHub comments without mention sanitization.
+- Catch fixed Markdown fences around untrusted model output; the model can emit the fence and escape the code block.
 - Catch workflow failure comments that drop HTTP status codes from HTTPError details.
 - Catch shell strict-mode traps, command substitution failures, and pipelines that keep scanning.
 - Catch config/env mismatches where docs/scripts/helpers use different variable names.
@@ -925,6 +976,28 @@ diff --git a/.github/workflows/local-llm-review.yml b/.github/workflows/local-ll
 +              f"- Error type: `{type(error).__name__}`\n"
 +              + f"- Error details: `{message}`\n"
 +          )
+diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-llm-review.yml
+--- /dev/null
++++ b/.github/workflows/fenced-llm-review.yml
+@@ -0,0 +1,20 @@
++on:
++  pull_request_target:
++    types: [labeled]
++permissions:
++  issues: write
++jobs:
++  review:
++    steps:
++      - run: |
++          review_fence = "~~~~~~~~~~~~"
++          def ollama_review(diff_text):
++              return call_ollama("/api/chat", diff_text)
++          def sanitize_review_output(review_text):
++              escaped = review_text.replace("@", "@\\u200b")
++              return f"{review_fence}text\n{escaped}\n{review_fence}"
++          review = ollama_review(diff)
++          body = header + sanitize_review_output(review)
++          post_or_update_comment(body)
 """
     files = parse_unified_diff(sample)
     findings: list[Finding] = []
@@ -938,6 +1011,7 @@ diff --git a/.github/workflows/local-llm-review.yml b/.github/workflows/local-ll
     assert "Library path now panics on configuration/setup failure" in titles
     assert "Lazy pool initialization can create duplicate pools under concurrency" in titles
     assert "Model output can trigger mentions from untrusted diff text" in titles
+    assert "Fixed Markdown fence can be escaped by model output" in titles
     assert "Failure comment drops HTTP status code" in titles
     assert any(item.title == "Local PostgreSQL URL is hard-coded in Rust code" for item in watch)
     print("OK: local AI precision review self-test passed")
