@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.local-ai-review.watcher.discord</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/YOU/dev/local-ai-review</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/YOU/dev/local-ai-review/scripts/local-ai-review-watcher.py</string>
+    <string>serve-discord</string>
+    <string>--env-file</string>
+    <string>/Users/YOU/.config/local-ai-review-watcher/env</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>/Users/YOU/Library/Logs/local-ai-review-watcher/discord.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOU/Library/Logs/local-ai-review-watcher/discord.err.log</string>
+</dict>
+</plist>
