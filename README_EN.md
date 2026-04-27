@@ -30,6 +30,7 @@ Japanese version: [README.md](README.md)
 - `docs/local-llm-shutdown-runbook-en.md`: detailed runbook for stopping the local LLM.
 - `docs/local-llm-watcher-design-en.md`: watcher, Discord notification, and idle unload design.
 - `docs/local-llm-watcher-runtime-ops-en.md`: env file, Discord App, live status, and launchd operations.
+- `docs/local-ai-precision-review.md`: file-by-file precision diff-only review workflow.
 - `ai-review-infra-design/`: v0.1 design pack used as the implementation spec.
 
 ## Runner Setup

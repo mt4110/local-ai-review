@@ -30,6 +30,7 @@ GitHub Actions の self-hosted runner で動かす、diff-only のローカル P
 - `docs/local-llm-shutdown-runbook.md`: ローカル LLM を止めるための詳細手順書。
 - `docs/local-llm-watcher-design.md`: 常時監視 watcher / Discord 通知 / idle unload の設計。
 - `docs/local-llm-watcher-runtime-ops.md`: env file、Discord App、live status、launchd の運用手順。
+- `docs/local-ai-precision-review.md`: file-by-file の高精度 diff-only review 手順。
 - `ai-review-infra-design/`: 実装仕様として使った v0.1 設計パック。
 
 ## Runner セットアップ
