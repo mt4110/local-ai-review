@@ -347,6 +347,95 @@ def static_review(file_patch: FilePatch) -> tuple[list[Finding], list[WatchItem]
             )
         )
 
+    if path.endswith((".yml", ".yaml")):
+        added_text = "\n".join(line for _, line in lines)
+        workflow_text = added_text.lower()
+        posts_model_output = (
+            "pull_request_target" in workflow_text
+            and "issues: write" in workflow_text
+            and ("ollama" in workflow_text or "/api/chat" in workflow_text)
+            and "post_or_update_comment" in workflow_text
+            and re.search(r"body\s*=.*review|review.*post_or_update_comment", added_text, re.DOTALL)
+        )
+        has_mention_sanitizer = any(
+            token in workflow_text
+            for token in (
+                "sanitize_model_output",
+                "sanitize_mentions",
+                "escape_mentions",
+                "\\u200b",
+                "zero width",
+                "zero-width",
+            )
+        )
+        if posts_model_output and not has_mention_sanitizer:
+            line_no = next(
+                (
+                    candidate_line
+                    for candidate_line, candidate_text in lines
+                    if "post_or_update_comment(body)" in candidate_text
+                ),
+                None,
+            )
+            findings.append(
+                Finding(
+                    source="static",
+                    severity="P2",
+                    confidence="medium",
+                    path=path,
+                    line=line_no,
+                    title="Model output can trigger mentions from untrusted diff text",
+                    body=(
+                        "The workflow sends an untrusted PR diff to a local model and posts the "
+                        "model response as a GitHub issue comment. A prompt-injected diff can ask "
+                        "the model to include @user or @team mentions, causing notification spam "
+                        "or social-engineering text to be posted by the automation account."
+                    ),
+                    fix=(
+                        "Sanitize model output before posting it, at minimum by escaping @ mentions "
+                        "with a zero-width separator or stripping mention-like tokens from the review body."
+                    ),
+                )
+            )
+
+        drops_http_status_from_failure_comment = (
+            "def describe_error" in workflow_text
+            and "urllib.error.httperror" in workflow_text
+            and "error.code" in workflow_text
+            and "failure_body" in workflow_text
+            and re.search(r"return\s+message\b", added_text)
+            and not re.search(r"return\s+f[\"'].*\{error\.code\}", added_text)
+        )
+        if drops_http_status_from_failure_comment:
+            line_no = next(
+                (
+                    candidate_line
+                    for candidate_line, candidate_text in lines
+                    if re.search(r"return\s+message\b", candidate_text)
+                ),
+                None,
+            )
+            findings.append(
+                Finding(
+                    source="static",
+                    severity="P3",
+                    confidence="medium",
+                    path=path,
+                    line=line_no,
+                    title="Failure comment drops HTTP status code",
+                    body=(
+                        "The workflow logs HTTPError.status via error.code, but returns only the "
+                        "response body for the PR failure comment. Auth, rate-limit, and service "
+                        "errors can have generic or empty bodies, so the user may see an HTTPError "
+                        "without the status needed to debug it."
+                    ),
+                    fix=(
+                        "Include the status code in the returned error details, for example "
+                        "`return f\"HTTP {error.code}: {message}\"`."
+                    ),
+                )
+            )
+
     return findings, watch
 
 
@@ -372,9 +461,14 @@ Calibration from prior high-signal reviews:
 - Catch API/schema drift, especially serde defaults that make public fields optional in OpenAPI.
 - Catch library/service paths that convert recoverable configuration errors into panics.
 - Catch hard-coded local service URLs in tests/helpers when a dummy valid value would work.
+- Catch untrusted AI/model output posted to GitHub comments without mention sanitization.
+- Catch workflow failure comments that drop HTTP status codes from HTTPError details.
 - Catch shell strict-mode traps, command substitution failures, and pipelines that keep scanning.
 - Catch config/env mismatches where docs/scripts/helpers use different variable names.
 - Catch runtime breakage from Docker read-only filesystems, missing tmpfs mounts, or non-root permissions.
+- Do not flag a local Ollama base URL or model name by itself; that is expected operator config.
+- Do not flag individual urlopen calls as unhandled when the diff shows a top-level failure handler.
+- Do not flag the default GitHub API URL when GITHUB_API_URL is available as an override.
 - Do not flag Docker COPY missing error handling; Docker build already fails when a source is missing.
 - Do not flag fixed container UIDs or /usr/local/bin PATH unless the diff shows a concrete permission/runtime break.
 - Catch tests that mock the behavior they are supposed to verify.
@@ -512,6 +606,10 @@ def calibrate_model_watch_item(path: str, item: dict[str, Any]) -> WatchItem | N
         "/usr/local/bin is in the path",
         "telemetry",
         "next_telemetry_disabled",
+        "ollama_base_url",
+        "local ollama instance",
+        "exactly at the limit",
+        "incomplete diffs",
     )
     if any(pattern in text for pattern in low_value_patterns):
         return None
@@ -565,6 +663,20 @@ def calibrate_model_finding(path: str, item: dict[str, Any]) -> tuple[Finding | 
         "postgres_pool_max_size",
         "dropped capabilities",
         "no-new-privileges",
+        "ollama service",
+        "hardcoded ollama",
+        "hard-coded ollama",
+        "model name",
+        "service unreachable",
+        "timeout handling",
+        "timeout exception",
+        "timeout exceptions",
+        "potential timeout",
+        "missing error handling for urllib",
+        "urlopen without a try",
+        "wrap the urllib.request.urlopen",
+        "hardcoded github api url",
+        "hard-coded github api url",
     )
     if any(pattern in text for pattern in watch_patterns):
         return None, WatchItem(
@@ -784,6 +896,35 @@ diff --git a/crates/storage-postgres/src/lib.rs b/crates/storage-postgres/src/li
 +pool: OnceLock<Pool>,
 +let created = self.pool_config.create_pool(Some(Runtime::Tokio1), NoTls)?;
 +self.pool.get_or_init(|| created)
+diff --git a/.github/workflows/local-llm-review.yml b/.github/workflows/local-llm-review.yml
+--- /dev/null
++++ b/.github/workflows/local-llm-review.yml
+@@ -0,0 +1,24 @@
++on:
++  pull_request_target:
++    types: [labeled]
++permissions:
++  issues: write
++jobs:
++  review:
++    steps:
++      - run: |
++          OLLAMA_BASE_URL=http://127.0.0.1:11434
++          def ollama_review(diff_text):
++              return call_ollama("/api/chat", diff_text)
++          review = ollama_review(diff)
++          body = header + review
++          post_or_update_comment(body)
++          def describe_error(error):
++              if isinstance(error, urllib.error.HTTPError):
++                  message = error.read().decode("utf-8", errors="replace")
++                  print(f"HTTP error: {error.code}\n{message}", file=sys.stderr)
++                  return message
++              return str(error)
++          failure_body = (
++              f"- Error type: `{type(error).__name__}`\n"
++              + f"- Error details: `{message}`\n"
++          )
 """
     files = parse_unified_diff(sample)
     findings: list[Finding] = []
@@ -796,6 +937,8 @@ diff --git a/crates/storage-postgres/src/lib.rs b/crates/storage-postgres/src/li
     assert "Non-optional public field may be generated as optional schema" in titles
     assert "Library path now panics on configuration/setup failure" in titles
     assert "Lazy pool initialization can create duplicate pools under concurrency" in titles
+    assert "Model output can trigger mentions from untrusted diff text" in titles
+    assert "Failure comment drops HTTP status code" in titles
     assert any(item.title == "Local PostgreSQL URL is hard-coded in Rust code" for item in watch)
     print("OK: local AI precision review self-test passed")
 
