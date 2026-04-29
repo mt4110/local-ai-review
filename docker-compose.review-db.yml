@@ -16,6 +16,6 @@ services:
       - "5000"
       - /data/${REVIEW_DB_FILE:-local-ai-review.db}
     ports:
-      - "${REVIEW_DB_PORT:-8003}:8001"
+      - "127.0.0.1:${REVIEW_DB_PORT:-8003}:8001"
     volumes:
       - ${REVIEW_DB_DIR:-./out/review-history}:/data:ro

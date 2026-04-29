@@ -20,20 +20,20 @@ precision-review:
 	@test -n "$(REPO)" || { echo "REPO=owner/name is required"; exit 2; }
 	@test -n "$(PR)" || { echo "PR=<number> is required"; exit 2; }
 	python3 scripts/local-ai-precision-review.py \
-		--repo $(REPO) \
-		--pr $(PR) \
-		--output $(REVIEW_REPORT) \
-		--db $(REVIEW_DB)
+		--repo "$(REPO)" \
+		--pr "$(PR)" \
+		--output "$(REVIEW_REPORT)" \
+		--db "$(REVIEW_DB)"
 
 precision-review-static:
 	@test -n "$(REPO)" || { echo "REPO=owner/name is required"; exit 2; }
 	@test -n "$(PR)" || { echo "PR=<number> is required"; exit 2; }
 	python3 scripts/local-ai-precision-review.py \
-		--repo $(REPO) \
-		--pr $(PR) \
+		--repo "$(REPO)" \
+		--pr "$(PR)" \
 		--max-model-files 0 \
-		--output $(REVIEW_REPORT) \
-		--db $(REVIEW_DB)
+		--output "$(REVIEW_REPORT)" \
+		--db "$(REVIEW_DB)"
 
 precision-review-self-test:
 	python3 scripts/local-ai-precision-review.py --self-test
@@ -76,25 +76,32 @@ pre-pr-review-static:
 		--db "$(REVIEW_DB)"
 
 review-db-init:
-	python3 scripts/local-ai-precision-review.py --init-db --db $(REVIEW_DB)
+	python3 scripts/local-ai-precision-review.py --init-db --db "$(REVIEW_DB)"
 
 review-db-stats: review-db-init
-	printf '.headers on\n.mode column\nSELECT id, created_at, repo, pr_number, model, findings_count, watch_items_count, ROUND(elapsed_seconds, 1) AS elapsed_s FROM review_run_summary ORDER BY id DESC LIMIT 10;\n' | sqlite3 $(REVIEW_DB)
+	printf '.headers on\n.mode column\nSELECT id, created_at, repo, pr_number, model, findings_count, watch_items_count, ROUND(elapsed_seconds, 1) AS elapsed_s FROM review_run_summary ORDER BY id DESC LIMIT 10;\n' | sqlite3 "$(REVIEW_DB)"
 
 review-db-up: review-db-init
-	REVIEW_DB_DIR=$(abspath $(dir $(REVIEW_DB))) \
-	REVIEW_DB_FILE=$(notdir $(REVIEW_DB)) \
-	REVIEW_DB_PORT=$(SQLITE_BROWSER_PORT) \
+	REVIEW_DB_DIR="$(abspath $(dir $(REVIEW_DB)))" \
+	REVIEW_DB_FILE="$(notdir $(REVIEW_DB))" \
+	REVIEW_DB_PORT="$(SQLITE_BROWSER_PORT)" \
 	docker compose -f docker-compose.review-db.yml up -d --build
 
 review-db-web: review-db-up
-	@echo "DB browser: http://127.0.0.1:$(SQLITE_BROWSER_PORT)"
-	@open http://127.0.0.1:$(SQLITE_BROWSER_PORT)
+	@url="http://127.0.0.1:$(SQLITE_BROWSER_PORT)"; \
+	echo "DB browser: $$url"; \
+	if [ "$$(uname -s)" = "Darwin" ] && command -v open >/dev/null 2>&1; then \
+		open "$$url"; \
+	elif command -v xdg-open >/dev/null 2>&1; then \
+		xdg-open "$$url" >/dev/null 2>&1; \
+	else \
+		echo "No supported browser opener found; open the URL manually."; \
+	fi
 
 review-db-down:
-	REVIEW_DB_DIR=$(abspath $(dir $(REVIEW_DB))) \
-	REVIEW_DB_FILE=$(notdir $(REVIEW_DB)) \
-	REVIEW_DB_PORT=$(SQLITE_BROWSER_PORT) \
+	REVIEW_DB_DIR="$(abspath $(dir $(REVIEW_DB)))" \
+	REVIEW_DB_FILE="$(notdir $(REVIEW_DB))" \
+	REVIEW_DB_PORT="$(SQLITE_BROWSER_PORT)" \
 	docker compose -f docker-compose.review-db.yml down
 
 review-db-score: review-db-init

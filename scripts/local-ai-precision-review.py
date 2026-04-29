@@ -19,8 +19,10 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 
 DEFAULT_MODEL = "qwen3-coder:30b-a3b-q4_K_M"
@@ -177,12 +179,6 @@ def init_db(db_path: str) -> Path:
     return resolved
 
 
-def maybe_path_text(value: str | None) -> str | None:
-    if not value:
-        return None
-    return str(resolve_path(value))
-
-
 def run(cmd: list[str]) -> str:
     completed = subprocess.run(cmd, check=True, capture_output=True, text=True)
     return completed.stdout
@@ -218,6 +214,25 @@ def github_request(path: str, token: str, *, accept: str = "application/vnd.gith
         return json.loads(raw.decode("utf-8"))
 
 
+def github_paginated_request(
+    path: str,
+    token: str,
+    *,
+    accept: str = "application/vnd.github+json",
+) -> list[Any]:
+    items: list[Any] = []
+    page = 1
+    separator = "&" if "?" in path else "?"
+    while True:
+        payload = github_request(f"{path}{separator}per_page=100&page={page}", token, accept=accept)
+        if not isinstance(payload, list):
+            return items
+        items.extend(payload)
+        if len(payload) < 100:
+            return items
+        page += 1
+
+
 def github_json_method(
     path: str,
     token: str,
@@ -247,6 +262,31 @@ def split_repo(value: str) -> tuple[str, str]:
         raise SystemExit("--repo must be owner/name")
     owner, repo = value.split("/", 1)
     return owner, repo
+
+
+def is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def validate_ollama_base_url(value: str, *, allow_remote: bool) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise SystemExit("--ollama-base-url must be an http(s) URL with a host")
+    if parsed.username or parsed.password:
+        raise SystemExit("--ollama-base-url must not include credentials")
+    if parsed.params or parsed.query or parsed.fragment:
+        raise SystemExit("--ollama-base-url must not include params, query, or fragment")
+    if not allow_remote and not is_loopback_host(parsed.hostname):
+        raise SystemExit(
+            "--ollama-base-url must point to localhost or a loopback address; "
+            "pass --allow-remote-ollama only for an explicitly trusted remote endpoint"
+        )
+    return value.rstrip("/")
 
 
 def parse_unified_diff(diff_text: str) -> list[FilePatch]:
@@ -709,7 +749,7 @@ def ollama_chat(
     return payload.get("message", {}).get("content", "")
 
 
-def parse_model_json(raw: str) -> dict[str, Any]:
+def parse_model_json(raw: str) -> Any:
     raw = raw.strip()
     try:
         return json.loads(raw)
@@ -739,6 +779,16 @@ def model_review_file(args: argparse.Namespace, file_patch: FilePatch) -> tuple[
                 path=file_patch.path,
                 title="Model response was not parseable JSON",
                 body=f"{exc.__class__.__name__}: {exc}",
+                verification=raw[:1000],
+            )
+        ]
+    if not isinstance(payload, dict):
+        return [], [
+            WatchItem(
+                source="model",
+                path=file_patch.path,
+                title="Model JSON root was not an object",
+                body=f"Expected an object root, got {type(payload).__name__}.",
                 verification=raw[:1000],
             )
         ]
@@ -1079,10 +1129,8 @@ def persist_review_run(
 
 def fetch_existing_review_comments(owner: str, repo: str, pr_number: int, token: str) -> list[dict[str, Any]]:
     try:
-        comments = github_request(f"/repos/{owner}/{repo}/pulls/{pr_number}/comments", token)
+        comments = github_paginated_request(f"/repos/{owner}/{repo}/pulls/{pr_number}/comments", token)
     except Exception:  # noqa: BLE001 - comparison is best-effort only.
-        return []
-    if not isinstance(comments, list):
         return []
     return [
         {
@@ -1093,7 +1141,6 @@ def fetch_existing_review_comments(owner: str, repo: str, pr_number: int, token:
         }
         for comment in comments
         if isinstance(comment, dict)
-        and "copilot" in (comment.get("user") or {}).get("login", "").lower()
     ]
 
 
@@ -1175,13 +1222,12 @@ def render_report(
 
 
 def post_or_update_comment(owner: str, repo: str, pr_number: int, token: str, body: str) -> None:
-    comments = github_request(f"/repos/{owner}/{repo}/issues/{pr_number}/comments?per_page=100", token)
+    comments = github_paginated_request(f"/repos/{owner}/{repo}/issues/{pr_number}/comments", token)
     existing = None
-    if isinstance(comments, list):
-        for comment in comments:
-            if MARKER in str(comment.get("body", "")):
-                existing = comment
-                break
+    for comment in comments:
+        if isinstance(comment, dict) and MARKER in str(comment.get("body", "")):
+            existing = comment
+            break
     if existing:
         github_json_method(
             f"/repos/{owner}/{repo}/issues/comments/{existing['id']}",
@@ -1199,6 +1245,17 @@ def post_or_update_comment(owner: str, repo: str, pr_number: int, token: str, bo
 
 
 def self_test() -> None:
+    assert parse_model_json("[]") == []
+    assert validate_ollama_base_url("http://127.0.0.1:11434", allow_remote=False) == (
+        "http://127.0.0.1:11434"
+    )
+    try:
+        validate_ollama_base_url("http://example.com:11434", allow_remote=False)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("remote Ollama URL should require an explicit override")
+
     sample = """diff --git a/crates/api-contracts/src/lib.rs b/crates/api-contracts/src/lib.rs
 --- a/crates/api-contracts/src/lib.rs
 +++ b/crates/api-contracts/src/lib.rs
@@ -1292,6 +1349,11 @@ def main() -> None:
     parser.add_argument("--diff-file", help="Review an existing diff file instead of fetching GitHub")
     parser.add_argument("--model", default=os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL))
     parser.add_argument("--ollama-base-url", default=os.environ.get("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL))
+    parser.add_argument(
+        "--allow-remote-ollama",
+        action="store_true",
+        help="Allow a non-loopback Ollama endpoint. Use only with an explicitly trusted host.",
+    )
     parser.add_argument("--ollama-num-ctx", type=int, default=int(os.environ.get("OLLAMA_NUM_CTX", "32768")))
     parser.add_argument("--ollama-timeout-seconds", type=int, default=int(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "1200")))
     parser.add_argument("--temperature", type=float, default=0.1)
@@ -1316,15 +1378,20 @@ def main() -> None:
         return
     if not args.diff_file and (not args.repo or not args.pr):
         raise SystemExit("--repo and --pr are required unless --diff-file is used")
+    args.ollama_base_url = validate_ollama_base_url(
+        args.ollama_base_url,
+        allow_remote=args.allow_remote_ollama,
+    )
 
     token = github_token() if args.repo and not args.diff_file else ""
     if args.diff_file:
         repo = args.repo or "local/diff"
         pr_number = args.pr or 0
-        diff_text = open(args.diff_file, encoding="utf-8", errors="replace").read()
+        diff_path = resolve_path(args.diff_file)
+        diff_text = diff_path.read_text(encoding="utf-8", errors="replace")
         owner = ""
         repo_name = ""
-        diff_source = maybe_path_text(args.diff_file) or args.diff_file
+        diff_source = str(diff_path)
     else:
         owner, repo_name = split_repo(args.repo)
         repo = args.repo
