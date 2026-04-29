@@ -28,7 +28,7 @@ from urllib.parse import urlparse
 DEFAULT_MODEL = "qwen3-coder:30b-a3b-q4_K_M"
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_DB_PATH = "out/review-history/local-ai-review.db"
-GITHUB_API = "https://api.github.com"
+GITHUB_API = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
 MARKER = "<!-- local-ai-precision-review -->"
 MAX_COMMENT_BYTES = 60000
 DB_SCHEMA = """
@@ -287,6 +287,10 @@ def validate_ollama_base_url(value: str, *, allow_remote: bool) -> str:
             "pass --allow-remote-ollama only for an explicitly trusted remote endpoint"
         )
     return value.rstrip("/")
+
+
+def neutralize_mentions(value: Any) -> str:
+    return re.sub(r"@(?=[A-Za-z0-9_-])", "@" + "\u200b", str(value))
 
 
 def parse_unified_diff(diff_text: str) -> list[FilePatch]:
@@ -1180,12 +1184,12 @@ def render_report(
             location = finding.path if finding.line is None else f"{finding.path}:{finding.line}"
             lines.extend(
                 [
-                    f"{index}. **[{finding.severity}] {finding.title}**",
+                    f"{index}. **[{finding.severity}] {neutralize_mentions(finding.title)}**",
                     f"   - Location: `{location}`",
                     f"   - Confidence: `{finding.confidence}`",
                     f"   - Source: `{finding.source}`",
-                    f"   - Why: {finding.body}",
-                    f"   - Fix: {finding.fix}",
+                    f"   - Why: {neutralize_mentions(finding.body)}",
+                    f"   - Fix: {neutralize_mentions(finding.fix)}",
                 ]
             )
     lines.extend(["", "## Watch Items", ""])
@@ -1195,15 +1199,15 @@ def render_report(
         for item in watch_items[:20]:
             lines.extend(
                 [
-                    f"- **{item.path}: {item.title}**",
-                    f"  {item.body}",
-                    f"  Verify: {item.verification}",
+                    f"- **{item.path}: {neutralize_mentions(item.title)}**",
+                    f"  {neutralize_mentions(item.body)}",
+                    f"  Verify: {neutralize_mentions(item.verification)}",
                 ]
             )
     if existing_comments:
         lines.extend(["", "## Existing Review Comments", ""])
         for comment in existing_comments[:20]:
-            body = " ".join(str(comment["body"]).split())[:240]
+            body = " ".join(neutralize_mentions(comment["body"]).split())[:240]
             location = comment["path"] if comment["line"] is None else f"{comment['path']}:{comment['line']}"
             lines.append(f"- `{comment['user']}` at `{location}`: {body}")
     lines.extend(["", "## Reviewed Files", ""])
@@ -1246,6 +1250,7 @@ def post_or_update_comment(owner: str, repo: str, pr_number: int, token: str, bo
 
 def self_test() -> None:
     assert parse_model_json("[]") == []
+    assert neutralize_mentions("@team ping") == "@" + "\u200b" + "team ping"
     assert validate_ollama_base_url("http://127.0.0.1:11434", allow_remote=False) == (
         "http://127.0.0.1:11434"
     )
@@ -1378,6 +1383,8 @@ def main() -> None:
         return
     if not args.diff_file and (not args.repo or not args.pr):
         raise SystemExit("--repo and --pr are required unless --diff-file is used")
+    if args.diff_file and args.post_comment:
+        raise SystemExit("--post-comment cannot be used with --diff-file; review a PR directly to post comments")
     args.ollama_base_url = validate_ollama_base_url(
         args.ollama_base_url,
         allow_remote=args.allow_remote_ollama,
