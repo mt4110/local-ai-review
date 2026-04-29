@@ -16,6 +16,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -293,6 +294,14 @@ def neutralize_mentions(value: Any) -> str:
     return re.sub(r"@(?=[A-Za-z0-9_-])", "@" + "\u200b", str(value))
 
 
+def is_new_file_header(line: str) -> bool:
+    return line.startswith("+++ b/") or line == "+++ /dev/null"
+
+
+def is_old_file_header(line: str) -> bool:
+    return line.startswith("--- a/") or line == "--- /dev/null"
+
+
 def parse_unified_diff(diff_text: str) -> list[FilePatch]:
     files: list[FilePatch] = []
     current: list[str] = []
@@ -307,12 +316,12 @@ def parse_unified_diff(diff_text: str) -> list[FilePatch]:
         additions = sum(
             1
             for line in current
-            if line.startswith("+") and not line.startswith("+++")
+            if line.startswith("+") and not is_new_file_header(line)
         )
         deletions = sum(
             1
             for line in current
-            if line.startswith("-") and not line.startswith("---")
+            if line.startswith("-") and not is_old_file_header(line)
         )
         files.append(
             FilePatch(
@@ -354,7 +363,7 @@ def added_lines(file_patch: FilePatch) -> list[tuple[int | None, str]]:
         if hunk:
             new_line = int(hunk.group(1))
             continue
-        if raw.startswith("+++") or raw.startswith("---"):
+        if is_new_file_header(raw) or is_old_file_header(raw):
             continue
         if raw.startswith("+"):
             lines.append((new_line, raw[1:]))
@@ -1261,6 +1270,19 @@ def self_test() -> None:
     else:
         raise AssertionError("remote Ollama URL should require an explicit override")
 
+    edge = parse_unified_diff(
+        """diff --git a/example.txt b/example.txt
+--- a/example.txt
++++ b/example.txt
+@@ -1,2 +1,2 @@
+---- removed heading
+++++ added heading
+"""
+    )
+    assert edge[0].additions == 1
+    assert edge[0].deletions == 1
+    assert added_lines(edge[0]) == [(1, "+++ added heading")]
+
     sample = """diff --git a/crates/api-contracts/src/lib.rs b/crates/api-contracts/src/lib.rs
 --- a/crates/api-contracts/src/lib.rs
 +++ b/crates/api-contracts/src/lib.rs
@@ -1344,6 +1366,25 @@ diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-
     assert "Fixed Markdown fence can be escaped by model output" in titles
     assert "Failure comment drops HTTP status code" in titles
     assert any(item.title == "Local PostgreSQL URL is hard-coded in Rust code" for item in watch)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        persist_review_run(
+            str(Path(temp_dir) / "review.db"),
+            repo="self/test",
+            pr_number=1,
+            diff_source="self_test",
+            model=DEFAULT_MODEL,
+            ollama_base_url=DEFAULT_OLLAMA_BASE_URL,
+            diff_bytes=len(sample.encode("utf-8")),
+            files=files,
+            reviewed_files=[files[0].path],
+            findings=findings[:1],
+            watch_items=watch[:1],
+            existing_comments=[],
+            elapsed=0.0,
+            output_path=None,
+            post_comment_requested=False,
+            report="self test",
+        )
     print("OK: local AI precision review self-test passed")
 
 
