@@ -1,0 +1,21 @@
+services:
+  review-db:
+    build:
+      context: .
+      dockerfile: docker/review-db/Dockerfile
+    command:
+      - -h
+      - 0.0.0.0
+      - -p
+      - "8001"
+      - --setting
+      - default_page_size
+      - "50"
+      - --setting
+      - sql_time_limit_ms
+      - "5000"
+      - /data/${REVIEW_DB_FILE:-local-ai-review.db}
+    ports:
+      - "${REVIEW_DB_PORT:-8003}:8001"
+    volumes:
+      - ${REVIEW_DB_DIR:-./out/review-history}:/data:ro

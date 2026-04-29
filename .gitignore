@@ -2,3 +2,6 @@
 .env.local
 .env.*.local
 .private_docs/
+out/
+__pycache__/
+scripts/__pycache__/

@@ -13,19 +13,126 @@ import dataclasses
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 
 DEFAULT_MODEL = "qwen3-coder:30b-a3b-q4_K_M"
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+DEFAULT_DB_PATH = "out/review-history/local-ai-review.db"
 GITHUB_API = "https://api.github.com"
 MARKER = "<!-- local-ai-precision-review -->"
 MAX_COMMENT_BYTES = 60000
+DB_SCHEMA = """
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS review_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    review_kind TEXT NOT NULL DEFAULT 'precision',
+    repo TEXT NOT NULL,
+    pr_number INTEGER,
+    diff_source TEXT NOT NULL,
+    model TEXT NOT NULL,
+    ollama_base_url TEXT NOT NULL,
+    diff_bytes INTEGER NOT NULL,
+    changed_files INTEGER NOT NULL,
+    reviewed_files_count INTEGER NOT NULL,
+    findings_count INTEGER NOT NULL,
+    watch_items_count INTEGER NOT NULL,
+    static_findings_count INTEGER NOT NULL,
+    model_findings_count INTEGER NOT NULL,
+    static_watch_items_count INTEGER NOT NULL,
+    model_watch_items_count INTEGER NOT NULL,
+    existing_review_comments_count INTEGER NOT NULL,
+    elapsed_seconds REAL NOT NULL,
+    output_path TEXT,
+    post_comment_requested INTEGER NOT NULL DEFAULT 0,
+    report_markdown TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS reviewed_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES review_runs(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    path TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS findings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES review_runs(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    confidence TEXT NOT NULL,
+    path TEXT NOT NULL,
+    line INTEGER,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    fix TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS watch_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES review_runs(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    path TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    verification TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS run_feedback (
+    run_id INTEGER PRIMARY KEY REFERENCES review_runs(id) ON DELETE CASCADE,
+    useful_findings_fixed INTEGER,
+    false_positives INTEGER,
+    unclear_findings INTEGER,
+    would_request_remote_review_now INTEGER,
+    remote_findings_count INTEGER,
+    note TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE VIEW IF NOT EXISTS review_run_summary AS
+SELECT
+    runs.id,
+    runs.created_at,
+    runs.review_kind,
+    runs.repo,
+    runs.pr_number,
+    runs.diff_source,
+    runs.model,
+    runs.diff_bytes,
+    runs.changed_files,
+    runs.reviewed_files_count,
+    runs.findings_count,
+    runs.watch_items_count,
+    runs.static_findings_count,
+    runs.model_findings_count,
+    runs.static_watch_items_count,
+    runs.model_watch_items_count,
+    runs.existing_review_comments_count,
+    runs.elapsed_seconds,
+    runs.output_path,
+    runs.post_comment_requested,
+    feedback.useful_findings_fixed,
+    feedback.false_positives,
+    feedback.unclear_findings,
+    feedback.would_request_remote_review_now,
+    feedback.remote_findings_count,
+    feedback.note,
+    feedback.updated_at
+FROM review_runs AS runs
+LEFT JOIN run_feedback AS feedback
+ON feedback.run_id = runs.id;
+"""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -56,6 +163,24 @@ class WatchItem:
     title: str
     body: str
     verification: str
+
+
+def resolve_path(value: str) -> Path:
+    return Path(value).expanduser().resolve()
+
+
+def init_db(db_path: str) -> Path:
+    resolved = resolve_path(db_path)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(resolved) as connection:
+        connection.executescript(DB_SCHEMA)
+    return resolved
+
+
+def maybe_path_text(value: str | None) -> str | None:
+    if not value:
+        return None
+    return str(resolve_path(value))
 
 
 def run(cmd: list[str]) -> str:
@@ -809,6 +934,149 @@ def dedupe_findings(findings: list[Finding]) -> list[Finding]:
     return result
 
 
+def persist_review_run(
+    db_path: str,
+    *,
+    repo: str,
+    pr_number: int,
+    diff_source: str,
+    model: str,
+    ollama_base_url: str,
+    diff_bytes: int,
+    files: list[FilePatch],
+    reviewed_files: list[str],
+    findings: list[Finding],
+    watch_items: list[WatchItem],
+    existing_comments: list[dict[str, Any]],
+    elapsed: float,
+    output_path: str | None,
+    post_comment_requested: bool,
+    report: str,
+) -> tuple[Path, int]:
+    resolved = init_db(db_path)
+    static_findings_count = sum(1 for item in findings if item.source == "static")
+    model_findings_count = sum(1 for item in findings if item.source == "model")
+    static_watch_items_count = sum(1 for item in watch_items if item.source == "static")
+    model_watch_items_count = sum(1 for item in watch_items if item.source == "model")
+
+    with sqlite3.connect(resolved) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        cursor = connection.execute(
+            """
+            INSERT INTO review_runs (
+                repo,
+                pr_number,
+                diff_source,
+                model,
+                ollama_base_url,
+                diff_bytes,
+                changed_files,
+                reviewed_files_count,
+                findings_count,
+                watch_items_count,
+                static_findings_count,
+                model_findings_count,
+                static_watch_items_count,
+                model_watch_items_count,
+                existing_review_comments_count,
+                elapsed_seconds,
+                output_path,
+                post_comment_requested,
+                report_markdown
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                repo,
+                pr_number,
+                diff_source,
+                model,
+                ollama_base_url,
+                diff_bytes,
+                len(files),
+                len(reviewed_files),
+                len(findings),
+                len(watch_items),
+                static_findings_count,
+                model_findings_count,
+                static_watch_items_count,
+                model_watch_items_count,
+                len(existing_comments),
+                elapsed,
+                output_path,
+                int(post_comment_requested),
+                report,
+            ),
+        )
+        run_id = int(cursor.lastrowid)
+        connection.executemany(
+            """
+            INSERT INTO reviewed_files (run_id, ordinal, path)
+            VALUES (?, ?, ?)
+            """,
+            [
+                (run_id, ordinal, path)
+                for ordinal, path in enumerate(reviewed_files, start=1)
+            ],
+        )
+        connection.executemany(
+            """
+            INSERT INTO findings (
+                run_id,
+                ordinal,
+                source,
+                severity,
+                confidence,
+                path,
+                line,
+                title,
+                body,
+                fix
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    run_id,
+                    ordinal,
+                    item.source,
+                    item.severity,
+                    item.confidence,
+                    item.path,
+                    item.line,
+                    item.title,
+                    item.body,
+                    item.fix,
+                )
+                for ordinal, item in enumerate(findings, start=1)
+            ],
+        )
+        connection.executemany(
+            """
+            INSERT INTO watch_items (
+                run_id,
+                ordinal,
+                source,
+                path,
+                title,
+                body,
+                verification
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    run_id,
+                    ordinal,
+                    item.source,
+                    item.path,
+                    item.title,
+                    item.body,
+                    item.verification,
+                )
+                for ordinal, item in enumerate(watch_items, start=1)
+            ],
+        )
+    return resolved, run_id
+
+
 def fetch_existing_review_comments(owner: str, repo: str, pr_number: int, token: str) -> list[dict[str, Any]]:
     try:
         comments = github_request(f"/repos/{owner}/{repo}/pulls/{pr_number}/comments", token)
@@ -1033,22 +1301,30 @@ def main() -> None:
     parser.add_argument("--max-findings-per-file", type=int, default=4)
     parser.add_argument("--post-comment", action="store_true")
     parser.add_argument("--output", help="Write report to a file")
+    parser.add_argument("--db", default=os.environ.get("LOCAL_AI_REVIEW_DB", DEFAULT_DB_PATH))
+    parser.add_argument("--skip-db", action="store_true", help="Do not persist the run into SQLite")
+    parser.add_argument("--init-db", action="store_true", help="Create the SQLite history file and exit")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
     if args.self_test:
         self_test()
         return
+    if args.init_db:
+        db_path = init_db(args.db)
+        print(f"OK: initialized review history DB at {db_path}")
+        return
     if not args.diff_file and (not args.repo or not args.pr):
         raise SystemExit("--repo and --pr are required unless --diff-file is used")
 
-    token = github_token() if args.repo else ""
+    token = github_token() if args.repo and not args.diff_file else ""
     if args.diff_file:
         repo = args.repo or "local/diff"
         pr_number = args.pr or 0
         diff_text = open(args.diff_file, encoding="utf-8", errors="replace").read()
         owner = ""
         repo_name = ""
+        diff_source = maybe_path_text(args.diff_file) or args.diff_file
     else:
         owner, repo_name = split_repo(args.repo)
         repo = args.repo
@@ -1058,6 +1334,7 @@ def main() -> None:
             token,
             accept="application/vnd.github.v3.diff",
         )
+        diff_source = "pull_request"
 
     started = time.time()
     diff_bytes = len(diff_text.encode("utf-8"))
@@ -1088,12 +1365,13 @@ def main() -> None:
     existing_comments: list[dict[str, Any]] = []
     if owner and repo_name:
         existing_comments = fetch_existing_review_comments(owner, repo_name, pr_number, token)
+    elapsed = round(time.time() - started, 1)
     report = render_report(
         repo=repo,
         pr_number=pr_number,
         model=args.model,
         diff_bytes=diff_bytes,
-        elapsed=round(time.time() - started, 1),
+        elapsed=elapsed,
         files=files,
         reviewed_files=reviewed_files,
         findings=findings,
@@ -1101,8 +1379,35 @@ def main() -> None:
         existing_comments=existing_comments,
     )
     if args.output:
-        with open(args.output, "w", encoding="utf-8") as handle:
-            handle.write(report)
+        output_path = resolve_path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(report, encoding="utf-8")
+    else:
+        output_path = None
+
+    if not args.skip_db:
+        saved_db_path, run_id = persist_review_run(
+            args.db,
+            repo=repo,
+            pr_number=pr_number,
+            diff_source=diff_source,
+            model=args.model,
+            ollama_base_url=args.ollama_base_url,
+            diff_bytes=diff_bytes,
+            files=files,
+            reviewed_files=reviewed_files,
+            findings=findings,
+            watch_items=watch_items,
+            existing_comments=existing_comments,
+            elapsed=elapsed,
+            output_path=str(output_path) if output_path else None,
+            post_comment_requested=args.post_comment,
+            report=report,
+        )
+        print(
+            f"OK: saved review run to {saved_db_path} (run_id={run_id})",
+            file=sys.stderr,
+        )
     print(report)
     if args.post_comment:
         if not owner or not repo_name:

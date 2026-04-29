@@ -31,6 +31,8 @@ GitHub Actions の self-hosted runner で動かす、diff-only のローカル P
 - `docs/local-llm-watcher-design.md`: 常時監視 watcher / Discord 通知 / idle unload の設計。
 - `docs/local-llm-watcher-runtime-ops.md`: env file、Discord App、live status、launchd の運用手順。
 - `docs/local-ai-precision-review.md`: file-by-file の高精度 diff-only review 手順。
+- `sql/review-history-example-queries.sql`: SQLite に保存した review 結果を評価するための SQL 例。
+- `docker-compose.review-db.yml`: review history をブラウザで見る Datasette 用 compose。
 - `ai-review-infra-design/`: 実装仕様として使った v0.1 設計パック。
 
 ## Runner セットアップ
@@ -146,6 +148,22 @@ PR コメントは以下の marker で識別します。
 ```
 
 `github-actions[bot]` が投稿した marker 付きコメントが既にある場合は、そのコメントを更新します。存在しない場合だけ新規コメントを作成します。
+
+precision review の評価データを SQLite に溜める場合は、以下を使います。
+
+```sh
+make pre-pr-review \
+  REPO=mt4110/geo-line-ranker \
+  PROJECT_DIR=/absolute/path/to/geo-line-ranker \
+  BASE=main
+make review-db-init
+make review-db-stats
+make review-db-web
+make review-db-score RUN=6 USEFUL=0 FALSE_POSITIVES=0 UNCLEAR=1 REMOTE_READY=yes NOTE='Static-only looked clean enough for PR.'
+make review-db-down
+```
+
+`make review-db-web` は Datasette を Docker でバックグラウンド起動し、`http://127.0.0.1:8003` を開きます。Datasette のデフォルトは `8001` なので、この repository では衝突を避けて `8003` にしています。停止は `make review-db-down` です。Datasette は read-only で立てているため、手動採点は `make review-db-score ...` で入れます。手元の DB client を使いたい場合は `out/review-history/local-ai-review.db` を DBeaver で開けます。
 
 ## テスト手順
 
