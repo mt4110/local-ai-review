@@ -2,8 +2,11 @@
 SELECT
   id,
   created_at,
+  review_kind,
   repo,
   pr_number,
+  base_ref,
+  head_ref,
   model,
   findings_count,
   watch_items_count,
@@ -24,14 +27,32 @@ ORDER BY source, severity;
 -- Repo and model level health
 SELECT
   repo,
+  review_kind,
   model,
   COUNT(*) AS runs,
   ROUND(AVG(elapsed_seconds), 1) AS avg_elapsed_s,
   ROUND(AVG(findings_count), 2) AS avg_findings,
   ROUND(AVG(watch_items_count), 2) AS avg_watch_items
 FROM review_run_summary
-GROUP BY repo, model
-ORDER BY runs DESC, repo, model;
+GROUP BY repo, review_kind, model
+ORDER BY runs DESC, repo, review_kind, model;
+
+-- Pre-PR runs waiting for later manual scoring
+SELECT
+  id,
+  created_at,
+  repo,
+  base_ref,
+  head_ref,
+  SUBSTR(head_sha, 1, 12) AS head_sha,
+  working_tree_included,
+  findings_count,
+  watch_items_count
+FROM review_run_summary
+WHERE review_kind = 'pre_pr'
+  AND useful_findings_fixed IS NULL
+ORDER BY id DESC
+LIMIT 20;
 
 -- Record your own evaluation for a run after remote review lands
 INSERT INTO run_feedback (

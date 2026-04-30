@@ -42,6 +42,10 @@ CREATE TABLE IF NOT EXISTS review_runs (
     repo TEXT NOT NULL,
     pr_number INTEGER,
     diff_source TEXT NOT NULL,
+    base_ref TEXT NOT NULL DEFAULT '',
+    head_ref TEXT NOT NULL DEFAULT '',
+    head_sha TEXT NOT NULL DEFAULT '',
+    working_tree_included INTEGER NOT NULL DEFAULT 0,
     model TEXT NOT NULL,
     ollama_base_url TEXT NOT NULL,
     diff_bytes INTEGER NOT NULL,
@@ -102,8 +106,11 @@ CREATE TABLE IF NOT EXISTS run_feedback (
     note TEXT,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+"""
 
-CREATE VIEW IF NOT EXISTS review_run_summary AS
+
+REVIEW_RUN_SUMMARY_VIEW_SQL = """
+CREATE VIEW review_run_summary AS
 SELECT
     runs.id,
     runs.created_at,
@@ -111,6 +118,10 @@ SELECT
     runs.repo,
     runs.pr_number,
     runs.diff_source,
+    runs.base_ref,
+    runs.head_ref,
+    runs.head_sha,
+    runs.working_tree_included,
     runs.model,
     runs.diff_bytes,
     runs.changed_files,
@@ -136,6 +147,17 @@ FROM review_runs AS runs
 LEFT JOIN run_feedback AS feedback
 ON feedback.run_id = runs.id;
 """
+
+
+REVIEW_RUNS_COLUMN_MIGRATIONS = (
+    ("base_ref", "ALTER TABLE review_runs ADD COLUMN base_ref TEXT NOT NULL DEFAULT ''"),
+    ("head_ref", "ALTER TABLE review_runs ADD COLUMN head_ref TEXT NOT NULL DEFAULT ''"),
+    ("head_sha", "ALTER TABLE review_runs ADD COLUMN head_sha TEXT NOT NULL DEFAULT ''"),
+    (
+        "working_tree_included",
+        "ALTER TABLE review_runs ADD COLUMN working_tree_included INTEGER NOT NULL DEFAULT 0",
+    ),
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -172,11 +194,46 @@ def resolve_path(value: str) -> Path:
     return Path(value).expanduser().resolve()
 
 
+def normalize_sql_definition(sql: str) -> str:
+    return re.sub(r"\s+", " ", sql).strip().rstrip(";")
+
+
+def review_run_summary_view_needs_rebuild(connection: sqlite3.Connection) -> bool:
+    row = connection.execute(
+        """
+        SELECT sql
+        FROM sqlite_master
+        WHERE type = 'view' AND name = 'review_run_summary'
+        """
+    ).fetchone()
+    if row is None or row[0] is None:
+        return True
+    current_sql = normalize_sql_definition(str(row[0]))
+    expected_sql = normalize_sql_definition(REVIEW_RUN_SUMMARY_VIEW_SQL)
+    return current_sql != expected_sql
+
+
+def migrate_db_schema(connection: sqlite3.Connection) -> None:
+    existing_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(review_runs)").fetchall()
+    }
+    migrated = False
+    for column, statement in REVIEW_RUNS_COLUMN_MIGRATIONS:
+        if column not in existing_columns:
+            connection.execute(statement)
+            migrated = True
+    if migrated or review_run_summary_view_needs_rebuild(connection):
+        connection.execute("DROP VIEW IF EXISTS review_run_summary")
+        connection.executescript(REVIEW_RUN_SUMMARY_VIEW_SQL)
+
+
 def init_db(db_path: str) -> Path:
     resolved = resolve_path(db_path)
     resolved.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(resolved) as connection:
         connection.executescript(DB_SCHEMA)
+        migrate_db_schema(connection)
     return resolved
 
 
@@ -724,6 +781,14 @@ Calibration from prior high-signal reviews:
 - Catch API/schema drift, especially serde defaults that make public fields optional in OpenAPI.
 - Catch library/service paths that convert recoverable configuration errors into panics.
 - Catch hard-coded local service URLs in tests/helpers when a dummy valid value would work.
+- Catch public package/API documentation drift: import paths, exported symbols, option names,
+  return shapes, env variable names, and persisted value fields that no longer match examples.
+- Catch client/server boundary mistakes in framework recipes, especially browser-only image,
+  File, canvas, or preview URL work shown in server-only code.
+- Catch upload recipe contract drift where docs confuse upload URLs, public URLs, object keys,
+  temporary previewSrc values, and persisted src values.
+- Catch TypeScript/TSX snippets that are unlikely to typecheck from the imports and values
+  visible in the diff.
 - Catch untrusted AI/model output posted to GitHub comments without mention sanitization.
 - Catch fixed Markdown fences around untrusted model output; the model can emit the fence and escape the code block.
 - Catch workflow failure comments that drop HTTP status codes from HTTPError details.
@@ -735,6 +800,16 @@ Calibration from prior high-signal reviews:
 - Do not flag the default GitHub API URL when GITHUB_API_URL is available as an override.
 - Do not flag Docker COPY missing error handling; Docker build already fails when a source is missing.
 - Do not flag fixed container UIDs or /usr/local/bin PATH unless the diff shows a concrete permission/runtime break.
+- Do not flag `context.mimeType ?? file.type` by itself when the route validates allowed MIME
+  types and signs/returns the same headers used for upload.
+- Do not flag documentation placeholders such as `signPutUrl()` throwing or `cdn.example.com`
+  as production bugs when the snippet says to replace them.
+- Do not flag a package CSS import from a Next.js app shell by itself; global package CSS is
+  expected when the package exposes one stylesheet.
+- Do not flag React Hook Form/Zod edit-state schemas for accepting optional `previewSrc` when
+  submit code strips `previewSrc` before persistence.
+- Do not flag `.nullable()` or `ImageUploadValue | null` field state by itself; empty image
+  fields are expected to use null.
 - Catch tests that mock the behavior they are supposed to verify.
 - Catch documentation vocabulary drift when labels/statuses are treated inconsistently.
 
@@ -764,6 +839,7 @@ Rules:
 - Findings must be concrete and actionable.
 - If there is no provable issue, return an empty findings array.
 - Put uncertain runtime concerns under watch_items, not findings.
+- For docs-only diffs, prefer API/contract drift and broken snippets over copy-editing.
 - Do not include markdown fences.
 
 Diff:
@@ -865,8 +941,30 @@ def calibrate_model_watch_item(path: str, item: dict[str, Any]) -> WatchItem | N
     body = str(item.get("body", "")).strip()
     verification = str(item.get("verification", "")).strip()
     text = f"{title}\n{body}\n{verification}".lower()
+    is_docs_path = path.startswith("docs/") or path.lower().startswith("readme")
 
     if "frontend service" in text and "postgres_pool_max_size" in text:
+        return None
+
+    if is_docs_path and any(
+        pattern in text
+        for pattern in (
+            "new recipe links may point to unverified content",
+            "client/server boundary documentation clarity",
+            "client/server boundary clarification",
+            "previewsrc handling consistency",
+            "assumption about imagedropinput behavior",
+            "browser/client boundary clarification",
+            "next.js recipe documentation consistency",
+            "header consistency in presign endpoint",
+        )
+    ):
+        return None
+
+    if is_docs_path and "context.mimetype" in text and "file.type" in text:
+        return None
+
+    if is_docs_path and "topersistedimagevalue" in text and "null" in text:
         return None
 
     low_value_patterns = (
@@ -888,6 +986,14 @@ def calibrate_model_watch_item(path: str, item: dict[str, Any]) -> WatchItem | N
     if any(pattern in text for pattern in low_value_patterns):
         return None
 
+    docs_low_value_patterns = (
+        "missing implementation for signputurl",
+        "cdn.example.com",
+        "header matching consistency",
+    )
+    if is_docs_path and any(pattern in text for pattern in docs_low_value_patterns):
+        return None
+
     return WatchItem(
         source="model",
         path=path,
@@ -905,6 +1011,7 @@ def calibrate_model_finding(path: str, item: dict[str, Any]) -> tuple[Finding | 
     body = str(item.get("body", "")).strip()
     fix = str(item.get("fix", "")).strip()
     text = f"{title}\n{body}\n{fix}".lower()
+    is_docs_path = path.startswith("docs/") or path.lower().startswith("readme")
 
     low_value_patterns = (
         "hardcoded uid",
@@ -924,6 +1031,81 @@ def calibrate_model_finding(path: str, item: dict[str, Any]) -> tuple[Finding | 
         "next_telemetry_disabled",
     )
     if any(pattern in text for pattern in low_value_patterns):
+        return None, None
+
+    if is_docs_path:
+        if any(pattern in text for pattern in ("css import location", "style conflicts")):
+            return None, None
+
+        if "cdn.example.com" in text and any(
+            pattern in text for pattern in ("hardcoded cdn url", "hard-coded cdn url")
+        ):
+            return None, None
+
+        if any(
+            pattern in text
+            for pattern in (
+                "partial<presignrequest>",
+                "strict schema validation library",
+                "zod or joi",
+            )
+        ):
+            return None, None
+
+        if "signputurl" in text and not any(
+            pattern in text
+            for pattern in (
+                "export",
+                "import path",
+                "option name",
+                "response shape",
+                "contract",
+                "no longer match",
+                "does not match",
+            )
+        ):
+            return None, None
+
+        if any(
+            pattern in text
+            for pattern in (
+                "field state",
+                "field.onblur",
+                "nullable()",
+                "null values are expected",
+                "initialvalue",
+            )
+        ):
+            return None, None
+
+        if "topersistedimagevalue" in text and any(
+            pattern in text for pattern in ("destructures `value`", "destructuring will proceed", "null")
+        ):
+            return None, None
+
+        if "inconsistent schema definition for `src`" in text:
+            return None, None
+
+        if "missing error handling in fetch call" in text:
+            return None, None
+
+    if (
+        is_docs_path
+        and "context.mimetype" in text
+        and "file.type" in text
+        and any(pattern in text for pattern in ("fallback", "mismatch", "mime type handling"))
+    ):
+        return None, None
+
+    if (
+        is_docs_path
+        and "filename" in text
+        and "originalfilename" in text
+        and any(pattern in text for pattern in ("validate", "sanitize", "object keys", "public urls"))
+    ):
+        return None, None
+
+    if path.startswith("docs/recipes/") and "previewsrc" in text and "schema" in text:
         return None, None
 
     watch_patterns = (
@@ -989,7 +1171,24 @@ def calibrate_model_finding(path: str, item: dict[str, Any]) -> tuple[Finding | 
         "does not validate",
         "missing test",
     )
-    if severity in {"P0", "P1"} or any(pattern in text for pattern in calibrated_finding_patterns):
+    docs_contract_patterns = (
+        "api documentation drift",
+        "public api",
+        "contract drift",
+        "exported symbol",
+        "exported symbols",
+        "import path",
+        "option name",
+        "response shape",
+        "persisted value",
+        "no longer match",
+        "does not match",
+    )
+    if (
+        severity in {"P0", "P1"}
+        or any(pattern in text for pattern in calibrated_finding_patterns)
+        or (is_docs_path and any(pattern in text for pattern in docs_contract_patterns))
+    ):
         return Finding(
             source="model",
             severity=severity,
@@ -1038,6 +1237,11 @@ def persist_review_run(
     repo: str,
     pr_number: int,
     diff_source: str,
+    review_kind: str,
+    base_ref: str,
+    head_ref: str,
+    head_sha: str,
+    working_tree_included: bool,
     model: str,
     ollama_base_url: str,
     diff_bytes: int,
@@ -1062,9 +1266,14 @@ def persist_review_run(
         cursor = connection.execute(
             """
             INSERT INTO review_runs (
+                review_kind,
                 repo,
                 pr_number,
                 diff_source,
+                base_ref,
+                head_ref,
+                head_sha,
+                working_tree_included,
                 model,
                 ollama_base_url,
                 diff_bytes,
@@ -1081,12 +1290,17 @@ def persist_review_run(
                 output_path,
                 post_comment_requested,
                 report_markdown
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                review_kind,
                 repo,
                 pr_number,
                 diff_source,
+                base_ref,
+                head_ref,
+                head_sha,
+                int(working_tree_included),
                 model,
                 ollama_base_url,
                 diff_bytes,
@@ -1196,6 +1410,12 @@ def render_report(
     *,
     repo: str,
     pr_number: int,
+    review_kind: str,
+    diff_source: str,
+    base_ref: str,
+    head_ref: str,
+    head_sha: str,
+    working_tree_included: bool,
     model: str,
     diff_bytes: int,
     elapsed: float,
@@ -1205,22 +1425,33 @@ def render_report(
     watch_items: list[WatchItem],
     existing_comments: list[dict[str, Any]],
 ) -> str:
+    subject = f"#{pr_number}" if pr_number > 0 else "pre-PR diff"
     lines = [
         MARKER,
         "",
         "# Local AI Precision PR Review",
         "",
         f"- Repository: `{repo}`",
-        f"- PR: `#{pr_number}`",
+        f"- Subject: `{subject}`",
+        f"- Review kind: `{review_kind}`",
+        f"- Diff source: `{diff_source}`",
         f"- Model: `{model}`",
         f"- Diff bytes: `{diff_bytes}`",
         f"- Changed files: `{len(files)}`",
         f"- Model-reviewed files: `{len(reviewed_files)}`",
         f"- Elapsed seconds: `{elapsed}`",
-        "",
-        "## Findings",
-        "",
     ]
+    if base_ref or head_ref or head_sha or working_tree_included:
+        lines.extend(["", "## Diff Context", ""])
+        if base_ref:
+            lines.append(f"- Base ref: `{base_ref}`")
+        if head_ref:
+            lines.append(f"- Head ref: `{head_ref}`")
+        if head_sha:
+            lines.append(f"- Head SHA: `{head_sha}`")
+        lines.append(f"- Working tree included: `{'yes' if working_tree_included else 'no'}`")
+
+    lines.extend(["", "## Findings", ""])
     if not findings:
         lines.append("No high-confidence actionable findings.")
     else:
@@ -1413,12 +1644,118 @@ diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-
     assert "Fixed Markdown fence can be escaped by model output" in titles
     assert "Failure comment drops HTTP status code" in titles
     assert any(item.title == "Local PostgreSQL URL is hard-coded in Rust code" for item in watch)
+
+    false_positive_samples = [
+        (
+            "docs/uploads.md",
+            {
+                "severity": "P2",
+                "confidence": "high",
+                "title": "Potential fallback mismatch in MIME type handling",
+                "body": "context.mimeType ?? file.type may cause a mismatch",
+                "fix": "validate file.type",
+            },
+        ),
+        (
+            "docs/recipes/nextjs-presign-route.md",
+            {
+                "severity": "P2",
+                "confidence": "high",
+                "title": "Missing error handling in signPutUrl",
+                "body": "signPutUrl should handle storage SDK failures",
+                "fix": "add logging",
+            },
+        ),
+        (
+            "docs/recipes/react-hook-form-zod.md",
+            {
+                "severity": "P2",
+                "confidence": "high",
+                "title": "Incorrect handling of previewSrc in schema",
+                "body": "previewSrc is allowed in the Zod schema",
+                "fix": "remove previewSrc from the schema",
+            },
+        ),
+        (
+            "README.md",
+            {
+                "severity": "P2",
+                "confidence": "high",
+                "title": "Potential MIME type fallback inconsistency",
+                "body": "context.mimeType ?? file.type may be unreliable",
+                "fix": "validate file.type",
+            },
+        ),
+        (
+            "docs/recipes/nextjs-app-router.md",
+            {
+                "severity": "P2",
+                "confidence": "high",
+                "title": "Potential runtime error in toPersistedImageValue",
+                "body": "The function destructures value after checking !value?.src && !value?.key",
+                "fix": "Add an explicit null check before destructuring.",
+            },
+        ),
+        (
+            "docs/recipes/react-hook-form-zod.md",
+            {
+                "severity": "P3",
+                "confidence": "medium",
+                "title": "Missing error handling in fetch call",
+                "body": "The documentation snippet does not catch fetch failures.",
+                "fix": "Add a try/catch.",
+            },
+        ),
+        (
+            "docs/recipes/nextjs-presign-route.md",
+            {
+                "severity": "P3",
+                "confidence": "medium",
+                "title": "Missing validation for `fileName` and `originalFileName`",
+                "body": "These fields could be used in object keys or public URLs.",
+                "fix": "Validate and sanitize them.",
+            },
+        ),
+    ]
+    for false_positive_path, false_positive in false_positive_samples:
+        finding, watch_item = calibrate_model_finding(false_positive_path, false_positive)
+        assert finding is None
+        assert watch_item is None
+
+    docs_contract_finding, docs_contract_watch = calibrate_model_finding(
+        "docs/uploads.md",
+        {
+            "severity": "P2",
+            "confidence": "high",
+            "title": "Persisted response shape no longer matches the public API",
+            "body": "The README says the src field is persisted, but the exported symbol now returns publicUrl and objectKey.",
+            "fix": "Update the docs example to match the exported response shape.",
+        },
+    )
+    assert docs_contract_finding is not None
+    assert docs_contract_watch is None
+
+    non_docs_watch_item = calibrate_model_watch_item(
+        "src/uploads.ts",
+        {
+            "title": "Runtime CDN placeholder leaks into persisted output",
+            "body": "cdn.example.com is used in generated object URLs outside documentation.",
+            "verification": "Check the saved upload response.",
+        },
+    )
+    assert non_docs_watch_item is not None
+
     with tempfile.TemporaryDirectory() as temp_dir:
-        persist_review_run(
+        db_path, run_id = persist_review_run(
             str(Path(temp_dir) / "review.db"),
             repo="self/test",
             pr_number=1,
             diff_source="self_test",
+            review_kind="precision",
+            base_ref="main",
+            head_ref="self-test",
+            head_sha="",
+            working_tree_included=False,
             model=DEFAULT_MODEL,
             ollama_base_url=DEFAULT_OLLAMA_BASE_URL,
             diff_bytes=len(sample.encode("utf-8")),
@@ -1432,6 +1769,16 @@ diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-
             post_comment_requested=False,
             report="self test",
         )
+        with sqlite3.connect(db_path) as connection:
+            row = connection.execute(
+                """
+                SELECT review_kind, base_ref, head_ref, working_tree_included
+                FROM review_run_summary
+                WHERE id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        assert row == ("precision", "main", "self-test", 0)
     print("OK: local AI precision review self-test passed")
 
 
@@ -1440,6 +1787,16 @@ def main() -> None:
     parser.add_argument("--repo", help="GitHub repository as owner/name")
     parser.add_argument("--pr", type=int, help="Pull request number")
     parser.add_argument("--diff-file", help="Review an existing diff file instead of fetching GitHub")
+    parser.add_argument("--review-kind", default="precision", choices=["precision", "pre_pr"])
+    parser.add_argument("--diff-source-label", help="Stable label to store instead of the diff file path")
+    parser.add_argument("--base-ref", default="", help="Base ref for a local or pre-PR diff")
+    parser.add_argument("--head-ref", default="", help="Head ref for a local or pre-PR diff")
+    parser.add_argument("--head-sha", default="", help="Head commit SHA for a local or pre-PR diff")
+    parser.add_argument(
+        "--working-tree-included",
+        action="store_true",
+        help="Record that the local working tree was appended to the reviewed diff",
+    )
     parser.add_argument("--model", default=os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL))
     parser.add_argument("--ollama-base-url", default=os.environ.get("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL))
     parser.add_argument(
@@ -1481,7 +1838,7 @@ def main() -> None:
         diff_text = diff_path.read_text(encoding="utf-8", errors="replace")
         owner = ""
         repo_name = ""
-        diff_source = str(diff_path)
+        diff_source = args.diff_source_label or str(diff_path)
     else:
         owner, repo_name = split_repo(args.repo)
         repo = args.repo
@@ -1491,7 +1848,7 @@ def main() -> None:
             token,
             accept="application/vnd.github.v3.diff",
         )
-        diff_source = "pull_request"
+        diff_source = args.diff_source_label or "pull_request"
 
     started = time.time()
     diff_bytes = len(diff_text.encode("utf-8"))
@@ -1531,6 +1888,12 @@ def main() -> None:
     report = render_report(
         repo=repo,
         pr_number=pr_number,
+        review_kind=args.review_kind,
+        diff_source=diff_source,
+        base_ref=args.base_ref,
+        head_ref=args.head_ref,
+        head_sha=args.head_sha,
+        working_tree_included=args.working_tree_included,
         model=args.model,
         diff_bytes=diff_bytes,
         elapsed=elapsed,
@@ -1553,6 +1916,11 @@ def main() -> None:
             repo=repo,
             pr_number=pr_number,
             diff_source=diff_source,
+            review_kind=args.review_kind,
+            base_ref=args.base_ref,
+            head_ref=args.head_ref,
+            head_sha=args.head_sha,
+            working_tree_included=args.working_tree_included,
             model=args.model,
             ollama_base_url=args.ollama_base_url,
             diff_bytes=diff_bytes,

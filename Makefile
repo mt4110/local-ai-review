@@ -48,16 +48,28 @@ pre-pr-review:
 	index_path="$$(git -C "$(PROJECT_DIR)" rev-parse --git-path index)"; \
 	if [ -f "$$index_path" ]; then cp "$$index_path" "$$tmp_index"; else git -C "$(PROJECT_DIR)" read-tree --index-output="$$tmp_index" HEAD; fi; \
 	git -C "$(PROJECT_DIR)" rev-parse --verify "$(BASE)" >/dev/null; \
+	head_ref="$$(git -C "$(PROJECT_DIR)" branch --show-current)"; \
+	if [ -z "$$head_ref" ]; then head_ref="$$(git -C "$(PROJECT_DIR)" rev-parse --short HEAD)"; fi; \
+	head_sha="$$(git -C "$(PROJECT_DIR)" rev-parse HEAD)"; \
+	diff_source_label="pre_pr:$(BASE)...$$head_ref"; \
+	working_tree_arg=""; \
 	git -C "$(PROJECT_DIR)" diff "$(BASE)...HEAD" > "$$tmp_diff"; \
 	if [ "$(INCLUDE_WORKING_TREE)" = "1" ]; then \
 		printf '\n' >> "$$tmp_diff"; \
 		GIT_INDEX_FILE="$$tmp_index" git -C "$(PROJECT_DIR)" add -N -- .; \
 		GIT_INDEX_FILE="$$tmp_index" git -C "$(PROJECT_DIR)" diff HEAD >> "$$tmp_diff"; \
+		working_tree_arg="--working-tree-included"; \
 	fi; \
 	python3 scripts/local-ai-precision-review.py \
 		--repo "$(REPO)" \
 		--pr 0 \
 		--diff-file "$$tmp_diff" \
+		--review-kind pre_pr \
+		--diff-source-label "$$diff_source_label" \
+		--base-ref "$(BASE)" \
+		--head-ref "$$head_ref" \
+		--head-sha "$$head_sha" \
+		$$working_tree_arg \
 		--output "$(REVIEW_REPORT)" \
 		--db "$(REVIEW_DB)"
 
@@ -71,16 +83,28 @@ pre-pr-review-static:
 	index_path="$$(git -C "$(PROJECT_DIR)" rev-parse --git-path index)"; \
 	if [ -f "$$index_path" ]; then cp "$$index_path" "$$tmp_index"; else git -C "$(PROJECT_DIR)" read-tree --index-output="$$tmp_index" HEAD; fi; \
 	git -C "$(PROJECT_DIR)" rev-parse --verify "$(BASE)" >/dev/null; \
+	head_ref="$$(git -C "$(PROJECT_DIR)" branch --show-current)"; \
+	if [ -z "$$head_ref" ]; then head_ref="$$(git -C "$(PROJECT_DIR)" rev-parse --short HEAD)"; fi; \
+	head_sha="$$(git -C "$(PROJECT_DIR)" rev-parse HEAD)"; \
+	diff_source_label="pre_pr:$(BASE)...$$head_ref"; \
+	working_tree_arg=""; \
 	git -C "$(PROJECT_DIR)" diff "$(BASE)...HEAD" > "$$tmp_diff"; \
 	if [ "$(INCLUDE_WORKING_TREE)" = "1" ]; then \
 		printf '\n' >> "$$tmp_diff"; \
 		GIT_INDEX_FILE="$$tmp_index" git -C "$(PROJECT_DIR)" add -N -- .; \
 		GIT_INDEX_FILE="$$tmp_index" git -C "$(PROJECT_DIR)" diff HEAD >> "$$tmp_diff"; \
+		working_tree_arg="--working-tree-included"; \
 	fi; \
 	python3 scripts/local-ai-precision-review.py \
 		--repo "$(REPO)" \
 		--pr 0 \
 		--diff-file "$$tmp_diff" \
+		--review-kind pre_pr \
+		--diff-source-label "$$diff_source_label" \
+		--base-ref "$(BASE)" \
+		--head-ref "$$head_ref" \
+		--head-sha "$$head_sha" \
+		$$working_tree_arg \
 		--max-model-files 0 \
 		--output "$(REVIEW_REPORT)" \
 		--db "$(REVIEW_DB)"
@@ -89,7 +113,7 @@ review-db-init:
 	python3 scripts/local-ai-precision-review.py --init-db --db "$(REVIEW_DB)"
 
 review-db-stats: review-db-init
-	printf '.headers on\n.mode column\nSELECT id, created_at, repo, pr_number, model, findings_count, watch_items_count, ROUND(elapsed_seconds, 1) AS elapsed_s FROM review_run_summary ORDER BY id DESC LIMIT 10;\n' | sqlite3 "$(REVIEW_DB)"
+	printf '.headers on\n.mode column\nSELECT id, created_at, review_kind, repo, pr_number, head_ref, findings_count, watch_items_count, ROUND(elapsed_seconds, 1) AS elapsed_s FROM review_run_summary ORDER BY id DESC LIMIT 10;\n' | sqlite3 "$(REVIEW_DB)"
 
 review-db-up: review-db-init
 	REVIEW_DB_DIR="$(abspath $(dir $(REVIEW_DB)))" \

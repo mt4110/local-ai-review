@@ -82,6 +82,11 @@ repository and, by default, appends the uncommitted working tree diff from
 changes. If you prefer the remote default branch as the baseline, pass
 `BASE=origin/main`.
 
+Pre-PR runs are stored with `review_kind=pre_pr`. The DB also keeps `base_ref`,
+`head_ref`, `head_sha`, and `working_tree_included`, so you can compare the
+preflight findings, false positives, and manual score against the later remote
+review.
+
 ## Calibration Rules
 
 Past high-signal review comments in `mt4110/geo-line-ranker` show that useful
@@ -112,8 +117,8 @@ such as container smoke tests after read-only filesystem hardening.
 ## SQLite History
 
 The history DB is for measuring whether local review is actually useful before
-remote review. It stores run metadata, findings, watch items, reviewed files,
-and an optional feedback row you can update later with SQL.
+remote review. It stores run metadata, pre-PR context, findings, watch items,
+reviewed files, and an optional feedback row you can update later with SQL.
 
 Default DB path:
 
