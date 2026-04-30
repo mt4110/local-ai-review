@@ -24,6 +24,21 @@ FROM findings
 GROUP BY source, severity
 ORDER BY source, severity;
 
+-- Normalized review items for future item-level scoring
+SELECT
+  runs.id AS run_id,
+  items.item_type,
+  items.source,
+  items.path,
+  items.line,
+  items.title,
+  items.fingerprint
+FROM review_items AS items
+JOIN review_runs AS runs
+ON runs.id = items.run_id
+ORDER BY runs.id DESC, items.item_type, items.ordinal
+LIMIT 50;
+
 -- Repo and model level health
 SELECT
   repo,

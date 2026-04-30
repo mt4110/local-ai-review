@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import os
 import re
@@ -32,6 +33,7 @@ DEFAULT_DB_PATH = "out/review-history/local-ai-review.db"
 GITHUB_API = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
 MARKER = "<!-- local-ai-precision-review -->"
 MAX_COMMENT_BYTES = 60000
+PROGRESS_PREFIX = "LLREVIEW_EVENT "
 DB_SCHEMA = """
 PRAGMA foreign_keys = ON;
 
@@ -104,6 +106,122 @@ CREATE TABLE IF NOT EXISTS run_feedback (
     would_request_remote_review_now INTEGER,
     remote_findings_count INTEGER,
     note TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS review_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES review_runs(id) ON DELETE CASCADE,
+    item_type TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT '',
+    confidence TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL,
+    line INTEGER,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    fix TEXT NOT NULL DEFAULT '',
+    verification TEXT NOT NULL DEFAULT '',
+    fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS review_items_run_type_ordinal_idx
+ON review_items(run_id, item_type, ordinal);
+
+CREATE INDEX IF NOT EXISTS review_items_fingerprint_idx
+ON review_items(fingerprint);
+
+CREATE TABLE IF NOT EXISTS external_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo TEXT NOT NULL,
+    pr_number INTEGER,
+    head_sha TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL,
+    path TEXT NOT NULL DEFAULT '',
+    line INTEGER,
+    title TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL,
+    url TEXT NOT NULL DEFAULT '',
+    github_comment_id TEXT NOT NULL DEFAULT '',
+    github_thread_id TEXT NOT NULL DEFAULT '',
+    fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS external_items_lookup_idx
+ON external_items(repo, pr_number, head_sha, source);
+
+CREATE INDEX IF NOT EXISTS external_items_fingerprint_idx
+ON external_items(fingerprint);
+
+CREATE TABLE IF NOT EXISTS item_verdicts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_kind TEXT NOT NULL,
+    target_id INTEGER NOT NULL,
+    verdict TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    scorer TEXT NOT NULL DEFAULT '',
+    scored_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS item_verdicts_target_idx
+ON item_verdicts(target_kind, target_id);
+
+CREATE TABLE IF NOT EXISTS item_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    review_item_id INTEGER NOT NULL REFERENCES review_items(id) ON DELETE CASCADE,
+    external_item_id INTEGER NOT NULL REFERENCES external_items(id) ON DELETE CASCADE,
+    relation TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS item_links_pair_idx
+ON item_links(review_item_id, external_item_id, relation);
+
+CREATE TABLE IF NOT EXISTS rule_updates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    verdict_id INTEGER REFERENCES item_verdicts(id) ON DELETE SET NULL,
+    change_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    rationale TEXT NOT NULL DEFAULT '',
+    artifact_path TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS runtime_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES review_runs(id) ON DELETE CASCADE,
+    elapsed_seconds REAL NOT NULL,
+    reviewed_files_count INTEGER NOT NULL,
+    findings_count INTEGER NOT NULL,
+    watch_items_count INTEGER NOT NULL,
+    queue_depth INTEGER,
+    memory_pressure TEXT NOT NULL DEFAULT '',
+    ollama_status TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER REFERENCES review_runs(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    path TEXT NOT NULL,
+    sha256 TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS workspace_state (
+    workspace_path TEXT PRIMARY KEY,
+    repo TEXT NOT NULL,
+    branch TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER,
+    base_ref TEXT NOT NULL DEFAULT '',
+    head_ref TEXT NOT NULL DEFAULT '',
+    head_sha TEXT NOT NULL DEFAULT '',
+    last_run_id INTEGER REFERENCES review_runs(id) ON DELETE SET NULL,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 """
@@ -188,6 +306,45 @@ class WatchItem:
     title: str
     body: str
     verification: str
+
+
+def stable_fingerprint(*parts: Any) -> str:
+    normalized = "\n".join("" if part is None else str(part) for part in parts)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def finding_fingerprint(item: Finding) -> str:
+    return stable_fingerprint(
+        "finding",
+        item.source,
+        item.path,
+        item.line or "",
+        item.title,
+        item.body,
+        item.fix,
+    )
+
+
+def watch_item_fingerprint(item: WatchItem) -> str:
+    return stable_fingerprint(
+        "watch",
+        item.source,
+        item.path,
+        item.title,
+        item.body,
+        item.verification,
+    )
+
+
+def emit_progress(args: argparse.Namespace, event: str, **payload: Any) -> None:
+    if not getattr(args, "progress_events", False):
+        return
+    body = {"event": event, **payload}
+    print(PROGRESS_PREFIX + json.dumps(body, sort_keys=True), file=sys.stderr, flush=True)
 
 
 def resolve_path(value: str) -> Path:
@@ -1386,6 +1543,86 @@ def persist_review_run(
                 for ordinal, item in enumerate(watch_items, start=1)
             ],
         )
+        connection.executemany(
+            """
+            INSERT INTO review_items (
+                run_id,
+                item_type,
+                ordinal,
+                source,
+                severity,
+                confidence,
+                path,
+                line,
+                title,
+                body,
+                fix,
+                verification,
+                fingerprint
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    run_id,
+                    "finding",
+                    ordinal,
+                    item.source,
+                    item.severity,
+                    item.confidence,
+                    item.path,
+                    item.line,
+                    item.title,
+                    item.body,
+                    item.fix,
+                    "",
+                    finding_fingerprint(item),
+                )
+                for ordinal, item in enumerate(findings, start=1)
+            ]
+            + [
+                (
+                    run_id,
+                    "watch",
+                    ordinal,
+                    item.source,
+                    "",
+                    "",
+                    item.path,
+                    None,
+                    item.title,
+                    item.body,
+                    "",
+                    item.verification,
+                    watch_item_fingerprint(item),
+                )
+                for ordinal, item in enumerate(watch_items, start=1)
+            ],
+        )
+        connection.execute(
+            """
+            INSERT INTO runtime_metrics (
+                run_id,
+                elapsed_seconds,
+                reviewed_files_count,
+                findings_count,
+                watch_items_count
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (run_id, elapsed, len(reviewed_files), len(findings), len(watch_items)),
+        )
+        if output_path:
+            connection.execute(
+                """
+                INSERT INTO artifacts (run_id, kind, path, sha256)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    "report_markdown",
+                    output_path,
+                    sha256_text(report),
+                ),
+            )
     return resolved, run_id
 
 
@@ -1778,7 +2015,12 @@ diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-
                 """,
                 (run_id,),
             ).fetchone()
+            review_item_count = connection.execute(
+                "SELECT COUNT(*) FROM review_items WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()[0]
         assert row == ("precision", "main", "self-test", 0)
+        assert review_item_count == 2
     print("OK: local AI precision review self-test passed")
 
 
@@ -1816,6 +2058,7 @@ def main() -> None:
     parser.add_argument("--db", default=os.environ.get("LOCAL_AI_REVIEW_DB", DEFAULT_DB_PATH))
     parser.add_argument("--skip-db", action="store_true", help="Do not persist the run into SQLite")
     parser.add_argument("--init-db", action="store_true", help="Create the SQLite history file and exit")
+    parser.add_argument("--progress-events", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
@@ -1835,6 +2078,7 @@ def main() -> None:
         repo = args.repo or "local/diff"
         pr_number = args.pr or 0
         diff_path = resolve_path(args.diff_file)
+        emit_progress(args, "diff_read_start", diff_source=str(diff_path))
         diff_text = diff_path.read_text(encoding="utf-8", errors="replace")
         owner = ""
         repo_name = ""
@@ -1843,6 +2087,7 @@ def main() -> None:
         owner, repo_name = split_repo(args.repo)
         repo = args.repo
         pr_number = args.pr
+        emit_progress(args, "diff_fetch_start", repo=repo, pr_number=pr_number)
         diff_text = github_request(
             f"/repos/{owner}/{repo_name}/pulls/{pr_number}",
             token,
@@ -1852,7 +2097,9 @@ def main() -> None:
 
     started = time.time()
     diff_bytes = len(diff_text.encode("utf-8"))
+    emit_progress(args, "diff_loaded", diff_source=diff_source, diff_bytes=diff_bytes)
     files = parse_unified_diff(diff_text)
+    emit_progress(args, "files_parsed", changed_files=len(files))
     if diff_bytes > args.max_diff_bytes:
         raise SystemExit(f"diff too large: {diff_bytes} > {args.max_diff_bytes}")
 
@@ -1862,28 +2109,52 @@ def main() -> None:
         file_findings, file_watch = static_review(file_patch)
         findings.extend(file_findings)
         watch_items.extend(file_watch)
+    emit_progress(args, "static_done", findings=len(findings), watch_items=len(watch_items))
 
     model_candidates = [
         item
         for item in files
         if should_model_review(item, args.max_file_bytes)
     ][: args.max_model_files]
+    emit_progress(args, "model_plan", model_files=len(model_candidates))
     if model_candidates:
         args.ollama_base_url = validate_ollama_base_url(
             args.ollama_base_url,
             allow_remote=args.allow_remote_ollama,
         )
     reviewed_files: list[str] = []
-    for file_patch in model_candidates:
+    for model_index, file_patch in enumerate(model_candidates, start=1):
+        emit_progress(
+            args,
+            "model_file_start",
+            index=model_index,
+            total=len(model_candidates),
+            path=file_patch.path,
+            findings=len(findings),
+            watch_items=len(watch_items),
+        )
         reviewed_files.append(file_patch.path)
         file_findings, file_watch = model_review_file(args, file_patch)
         findings.extend(file_findings)
         watch_items.extend(file_watch)
+        emit_progress(
+            args,
+            "model_file_done",
+            index=model_index,
+            total=len(model_candidates),
+            path=file_patch.path,
+            file_findings=len(file_findings),
+            file_watch_items=len(file_watch),
+            findings=len(findings),
+            watch_items=len(watch_items),
+        )
 
     findings = dedupe_findings(findings)
+    emit_progress(args, "dedupe_done", findings=len(findings), watch_items=len(watch_items))
     existing_comments: list[dict[str, Any]] = []
     if owner and repo_name:
         existing_comments = fetch_existing_review_comments(owner, repo_name, pr_number, token)
+    emit_progress(args, "comments_loaded", existing_review_comments=len(existing_comments))
     elapsed = round(time.time() - started, 1)
     report = render_report(
         repo=repo,
@@ -1938,11 +2209,14 @@ def main() -> None:
             f"OK: saved review run to {saved_db_path} (run_id={run_id})",
             file=sys.stderr,
         )
+        emit_progress(args, "saved", db_path=str(saved_db_path), run_id=run_id)
     print(report)
     if args.post_comment:
         if not owner or not repo_name:
             raise SystemExit("--post-comment requires --repo and --pr")
         post_or_update_comment(owner, repo_name, pr_number, token, report)
+        emit_progress(args, "posted", repo=repo, pr_number=pr_number)
+    emit_progress(args, "done", elapsed_seconds=elapsed)
 
 
 if __name__ == "__main__":

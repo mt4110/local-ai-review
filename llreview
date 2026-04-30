@@ -1,0 +1,13 @@
+#!/usr/bin/env sh
+set -eu
+SCRIPT_PATH=$0
+while [ -L "$SCRIPT_PATH" ]; do
+  SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
+  LINK_TARGET=$(readlink "$SCRIPT_PATH")
+  case "$LINK_TARGET" in
+    /*) SCRIPT_PATH=$LINK_TARGET ;;
+    *) SCRIPT_PATH=$SCRIPT_DIR/$LINK_TARGET ;;
+  esac
+done
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
+exec python3 "$SCRIPT_DIR/scripts/llreview.py" "$@"
