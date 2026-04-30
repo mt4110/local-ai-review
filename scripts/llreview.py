@@ -354,8 +354,9 @@ class ProgressRenderer:
         line = self.line()
         if len(line) >= width:
             line = line[: max(0, width - 4)] + "..."
-        padded = line.ljust(self._last_line_len)
-        self._last_line_len = len(line)
+        display_width = max(self._last_line_len, len(line))
+        padded = line.ljust(display_width)
+        self._last_line_len = display_width
         sys.stderr.write("\r" + padded)
         sys.stderr.flush()
 
