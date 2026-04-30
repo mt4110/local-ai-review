@@ -35,6 +35,7 @@ DEFAULT_DB = TOOL_ROOT / "out" / "review-history" / "local-ai-review.db"
 DEFAULT_REPORT = TOOL_ROOT / "out" / "reviews" / "llreview-latest.md"
 DEFAULT_BENCHMARK_REPORT = TOOL_ROOT / "out" / "reviews" / "benchmark-report.md"
 DEFAULT_JSONL = TOOL_ROOT / "out" / "review-history" / "review-items.jsonl"
+DEFAULT_INSTALL_PATH = Path.home() / ".local" / "bin" / "llreview"
 GITHUB_API = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
 PROGRESS_PREFIX = "LLREVIEW_EVENT "
 
@@ -840,6 +841,24 @@ def command_export_jsonl(args: argparse.Namespace) -> None:
     print(f"OK: exported {count} review items to {output}")
 
 
+def command_install(args: argparse.Namespace) -> None:
+    source = TOOL_ROOT / "llreview"
+    target = Path(os.path.abspath(os.path.expanduser(args.path)))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() or target.is_symlink():
+        current = target.resolve() if target.is_symlink() else target
+        if current == source.resolve():
+            print(f"OK: llreview is already installed at {target}")
+            return
+        if not args.force:
+            raise SystemExit(f"{target} already exists; pass --force to replace it")
+        target.unlink()
+    target.symlink_to(source)
+    print(f"OK: installed llreview at {target}")
+    if str(target.parent) not in os.environ.get("PATH", "").split(os.pathsep):
+        print(f"Note: add {target.parent} to PATH to run `llreview` without a path.")
+
+
 def add_workspace_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--project-dir", default=os.getcwd(), help="Git workspace to inspect")
     parser.add_argument("--repo", help="Override GitHub repository as owner/name")
@@ -849,7 +868,7 @@ def add_workspace_options(parser: argparse.ArgumentParser) -> None:
 def build_review_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Auto-detect and run local PR review",
-        epilog="Subcommands: status, score, report, export-jsonl",
+        epilog="Subcommands: status, score, report, export-jsonl, install",
     )
     parser.set_defaults(func=command_review)
     parser.add_argument("pr", nargs="?", type=int, help="PR number. Omit to auto-detect.")
@@ -901,11 +920,20 @@ def build_export_parser() -> argparse.ArgumentParser:
     return export
 
 
+def build_install_parser() -> argparse.ArgumentParser:
+    install = argparse.ArgumentParser(description="Install llreview into a local PATH directory")
+    install.set_defaults(func=command_install)
+    install.add_argument("--path", default=str(DEFAULT_INSTALL_PATH), help="Command path to create")
+    install.add_argument("--force", action="store_true", help="Replace an existing path")
+    return install
+
+
 COMMAND_PARSERS = {
     "status": build_status_parser,
     "score": build_score_parser,
     "report": build_report_parser,
     "export-jsonl": build_export_parser,
+    "install": build_install_parser,
 }
 
 

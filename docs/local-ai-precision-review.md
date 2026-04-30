@@ -107,11 +107,12 @@ v1.0 evidence loop 用に、従来の `findings` / `watch_items` に加えて `r
 日常利用の入口は `llreview` です。
 
 ```sh
-./llreview
-./llreview status
-./llreview score
-./llreview report
-./llreview export-jsonl
+./llreview install
+llreview status
+llreview
+llreview score
+llreview report
+llreview export-jsonl
 ```
 
 デフォルトの DB path:

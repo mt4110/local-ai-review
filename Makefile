@@ -1,4 +1,4 @@
-.PHONY: llreview precision-review precision-review-static precision-review-self-test pre-pr-review pre-pr-review-static review-db-init review-db-stats review-db-up review-db-web review-db-down review-db-score
+.PHONY: install-local llreview precision-review precision-review-static precision-review-self-test pre-pr-review pre-pr-review-static review-db-init review-db-stats review-db-up review-db-web review-db-down review-db-score
 
 REPO ?=
 PR ?=
@@ -18,6 +18,9 @@ NOTE ?=
 
 llreview:
 	./llreview
+
+install-local:
+	./llreview install
 
 precision-review:
 	@test -n "$(REPO)" || { echo "REPO=owner/name is required"; exit 2; }
