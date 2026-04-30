@@ -194,16 +194,38 @@ def resolve_path(value: str) -> Path:
     return Path(value).expanduser().resolve()
 
 
+def normalize_sql_definition(sql: str) -> str:
+    return re.sub(r"\s+", " ", sql).strip().rstrip(";")
+
+
+def review_run_summary_view_needs_rebuild(connection: sqlite3.Connection) -> bool:
+    row = connection.execute(
+        """
+        SELECT sql
+        FROM sqlite_master
+        WHERE type = 'view' AND name = 'review_run_summary'
+        """
+    ).fetchone()
+    if row is None or row[0] is None:
+        return True
+    current_sql = normalize_sql_definition(str(row[0]))
+    expected_sql = normalize_sql_definition(REVIEW_RUN_SUMMARY_VIEW_SQL)
+    return current_sql != expected_sql
+
+
 def migrate_db_schema(connection: sqlite3.Connection) -> None:
     existing_columns = {
         str(row[1])
         for row in connection.execute("PRAGMA table_info(review_runs)").fetchall()
     }
+    migrated = False
     for column, statement in REVIEW_RUNS_COLUMN_MIGRATIONS:
         if column not in existing_columns:
             connection.execute(statement)
-    connection.execute("DROP VIEW IF EXISTS review_run_summary")
-    connection.executescript(REVIEW_RUN_SUMMARY_VIEW_SQL)
+            migrated = True
+    if migrated or review_run_summary_view_needs_rebuild(connection):
+        connection.execute("DROP VIEW IF EXISTS review_run_summary")
+        connection.executescript(REVIEW_RUN_SUMMARY_VIEW_SQL)
 
 
 def init_db(db_path: str) -> Path:
@@ -960,11 +982,16 @@ def calibrate_model_watch_item(path: str, item: dict[str, Any]) -> WatchItem | N
         "local ollama instance",
         "exactly at the limit",
         "incomplete diffs",
+    )
+    if any(pattern in text for pattern in low_value_patterns):
+        return None
+
+    docs_low_value_patterns = (
         "missing implementation for signputurl",
         "cdn.example.com",
         "header matching consistency",
     )
-    if any(pattern in text for pattern in low_value_patterns):
+    if is_docs_path and any(pattern in text for pattern in docs_low_value_patterns):
         return None
 
     return WatchItem(
@@ -1006,38 +1033,61 @@ def calibrate_model_finding(path: str, item: dict[str, Any]) -> tuple[Finding | 
     if any(pattern in text for pattern in low_value_patterns):
         return None, None
 
-    if is_docs_path and any(
-        pattern in text
-        for pattern in (
-            "css import location",
-            "style conflicts",
-            "hardcoded cdn url",
-            "hard-coded cdn url",
-            "cdn.example.com",
-            "partial<presignrequest>",
-            "strict schema validation library",
-            "zod or joi",
-            "signputurl",
-            "missing error handling in signputurl",
-            "storage sdk",
-            "field state",
-            "field.onblur",
-            "nullable()",
-            "null values are expected",
-            "initialvalue",
-            "persistedimagevalue",
-            "topersistedimagevalue",
-            "destructures `value`",
-            "destructuring will proceed",
-            "inconsistent schema definition for `src`",
-            "src field",
-            "empty strings",
-            "fileName and originalFileName",
-            "filename and originalfilename",
-            "missing error handling in fetch call",
-        )
-    ):
-        return None, None
+    if is_docs_path:
+        if any(pattern in text for pattern in ("css import location", "style conflicts")):
+            return None, None
+
+        if "cdn.example.com" in text and any(
+            pattern in text for pattern in ("hardcoded cdn url", "hard-coded cdn url")
+        ):
+            return None, None
+
+        if any(
+            pattern in text
+            for pattern in (
+                "partial<presignrequest>",
+                "strict schema validation library",
+                "zod or joi",
+            )
+        ):
+            return None, None
+
+        if "signputurl" in text and not any(
+            pattern in text
+            for pattern in (
+                "export",
+                "import path",
+                "option name",
+                "response shape",
+                "contract",
+                "no longer match",
+                "does not match",
+            )
+        ):
+            return None, None
+
+        if any(
+            pattern in text
+            for pattern in (
+                "field state",
+                "field.onblur",
+                "nullable()",
+                "null values are expected",
+                "initialvalue",
+            )
+        ):
+            return None, None
+
+        if "topersistedimagevalue" in text and any(
+            pattern in text for pattern in ("destructures `value`", "destructuring will proceed", "null")
+        ):
+            return None, None
+
+        if "inconsistent schema definition for `src`" in text:
+            return None, None
+
+        if "missing error handling in fetch call" in text:
+            return None, None
 
     if (
         is_docs_path
@@ -1121,7 +1171,24 @@ def calibrate_model_finding(path: str, item: dict[str, Any]) -> tuple[Finding | 
         "does not validate",
         "missing test",
     )
-    if severity in {"P0", "P1"} or any(pattern in text for pattern in calibrated_finding_patterns):
+    docs_contract_patterns = (
+        "api documentation drift",
+        "public api",
+        "contract drift",
+        "exported symbol",
+        "exported symbols",
+        "import path",
+        "option name",
+        "response shape",
+        "persisted value",
+        "no longer match",
+        "does not match",
+    )
+    if (
+        severity in {"P0", "P1"}
+        or any(pattern in text for pattern in calibrated_finding_patterns)
+        or (is_docs_path and any(pattern in text for pattern in docs_contract_patterns))
+    ):
         return Finding(
             source="model",
             severity=severity,
@@ -1654,6 +1721,29 @@ diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-
         finding, watch_item = calibrate_model_finding(false_positive_path, false_positive)
         assert finding is None
         assert watch_item is None
+
+    docs_contract_finding, docs_contract_watch = calibrate_model_finding(
+        "docs/uploads.md",
+        {
+            "severity": "P2",
+            "confidence": "high",
+            "title": "Persisted response shape no longer matches the public API",
+            "body": "The README says the src field is persisted, but the exported symbol now returns publicUrl and objectKey.",
+            "fix": "Update the docs example to match the exported response shape.",
+        },
+    )
+    assert docs_contract_finding is not None
+    assert docs_contract_watch is None
+
+    non_docs_watch_item = calibrate_model_watch_item(
+        "src/uploads.ts",
+        {
+            "title": "Runtime CDN placeholder leaks into persisted output",
+            "body": "cdn.example.com is used in generated object URLs outside documentation.",
+            "verification": "Check the saved upload response.",
+        },
+    )
+    assert non_docs_watch_item is not None
 
     with tempfile.TemporaryDirectory() as temp_dir:
         db_path, run_id = persist_review_run(
