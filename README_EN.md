@@ -30,6 +30,10 @@ Japanese version: [README.md](README.md)
 - `docs/local-llm-shutdown-runbook-en.md`: detailed runbook for stopping the local LLM.
 - `docs/local-llm-watcher-design-en.md`: watcher, Discord notification, and idle unload design.
 - `docs/local-llm-watcher-runtime-ops-en.md`: env file, Discord App, live status, and launchd operations.
+- `docs/local-ai-precision-review-en.md`: file-by-file precision diff-only review workflow.
+- `docs/local-ai-precision-review.md`: Japanese version of the precision review runbook.
+- `sql/review-history-example-queries.sql`: example SQL for evaluating saved review runs.
+- `docker-compose.review-db.yml`: Datasette compose file for browsing review history in a browser.
 - `ai-review-infra-design/`: v0.1 design pack used as the implementation spec.
 
 ## Runner Setup
@@ -145,6 +149,30 @@ The PR comment is identified by this marker:
 ```
 
 If the marker comment already exists from `github-actions[bot]`, the workflow updates it. Otherwise it creates one comment.
+
+## Precision Review History (SQLite)
+
+This section is for locally-run precision review history, not the label-triggered workflow. The precision reviewer uses this PR comment marker:
+
+```text
+<!-- local-ai-precision-review -->
+```
+
+To keep evaluation data in SQLite, use:
+
+```sh
+make pre-pr-review \
+  REPO=mt4110/geo-line-ranker \
+  PROJECT_DIR=/absolute/path/to/geo-line-ranker \
+  BASE=main
+make review-db-init
+make review-db-stats
+make review-db-web
+make review-db-score RUN=6 USEFUL=0 FALSE_POSITIVES=0 UNCLEAR=1 REMOTE_READY=yes NOTE='Static-only looked clean enough for PR.'
+make review-db-down
+```
+
+`make review-db-web` starts Datasette in Docker in the background and opens the DB at `http://127.0.0.1:8003`. Datasette defaults to `8001`, so this repo binds `8003` to stay two ports above the default. Stop it with `make review-db-down`. Datasette is intentionally read-only here, so manual scoring goes through `make review-db-score ...`. If you prefer a desktop client, open `out/review-history/local-ai-review.db` in DBeaver.
 
 ## Test Procedure
 

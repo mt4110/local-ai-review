@@ -1,0 +1,159 @@
+# Local AI Precision Review
+
+This runbook is for Copilot-style, diff-only local review calibration.
+
+The first MVP workflow sends the whole PR diff to the model once. That is safe,
+but it can miss small review comments that are easier to catch file by file. The
+precision reviewer keeps the same safety contract while reviewing smaller diff
+chunks.
+
+## Safety Contract
+
+- Do not checkout PR code.
+- Do not run PR code.
+- Do not run tests from the PR branch.
+- Do not mutate labels, workflow files, or repository content.
+- Fetch only the PR diff and review comments through the GitHub API.
+- Send diff text only to local Ollama.
+
+## Usage
+
+```sh
+python3 scripts/local-ai-precision-review.py \
+  --repo mt4110/geo-line-ranker \
+  --pr 23 \
+  --output /tmp/geo-line-ranker-pr23-precision-review.md
+```
+
+Every run is also persisted into SQLite by default.
+
+```sh
+python3 scripts/local-ai-precision-review.py \
+  --repo mt4110/geo-line-ranker \
+  --pr 23 \
+  --output out/reviews/geo-line-ranker-pr23.md \
+  --db out/review-history/local-ai-review.db
+```
+
+To post or update a marker comment on the PR:
+
+```sh
+python3 scripts/local-ai-precision-review.py \
+  --repo mt4110/geo-line-ranker \
+  --pr 23 \
+  --post-comment
+```
+
+For a fast static-only calibration pass:
+
+```sh
+python3 scripts/local-ai-precision-review.py \
+  --repo mt4110/geo-line-ranker \
+  --pr 23 \
+  --max-model-files 0
+```
+
+Or use the bundled make targets:
+
+```sh
+make precision-review REPO=mt4110/geo-line-ranker PR=23
+make pre-pr-review \
+  REPO=mt4110/geo-line-ranker \
+  PROJECT_DIR=/absolute/path/to/geo-line-ranker \
+  BASE=main
+make review-db-stats
+make review-db-web
+make review-db-score RUN=6 USEFUL=0 FALSE_POSITIVES=0 UNCLEAR=1 REMOTE_READY=yes NOTE='Static-only looked clean enough for PR.'
+make review-db-down
+```
+
+For a pre-PR static-only pass:
+
+```sh
+make pre-pr-review-static \
+  REPO=mt4110/geo-line-ranker \
+  PROJECT_DIR=/absolute/path/to/geo-line-ranker \
+  BASE=main
+```
+
+`pre-pr-review` builds a temporary diff from `BASE...HEAD` in the target
+repository and, by default, appends the uncommitted working tree diff from
+`git diff HEAD`. Set `INCLUDE_WORKING_TREE=0` if you want only committed
+changes. If you prefer the remote default branch as the baseline, pass
+`BASE=origin/main`.
+
+## Calibration Rules
+
+Past high-signal review comments in `mt4110/geo-line-ranker` show that useful
+findings tend to be small and grounded:
+
+- API/schema drift, especially public fields that are non-optional in code but
+  optional in generated OpenAPI.
+- Recoverable configuration or database setup failures becoming panics.
+- Hard-coded local service URLs in tests/helpers.
+- Shell strict-mode traps around command substitution and pipelines.
+- Env/config mismatches between scripts, docs, and compose files.
+- Runtime breakage from read-only containers, tmpfs, non-root users, and missing
+  writable paths.
+- Tests that mock the behavior they were supposed to verify.
+- Documentation vocabulary drift for labels, statuses, and operating lanes.
+
+Generic best-practice comments are intentionally filtered out or demoted to
+watch items. Examples: fixed container UIDs, Docker `COPY` "missing error
+handling", `/usr/local/bin` PATH concerns, and telemetry environment variables.
+
+## Interpreting Output
+
+`Findings` should be actionable enough to comment on a PR.
+
+`Watch Items` are not findings. They are runtime or manual verification points,
+such as container smoke tests after read-only filesystem hardening.
+
+## SQLite History
+
+The history DB is for measuring whether local review is actually useful before
+remote review. It stores run metadata, findings, watch items, reviewed files,
+and an optional feedback row you can update later with SQL.
+
+Default DB path:
+
+```text
+out/review-history/local-ai-review.db
+```
+
+Example browser view:
+
+```sh
+make review-db-web
+```
+
+This starts Datasette in Docker in the background, then opens
+`http://127.0.0.1:8003` in the browser. Datasette defaults to `8001`, so this
+repo binds `8003` to stay two ports above the default.
+
+To stop it:
+
+```sh
+make review-db-down
+```
+
+Datasette is intentionally read-only here, so manual scoring is done through the
+CLI instead of browser `INSERT` statements:
+
+```sh
+make review-db-score \
+  RUN=6 \
+  USEFUL=0 \
+  FALSE_POSITIVES=0 \
+  UNCLEAR=1 \
+  REMOTE_READY=yes \
+  NOTE='Static-only looked clean enough for PR.'
+```
+
+If you prefer a desktop DB client, open the same file in DBeaver.
+
+Useful SQL examples live in:
+
+```text
+sql/review-history-example-queries.sql
+```
