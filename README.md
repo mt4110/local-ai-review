@@ -31,6 +31,7 @@ GitHub Actions の self-hosted runner で動かす、diff-only のローカル P
 - `docs/local-llm-watcher-design.md`: 常時監視 watcher / Discord 通知 / idle unload の設計。
 - `docs/local-llm-watcher-runtime-ops.md`: env file、Discord App、live status、launchd の運用手順。
 - `docs/local-ai-precision-review.md`: file-by-file の高精度 diff-only review 手順。
+- `docs/local-ai-precision-review-en.md`: English version of the precision review runbook.
 - `sql/review-history-example-queries.sql`: SQLite に保存した review 結果を評価するための SQL 例。
 - `docker-compose.review-db.yml`: review history をブラウザで見る Datasette 用 compose。
 - `ai-review-infra-design/`: 実装仕様として使った v0.1 設計パック。
@@ -148,6 +149,14 @@ PR コメントは以下の marker で識別します。
 ```
 
 `github-actions[bot]` が投稿した marker 付きコメントが既にある場合は、そのコメントを更新します。存在しない場合だけ新規コメントを作成します。
+
+## Precision review history (SQLite)
+
+この章は label-triggered workflow ではなく、手元で実行する precision review の履歴保存について説明します。precision reviewer の PR comment marker は以下です。
+
+```text
+<!-- local-ai-precision-review -->
+```
 
 precision review の評価データを SQLite に溜める場合は、以下を使います。
 

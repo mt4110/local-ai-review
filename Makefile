@@ -41,7 +41,7 @@ precision-review-self-test:
 pre-pr-review:
 	@test -n "$(REPO)" || { echo "REPO=owner/name is required"; exit 2; }
 	@test -n "$(PROJECT_DIR)" || { echo "PROJECT_DIR=/absolute/path/to/project is required"; exit 2; }
-	@tmp_diff="$$(mktemp /tmp/local-ai-pre-pr.XXXXXX.diff)"; \
+	@tmp_diff="$$(mktemp "$${TMPDIR:-/tmp}/local-ai-pre-pr.XXXXXX")"; \
 	trap 'rm -f "$$tmp_diff"' EXIT INT TERM; \
 	git -C "$(PROJECT_DIR)" rev-parse --verify "$(BASE)" >/dev/null; \
 	git -C "$(PROJECT_DIR)" diff "$(BASE)...HEAD" > "$$tmp_diff"; \
@@ -59,7 +59,7 @@ pre-pr-review:
 pre-pr-review-static:
 	@test -n "$(REPO)" || { echo "REPO=owner/name is required"; exit 2; }
 	@test -n "$(PROJECT_DIR)" || { echo "PROJECT_DIR=/absolute/path/to/project is required"; exit 2; }
-	@tmp_diff="$$(mktemp /tmp/local-ai-pre-pr.XXXXXX.diff)"; \
+	@tmp_diff="$$(mktemp "$${TMPDIR:-/tmp}/local-ai-pre-pr.XXXXXX")"; \
 	trap 'rm -f "$$tmp_diff"' EXIT INT TERM; \
 	git -C "$(PROJECT_DIR)" rev-parse --verify "$(BASE)" >/dev/null; \
 	git -C "$(PROJECT_DIR)" diff "$(BASE)...HEAD" > "$$tmp_diff"; \

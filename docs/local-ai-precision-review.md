@@ -1,22 +1,19 @@
 # Local AI Precision Review
 
-This runbook is for Copilot-style, diff-only local review calibration.
+この runbook は、diff-only の local review を file-by-file で校正するための手順です。
 
-The first MVP workflow sends the whole PR diff to the model once. That is safe,
-but it can miss small review comments that are easier to catch file by file. The
-precision reviewer keeps the same safety contract while reviewing smaller diff
-chunks.
+最初の MVP workflow は PR diff 全体を一度だけ model に渡します。安全ですが、file 単位で見ると拾いやすい小さな review comment を落とすことがあります。precision reviewer は同じ safety contract を保ったまま、小さな diff chunk に分けて確認します。
 
 ## Safety Contract
 
-- Do not checkout PR code.
-- Do not run PR code.
-- Do not run tests from the PR branch.
-- Do not mutate labels, workflow files, or repository content.
-- Fetch only the PR diff and review comments through the GitHub API.
-- Send diff text only to local Ollama.
+- PR code を checkout しない。
+- PR code を実行しない。
+- PR branch の test を実行しない。
+- label、workflow file、repository content を変更しない。
+- GitHub API から PR diff と review comment だけを取得する。
+- diff text は local Ollama にだけ送る。
 
-## Usage
+## 使い方
 
 ```sh
 python3 scripts/local-ai-precision-review.py \
@@ -25,7 +22,7 @@ python3 scripts/local-ai-precision-review.py \
   --output /tmp/geo-line-ranker-pr23-precision-review.md
 ```
 
-Every run is also persisted into SQLite by default.
+各 run はデフォルトで SQLite にも保存されます。
 
 ```sh
 python3 scripts/local-ai-precision-review.py \
@@ -35,7 +32,7 @@ python3 scripts/local-ai-precision-review.py \
   --db out/review-history/local-ai-review.db
 ```
 
-To post or update a marker comment on the PR:
+PR に marker comment を投稿または更新する場合:
 
 ```sh
 python3 scripts/local-ai-precision-review.py \
@@ -44,7 +41,7 @@ python3 scripts/local-ai-precision-review.py \
   --post-comment
 ```
 
-For a fast static-only calibration pass:
+高速な static-only calibration pass:
 
 ```sh
 python3 scripts/local-ai-precision-review.py \
@@ -53,7 +50,7 @@ python3 scripts/local-ai-precision-review.py \
   --max-model-files 0
 ```
 
-Or use the bundled make targets:
+同梱の make target も使えます。
 
 ```sh
 make precision-review REPO=mt4110/geo-line-ranker PR=23
@@ -67,7 +64,7 @@ make review-db-score RUN=6 USEFUL=0 FALSE_POSITIVES=0 UNCLEAR=1 REMOTE_READY=yes
 make review-db-down
 ```
 
-For a pre-PR static-only pass:
+pre-PR の static-only pass:
 
 ```sh
 make pre-pr-review-static \
@@ -76,69 +73,54 @@ make pre-pr-review-static \
   BASE=main
 ```
 
-`pre-pr-review` builds a temporary diff from `BASE...HEAD` in the target
-repository and, by default, appends the uncommitted working tree diff from
-`git diff HEAD`. Set `INCLUDE_WORKING_TREE=0` if you want only committed
-changes. If you prefer the remote default branch as the baseline, pass
-`BASE=origin/main`.
+`pre-pr-review` は対象 repository で `BASE...HEAD` から一時 diff を作り、デフォルトでは `git diff HEAD` の未commit差分も追加します。commit済み差分だけを見たい場合は `INCLUDE_WORKING_TREE=0` を指定します。remote default branch を baseline にしたい場合は `BASE=origin/main` を渡します。
 
 ## Calibration Rules
 
-Past high-signal review comments in `mt4110/geo-line-ranker` show that useful
-findings tend to be small and grounded:
+`mt4110/geo-line-ranker` の高信号 review comment では、役に立つ指摘は小さく、具体的で、diff に根拠があります。
 
-- API/schema drift, especially public fields that are non-optional in code but
-  optional in generated OpenAPI.
-- Recoverable configuration or database setup failures becoming panics.
-- Hard-coded local service URLs in tests/helpers.
-- Shell strict-mode traps around command substitution and pipelines.
-- Env/config mismatches between scripts, docs, and compose files.
-- Runtime breakage from read-only containers, tmpfs, non-root users, and missing
-  writable paths.
-- Tests that mock the behavior they were supposed to verify.
-- Documentation vocabulary drift for labels, statuses, and operating lanes.
+- API/schema drift。特に code では non-optional なのに generated OpenAPI では optional になる public field。
+- recoverable な configuration / database setup failure が panic になる変更。
+- test/helper 内の hard-coded local service URL。
+- shell strict-mode と command substitution / pipeline の罠。
+- script、docs、compose の env/config mismatch。
+- read-only container、tmpfs、non-root user、writable path 不足による runtime breakage。
+- 検証すべき behavior を mock してしまう test。
+- label、status、operating lane の vocabulary drift。
 
-Generic best-practice comments are intentionally filtered out or demoted to
-watch items. Examples: fixed container UIDs, Docker `COPY` "missing error
-handling", `/usr/local/bin` PATH concerns, and telemetry environment variables.
+generic な best-practice comment は filtered out するか watch item に落とします。例: fixed container UID、Docker `COPY` の missing error handling、`/usr/local/bin` PATH、telemetry environment variable。
 
-## Interpreting Output
+## Output の読み方
 
-`Findings` should be actionable enough to comment on a PR.
+`Findings` は PR comment にできる程度に actionable なものです。
 
-`Watch Items` are not findings. They are runtime or manual verification points,
-such as container smoke tests after read-only filesystem hardening.
+`Watch Items` は findings ではありません。read-only filesystem hardening 後の container smoke test など、runtime または manual verification の確認点です。
 
 ## SQLite History
 
-The history DB is for measuring whether local review is actually useful before
-remote review. It stores run metadata, findings, watch items, reviewed files,
-and an optional feedback row you can update later with SQL.
+history DB は、remote review の前に local review が実際に役立ったかを測るためのものです。run metadata、findings、watch items、reviewed files、後から更新できる feedback row を保存します。
 
-Default DB path:
+デフォルトの DB path:
 
 ```text
 out/review-history/local-ai-review.db
 ```
 
-Example browser view:
+browser view:
 
 ```sh
 make review-db-web
 ```
 
-This starts Datasette in Docker in the background, then opens
-`http://127.0.0.1:8003` in the browser. Datasette defaults to `8001`, so this
-repo binds `8003` to stay two ports above the default.
+Datasette を Docker でバックグラウンド起動し、`http://127.0.0.1:8003` を開きます。Datasette のデフォルトは `8001` なので、この repository では `8003` に bind します。
 
-To stop it:
+停止:
 
 ```sh
 make review-db-down
 ```
 
-Datasette is intentionally read-only here, so manual scoring is done through the
-CLI instead of browser `INSERT` statements:
+Datasette は read-only で立てるため、manual scoring は browser の `INSERT` ではなく CLI で行います。
 
 ```sh
 make review-db-score \
@@ -150,9 +132,9 @@ make review-db-score \
   NOTE='Static-only looked clean enough for PR.'
 ```
 
-If you prefer a desktop DB client, open the same file in DBeaver.
+desktop DB client を使う場合は、同じ DB file を DBeaver で開けます。
 
-Useful SQL examples live in:
+SQL 例:
 
 ```text
 sql/review-history-example-queries.sql
