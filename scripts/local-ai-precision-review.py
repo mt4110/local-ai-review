@@ -208,7 +208,7 @@ def github_request(path: str, token: str, *, accept: str = "application/vnd.gith
     )
     with urllib.request.urlopen(request, timeout=120) as response:
         raw = response.read()
-        if accept.endswith(".diff"):
+        if is_diff_media_type(accept):
             return raw.decode("utf-8", errors="replace")
         if not raw:
             return None
@@ -294,12 +294,30 @@ def neutralize_mentions(value: Any) -> str:
     return re.sub(r"@(?=[A-Za-z0-9_-])", "@" + "\u200b", str(value))
 
 
-def is_new_file_header(line: str) -> bool:
-    return line.startswith("+++ b/") or line == "+++ /dev/null"
+def is_diff_media_type(accept: str) -> bool:
+    media_type = accept.split(";", 1)[0].strip().lower()
+    return media_type.endswith(".diff") or media_type.endswith("+diff")
 
 
-def is_old_file_header(line: str) -> bool:
-    return line.startswith("--- a/") or line == "--- /dev/null"
+def patch_header_path(line: str, prefix: str) -> str:
+    return line.removeprefix(prefix).split("\t", 1)[0]
+
+
+def count_hunk_changes(lines: list[str]) -> tuple[int, int]:
+    additions = 0
+    deletions = 0
+    in_hunk = False
+    for line in lines:
+        if line.startswith("@@ "):
+            in_hunk = True
+            continue
+        if not in_hunk:
+            continue
+        if line.startswith("+"):
+            additions += 1
+        elif line.startswith("-"):
+            deletions += 1
+    return additions, deletions
 
 
 def parse_unified_diff(diff_text: str) -> list[FilePatch]:
@@ -307,22 +325,14 @@ def parse_unified_diff(diff_text: str) -> list[FilePatch]:
     current: list[str] = []
     old_path = ""
     new_path = ""
+    in_hunk = False
 
     def finish() -> None:
-        nonlocal current, old_path, new_path
+        nonlocal current, old_path, new_path, in_hunk
         if not current:
             return
         patch = "\n".join(current) + "\n"
-        additions = sum(
-            1
-            for line in current
-            if line.startswith("+") and not is_new_file_header(line)
-        )
-        deletions = sum(
-            1
-            for line in current
-            if line.startswith("-") and not is_old_file_header(line)
-        )
+        additions, deletions = count_hunk_changes(current)
         files.append(
             FilePatch(
                 path=new_path,
@@ -335,11 +345,13 @@ def parse_unified_diff(diff_text: str) -> list[FilePatch]:
         current = []
         old_path = ""
         new_path = ""
+        in_hunk = False
 
     for line in diff_text.splitlines():
         if line.startswith("diff --git "):
             finish()
             current = [line]
+            in_hunk = False
             match = re.match(r"diff --git a/(.*?) b/(.*)$", line)
             if match:
                 old_path = match.group(1)
@@ -347,10 +359,14 @@ def parse_unified_diff(diff_text: str) -> list[FilePatch]:
             continue
         if current:
             current.append(line)
-            if line.startswith("--- a/"):
-                old_path = line.removeprefix("--- a/")
-            elif line.startswith("+++ b/"):
-                new_path = line.removeprefix("+++ b/")
+            if line.startswith("@@ "):
+                in_hunk = True
+                continue
+            if not in_hunk:
+                if line.startswith("--- a/"):
+                    old_path = patch_header_path(line, "--- a/")
+                elif line.startswith("+++ b/"):
+                    new_path = patch_header_path(line, "+++ b/")
     finish()
     return files
 
@@ -363,7 +379,9 @@ def added_lines(file_patch: FilePatch) -> list[tuple[int | None, str]]:
         if hunk:
             new_line = int(hunk.group(1))
             continue
-        if is_new_file_header(raw) or is_old_file_header(raw):
+        if raw.startswith("\\ No newline"):
+            continue
+        if new_line is None:
             continue
         if raw.startswith("+"):
             lines.append((new_line, raw[1:]))
@@ -1260,6 +1278,7 @@ def post_or_update_comment(owner: str, repo: str, pr_number: int, token: str, bo
 def self_test() -> None:
     assert parse_model_json("[]") == []
     assert neutralize_mentions("@team ping") == "@" + "\u200b" + "team ping"
+    assert is_diff_media_type("application/vnd.github.v3.diff")
     assert validate_ollama_base_url("http://127.0.0.1:11434", allow_remote=False) == (
         "http://127.0.0.1:11434"
     )
@@ -1270,18 +1289,20 @@ def self_test() -> None:
     else:
         raise AssertionError("remote Ollama URL should require an explicit override")
 
-    edge = parse_unified_diff(
-        """diff --git a/example.txt b/example.txt
+    edge = parse_unified_diff("""diff --git a/example.txt b/example.txt
 --- a/example.txt
-+++ b/example.txt
++++ b/example.txt\t2026-04-30
 @@ -1,2 +1,2 @@
+--- a/not-a-header
++++ b/not-a-header
 ---- removed heading
 ++++ added heading
 """
     )
-    assert edge[0].additions == 1
-    assert edge[0].deletions == 1
-    assert added_lines(edge[0]) == [(1, "+++ added heading")]
+    assert edge[0].path == "example.txt"
+    assert edge[0].additions == 2
+    assert edge[0].deletions == 2
+    assert added_lines(edge[0]) == [(1, "++ b/not-a-header"), (2, "+++ added heading")]
 
     sample = """diff --git a/crates/api-contracts/src/lib.rs b/crates/api-contracts/src/lib.rs
 --- a/crates/api-contracts/src/lib.rs
