@@ -43,12 +43,16 @@ pre-pr-review:
 	@test -n "$(PROJECT_DIR)" || { echo "PROJECT_DIR=/absolute/path/to/project is required"; exit 2; }
 	@set -e; \
 	tmp_diff="$$(mktemp "$${TMPDIR:-/tmp}/local-ai-pre-pr.XXXXXX")"; \
-	trap 'rm -f "$$tmp_diff"' EXIT INT TERM; \
+	tmp_index="$$(mktemp "$${TMPDIR:-/tmp}/local-ai-pre-pr-index.XXXXXX")"; \
+	trap 'rm -f "$$tmp_diff" "$$tmp_index"' EXIT INT TERM; \
+	index_path="$$(git -C "$(PROJECT_DIR)" rev-parse --git-path index)"; \
+	if [ -f "$$index_path" ]; then cp "$$index_path" "$$tmp_index"; else git -C "$(PROJECT_DIR)" read-tree --index-output="$$tmp_index" HEAD; fi; \
 	git -C "$(PROJECT_DIR)" rev-parse --verify "$(BASE)" >/dev/null; \
 	git -C "$(PROJECT_DIR)" diff "$(BASE)...HEAD" > "$$tmp_diff"; \
 	if [ "$(INCLUDE_WORKING_TREE)" = "1" ]; then \
 		printf '\n' >> "$$tmp_diff"; \
-		git -C "$(PROJECT_DIR)" diff HEAD >> "$$tmp_diff"; \
+		GIT_INDEX_FILE="$$tmp_index" git -C "$(PROJECT_DIR)" add -N -- .; \
+		GIT_INDEX_FILE="$$tmp_index" git -C "$(PROJECT_DIR)" diff HEAD >> "$$tmp_diff"; \
 	fi; \
 	python3 scripts/local-ai-precision-review.py \
 		--repo "$(REPO)" \
@@ -62,12 +66,16 @@ pre-pr-review-static:
 	@test -n "$(PROJECT_DIR)" || { echo "PROJECT_DIR=/absolute/path/to/project is required"; exit 2; }
 	@set -e; \
 	tmp_diff="$$(mktemp "$${TMPDIR:-/tmp}/local-ai-pre-pr.XXXXXX")"; \
-	trap 'rm -f "$$tmp_diff"' EXIT INT TERM; \
+	tmp_index="$$(mktemp "$${TMPDIR:-/tmp}/local-ai-pre-pr-index.XXXXXX")"; \
+	trap 'rm -f "$$tmp_diff" "$$tmp_index"' EXIT INT TERM; \
+	index_path="$$(git -C "$(PROJECT_DIR)" rev-parse --git-path index)"; \
+	if [ -f "$$index_path" ]; then cp "$$index_path" "$$tmp_index"; else git -C "$(PROJECT_DIR)" read-tree --index-output="$$tmp_index" HEAD; fi; \
 	git -C "$(PROJECT_DIR)" rev-parse --verify "$(BASE)" >/dev/null; \
 	git -C "$(PROJECT_DIR)" diff "$(BASE)...HEAD" > "$$tmp_diff"; \
 	if [ "$(INCLUDE_WORKING_TREE)" = "1" ]; then \
 		printf '\n' >> "$$tmp_diff"; \
-		git -C "$(PROJECT_DIR)" diff HEAD >> "$$tmp_diff"; \
+		GIT_INDEX_FILE="$$tmp_index" git -C "$(PROJECT_DIR)" add -N -- .; \
+		GIT_INDEX_FILE="$$tmp_index" git -C "$(PROJECT_DIR)" diff HEAD >> "$$tmp_diff"; \
 	fi; \
 	python3 scripts/local-ai-precision-review.py \
 		--repo "$(REPO)" \
