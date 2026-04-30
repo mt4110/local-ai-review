@@ -195,6 +195,16 @@ def github_token() -> str:
         raise SystemExit(f"GITHUB_TOKEN is unset and gh auth token failed: {exc}") from exc
 
 
+def github_authenticated_login(token: str) -> str:
+    try:
+        payload = github_request("/user", token)
+    except Exception:  # noqa: BLE001 - comment ownership is best-effort.
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("login", ""))
+
+
 def github_request(path: str, token: str, *, accept: str = "application/vnd.github+json") -> Any:
     url = path if path.startswith("https://") else f"{GITHUB_API}{path}"
     request = urllib.request.Request(
@@ -292,6 +302,13 @@ def validate_ollama_base_url(value: str, *, allow_remote: bool) -> str:
 
 def neutralize_mentions(value: Any) -> str:
     return re.sub(r"@(?=[A-Za-z0-9_-])", "@" + "\u200b", str(value))
+
+
+def marker_comment_owned_by(comment: dict[str, Any], owner_login: str) -> bool:
+    if not owner_login:
+        return False
+    login = str((comment.get("user") or {}).get("login", ""))
+    return login.lower() == owner_login.lower() and MARKER in str(comment.get("body", ""))
 
 
 def is_diff_media_type(accept: str) -> bool:
@@ -1254,9 +1271,10 @@ def render_report(
 
 def post_or_update_comment(owner: str, repo: str, pr_number: int, token: str, body: str) -> None:
     comments = github_paginated_request(f"/repos/{owner}/{repo}/issues/{pr_number}/comments", token)
+    owner_login = github_authenticated_login(token)
     existing = None
     for comment in comments:
-        if isinstance(comment, dict) and MARKER in str(comment.get("body", "")):
+        if isinstance(comment, dict) and marker_comment_owned_by(comment, owner_login):
             existing = comment
             break
     if existing:
@@ -1279,6 +1297,14 @@ def self_test() -> None:
     assert parse_model_json("[]") == []
     assert neutralize_mentions("@team ping") == "@" + "\u200b" + "team ping"
     assert is_diff_media_type("application/vnd.github.v3.diff")
+    assert marker_comment_owned_by(
+        {"user": {"login": "github-actions[bot]"}, "body": f"{MARKER}\nbody"},
+        "github-actions[bot]",
+    )
+    assert not marker_comment_owned_by(
+        {"user": {"login": "human"}, "body": f"{MARKER}\nbody"},
+        "github-actions[bot]",
+    )
     assert validate_ollama_base_url("http://127.0.0.1:11434", allow_remote=False) == (
         "http://127.0.0.1:11434"
     )
@@ -1447,11 +1473,6 @@ def main() -> None:
         raise SystemExit("--repo and --pr are required unless --diff-file is used")
     if args.diff_file and args.post_comment:
         raise SystemExit("--post-comment cannot be used with --diff-file; review a PR directly to post comments")
-    args.ollama_base_url = validate_ollama_base_url(
-        args.ollama_base_url,
-        allow_remote=args.allow_remote_ollama,
-    )
-
     token = github_token() if args.repo and not args.diff_file else ""
     if args.diff_file:
         repo = args.repo or "local/diff"
@@ -1490,6 +1511,11 @@ def main() -> None:
         for item in files
         if should_model_review(item, args.max_file_bytes)
     ][: args.max_model_files]
+    if model_candidates:
+        args.ollama_base_url = validate_ollama_base_url(
+            args.ollama_base_url,
+            allow_remote=args.allow_remote_ollama,
+        )
     reviewed_files: list[str] = []
     for file_patch in model_candidates:
         reviewed_files.append(file_patch.path)
