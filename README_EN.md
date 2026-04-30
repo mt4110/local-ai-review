@@ -172,6 +172,11 @@ make review-db-score RUN=6 USEFUL=0 FALSE_POSITIVES=0 UNCLEAR=1 REMOTE_READY=yes
 make review-db-down
 ```
 
+`pre-pr-review` stores branch diffs before PR creation as `review_kind=pre_pr`.
+The DB also records the `BASE...HEAD` base/head, head SHA, and whether
+uncommitted changes were included, which makes the run easier to compare with
+the later remote review.
+
 `make review-db-web` starts Datasette in Docker in the background and opens the DB at `http://127.0.0.1:8003`. Datasette defaults to `8001`, so this repo binds `8003` to stay two ports above the default. Stop it with `make review-db-down`. Datasette is intentionally read-only here, so manual scoring goes through `make review-db-score ...`. If you prefer a desktop client, open `out/review-history/local-ai-review.db` in DBeaver.
 
 ## Test Procedure

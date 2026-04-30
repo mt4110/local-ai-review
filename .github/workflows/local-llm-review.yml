@@ -152,12 +152,20 @@ jobs:
           - broken edge cases
           - breaking API changes
           - missing tests for risky behavior
+          - public API or documentation examples that no longer match exported symbols, option names, or response shapes
+          - framework recipe mistakes around client/server boundaries or browser-only APIs
+          - upload/persistence contract drift, such as confusing temporary preview URLs with stored URLs or object keys
+          - TypeScript/TSX snippets that are unlikely to typecheck from the imports and values shown in the diff
 
           Ignore:
           - formatting
           - style-only issues
           - naming preferences
           - speculative concerns
+          - documentation placeholders that are explicitly marked for replacement, such as example CDN domains or storage signing stubs
+          - MIME fallback snippets like context.mimeType ?? file.type when the same value is validated, signed, and returned in upload headers
+          - Next.js app-shell imports of package CSS
+          - nullable image field state or optional previewSrc in form edit state when submit code strips previewSrc from persisted payloads
 
           Rules:
           - Return at most {max_findings} findings.
