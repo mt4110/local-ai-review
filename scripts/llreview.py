@@ -50,6 +50,10 @@ class GitHubRepo:
     def full_name(self) -> str:
         return f"{self.owner}/{self.name}"
 
+    @property
+    def is_local(self) -> bool:
+        return self.owner == "local"
+
 
 @dataclass(frozen=True)
 class Workspace:
@@ -113,14 +117,38 @@ def parse_github_remote(url: str) -> GitHubRepo:
     raise SystemExit(f"Could not infer GitHub owner/repo from remote: {url}")
 
 
+def github_remotes(root: Path) -> list[tuple[str, GitHubRepo]]:
+    remotes: list[tuple[str, GitHubRepo]] = []
+    remote_names = git(root, "remote", check=False).splitlines()
+    seen: set[str] = set()
+    for name in remote_names:
+        url = git(root, "remote", "get-url", name, check=False)
+        if not url:
+            continue
+        try:
+            repo = parse_github_remote(url)
+        except SystemExit:
+            continue
+        if repo.full_name in seen:
+            continue
+        seen.add(repo.full_name)
+        remotes.append((name, repo))
+    return remotes
+
+
 def detect_repo(root: Path, override: str | None) -> GitHubRepo:
     if override:
         if "/" not in override:
             raise SystemExit("--repo must be owner/name")
         owner, name = override.split("/", 1)
         return GitHubRepo(owner, name)
-    remote = git(root, "config", "--get", "remote.origin.url")
-    return parse_github_remote(remote)
+    remotes = github_remotes(root)
+    for remote_name, repo in remotes:
+        if remote_name == "origin":
+            return repo
+    if remotes:
+        return remotes[0][1]
+    return GitHubRepo("local", root.name)
 
 
 def github_token() -> tuple[str, str]:
@@ -184,21 +212,63 @@ def detect_base_ref(root: Path) -> str:
     fallback = "HEAD~1"
     if git(root, "rev-parse", "--verify", fallback, check=False):
         return fallback
+    if git(root, "rev-parse", "--verify", "HEAD", check=False):
+        return "HEAD"
     attempted = ", ".join(seen) or "(none)"
     raise SystemExit(
         "Could not resolve a base ref for pre-PR review. "
-        f"Tried {attempted} and {fallback}. Pass an explicit PR number or set origin/HEAD."
+        f"Tried {attempted}, {fallback}, and HEAD. Pass an explicit PR number or set origin/HEAD."
     )
 
 
-def find_open_pr(repo: GitHubRepo, branch: str, token: str) -> dict[str, Any] | None:
+def find_open_pr(
+    repo: GitHubRepo,
+    branch: str,
+    token: str,
+    *,
+    head_owner: str | None = None,
+) -> dict[str, Any] | None:
     if not token or not branch:
         return None
-    query = urllib.parse.urlencode({"state": "open", "head": f"{repo.owner}:{branch}"})
+    owner = head_owner or repo.owner
+    query = urllib.parse.urlencode({"state": "open", "head": f"{owner}:{branch}"})
     payload = github_request(f"/repos/{repo.full_name}/pulls?{query}", token)
     if isinstance(payload, list) and payload:
         return payload[0]
     return None
+
+
+def find_open_pr_across_remotes(
+    repo: GitHubRepo,
+    remotes: list[tuple[str, GitHubRepo]],
+    branch: str,
+    token: str,
+) -> tuple[GitHubRepo, dict[str, Any] | None, str]:
+    if repo.is_local or not token or not branch:
+        return repo, None, ""
+    base_candidates = [repo]
+    for _, remote_repo in remotes:
+        if remote_repo not in base_candidates:
+            base_candidates.append(remote_repo)
+    head_owners = [repo.owner]
+    for remote_name, remote_repo in remotes:
+        if remote_name == "origin" and remote_repo.owner not in head_owners:
+            head_owners.append(remote_repo.owner)
+    for _, remote_repo in remotes:
+        if remote_repo.owner not in head_owners:
+            head_owners.append(remote_repo.owner)
+
+    errors: list[str] = []
+    for base_repo in base_candidates:
+        for head_owner in head_owners:
+            try:
+                pr = find_open_pr(base_repo, branch, token, head_owner=head_owner)
+            except GitHubRequestError as exc:
+                errors.append(str(exc))
+                continue
+            if pr:
+                return base_repo, pr, ""
+    return repo, None, "; ".join(errors)
 
 
 def fetch_pr(repo: GitHubRepo, pr_number: int) -> tuple[dict[str, Any] | None, str]:
@@ -214,6 +284,7 @@ def fetch_pr(repo: GitHubRepo, pr_number: int) -> tuple[dict[str, Any] | None, s
 
 def detect_workspace(project_dir: Path, repo_override: str | None = None) -> Workspace:
     root = discover_git_root(project_dir)
+    remotes = github_remotes(root)
     repo = detect_repo(root, repo_override)
     branch = git(root, "branch", "--show-current", check=False)
     head_sha = git(root, "rev-parse", "HEAD")
@@ -221,11 +292,11 @@ def detect_workspace(project_dir: Path, repo_override: str | None = None) -> Wor
     dirty = bool(git(root, "status", "--porcelain", check=False))
     token, token_status = github_token()
     open_pr = None
-    if token and branch:
-        try:
-            open_pr = find_open_pr(repo, branch, token)
-        except Exception as exc:  # noqa: BLE001 - local pre-PR review can still work.
-            token_status = f"{token_status}; PR lookup failed ({exc.__class__.__name__}: {exc})"
+    if token and branch and not repo.is_local:
+        pr_repo, open_pr, lookup_error = find_open_pr_across_remotes(repo, remotes, branch, token)
+        repo = pr_repo
+        if lookup_error:
+            token_status = f"{token_status}; PR lookup failed ({lookup_error})"
     if open_pr:
         base_ref = str((open_pr.get("base") or {}).get("ref") or base_ref)
         head_sha = str((open_pr.get("head") or {}).get("sha") or head_sha)
