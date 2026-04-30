@@ -44,6 +44,7 @@ def main() -> None:
         raise SystemExit(f"DB file does not exist: {db_path}")
 
     with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
         row = connection.execute(
             "select id, repo from review_runs where id = ?",
             (args.run_id,),
