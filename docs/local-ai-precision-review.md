@@ -110,6 +110,7 @@ v1.0 evidence loop 用に、従来の `findings` / `watch_items` に加えて `r
 ./llreview install
 llreview status
 llreview
+llreview --update
 llreview score
 llreview report
 llreview export-jsonl
