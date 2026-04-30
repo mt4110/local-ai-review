@@ -158,6 +158,20 @@ PR コメントは以下の marker で識別します。
 <!-- local-ai-precision-review -->
 ```
 
+日常利用では、まず薄い CLI の `llreview` を使います。現在の Git workspace から repository、branch、open PR を自動検知し、PR が見つからない場合は `BASE...HEAD` と working tree を pre-PR review として扱います。
+
+```sh
+./llreview
+./llreview 42
+./llreview --post
+./llreview status
+./llreview score
+./llreview report
+./llreview export-jsonl
+```
+
+TTY では進行中の phase、elapsed、model-reviewed file count、finding/watch count を 1 行で更新します。CI や log 保存では `--plain` を使うと通常の行ログになります。
+
 precision review の評価データを SQLite に溜める場合は、以下を使います。
 
 ```sh
