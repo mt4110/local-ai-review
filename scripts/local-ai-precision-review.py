@@ -309,7 +309,7 @@ class WatchItem:
 
 
 def stable_fingerprint(*parts: Any) -> str:
-    normalized = "\n".join(str(part or "").strip() for part in parts)
+    normalized = "\n".join("" if part is None else str(part) for part in parts)
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 

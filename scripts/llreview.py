@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -60,6 +61,10 @@ class Workspace:
     dirty: bool
     open_pr: dict[str, Any] | None
     token_status: str
+
+
+class GitHubRequestError(Exception):
+    """Readable GitHub API failure for CLI paths."""
 
 
 def run(
@@ -148,8 +153,15 @@ def github_request(path: str, token: str) -> Any:
             "User-Agent": "llreview",
         },
     )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        raw = response.read()
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        raw_error = exc.read().decode("utf-8", errors="replace").strip()
+        detail = f": {raw_error}" if raw_error else ""
+        raise GitHubRequestError(f"GitHub API {path} failed with HTTP {exc.code}{detail}") from exc
+    except urllib.error.URLError as exc:
+        raise GitHubRequestError(f"GitHub API {path} failed: {exc.reason}") from exc
     if not raw:
         return None
     return json.loads(raw.decode("utf-8"))
@@ -169,7 +181,14 @@ def detect_base_ref(root: Path) -> str:
         seen.add(candidate)
         if git(root, "rev-parse", "--verify", candidate, check=False):
             return candidate
-    return "main"
+    fallback = "HEAD~1"
+    if git(root, "rev-parse", "--verify", fallback, check=False):
+        return fallback
+    attempted = ", ".join(seen) or "(none)"
+    raise SystemExit(
+        "Could not resolve a base ref for pre-PR review. "
+        f"Tried {attempted} and {fallback}. Pass an explicit PR number or set origin/HEAD."
+    )
 
 
 def find_open_pr(repo: GitHubRepo, branch: str, token: str) -> dict[str, Any] | None:
@@ -186,7 +205,10 @@ def fetch_pr(repo: GitHubRepo, pr_number: int) -> tuple[dict[str, Any] | None, s
     token, token_status = github_token()
     if not token:
         return None, token_status
-    payload = github_request(f"/repos/{repo.full_name}/pulls/{pr_number}", token)
+    try:
+        payload = github_request(f"/repos/{repo.full_name}/pulls/{pr_number}", token)
+    except GitHubRequestError as exc:
+        raise SystemExit(str(exc)) from exc
     return payload if isinstance(payload, dict) else None, token_status
 
 
@@ -631,9 +653,12 @@ def command_status(args: argparse.Namespace) -> None:
 
 
 def parse_non_negative(value: str) -> int:
-    parsed = int(value)
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a non-negative integer") from exc
     if parsed < 0:
-        raise ValueError("expected a non-negative integer")
+        raise argparse.ArgumentTypeError("expected a non-negative integer")
     return parsed
 
 
@@ -645,7 +670,7 @@ def prompt_int(label: str, default: int | None = None) -> int:
             return default
         try:
             return parse_non_negative(raw)
-        except ValueError as exc:
+        except argparse.ArgumentTypeError as exc:
             print(exc)
 
 
@@ -893,12 +918,12 @@ def build_score_parser() -> argparse.ArgumentParser:
     score = argparse.ArgumentParser(description="Score the latest unscored run")
     score.set_defaults(func=command_score)
     score.add_argument("--db", default=str(DEFAULT_DB))
-    score.add_argument("--run", type=int)
-    score.add_argument("--useful", type=int)
-    score.add_argument("--false-positives", type=int)
-    score.add_argument("--unclear", type=int)
+    score.add_argument("--run", type=parse_non_negative)
+    score.add_argument("--useful", type=parse_non_negative)
+    score.add_argument("--false-positives", type=parse_non_negative)
+    score.add_argument("--unclear", type=parse_non_negative)
     score.add_argument("--remote-ready", type=int, choices=[0, 1])
-    score.add_argument("--remote-findings", type=int)
+    score.add_argument("--remote-findings", type=parse_non_negative)
     score.add_argument("--note")
     return score
 
