@@ -17,15 +17,25 @@ def parse_bool_flag(value: str) -> int:
     raise argparse.ArgumentTypeError("expected yes/no, true/false, or 1/0")
 
 
+def parse_non_negative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a non-negative integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("expected a non-negative integer")
+    return parsed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True, help="Path to the SQLite review DB")
     parser.add_argument("--run-id", required=True, type=int, help="review_runs.id to score")
-    parser.add_argument("--useful-findings-fixed", required=True, type=int)
-    parser.add_argument("--false-positives", required=True, type=int)
-    parser.add_argument("--unclear-findings", required=True, type=int)
+    parser.add_argument("--useful-findings-fixed", required=True, type=parse_non_negative_int)
+    parser.add_argument("--false-positives", required=True, type=parse_non_negative_int)
+    parser.add_argument("--unclear-findings", required=True, type=parse_non_negative_int)
     parser.add_argument("--would-request-remote-review-now", required=True, type=parse_bool_flag)
-    parser.add_argument("--remote-findings-count", type=int)
+    parser.add_argument("--remote-findings-count", type=parse_non_negative_int)
     parser.add_argument("--note", default="", help="Short manual note about the run")
     args = parser.parse_args()
 
