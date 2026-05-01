@@ -936,6 +936,7 @@ def score_review_items(connection: sqlite3.Connection, run_id: int) -> None:
         current = existing.get(int(item["id"]))
         current_verdict = str(current["verdict"]) if current else ""
         current_reason = str(current["reason"]) if current and "reason" in current.keys() else ""
+        current_note = str(current["note"]) if current and "note" in current.keys() else ""
         location = item["path"]
         if item["line"] is not None:
             location = f"{location}:{item['line']}"
@@ -947,11 +948,16 @@ def score_review_items(connection: sqlite3.Connection, run_id: int) -> None:
             print(f"   fix: {truncate_text(item['fix'])}")
         if current:
             print(f"   current: {current_verdict} reason={current_reason or '(none)'}")
+            if current_note:
+                print(f"   current note: {truncate_text(current_note)}")
         verdict = prompt_item_verdict(current_verdict)
         if verdict == "skip":
             continue
         reason = prompt_reason(verdict, current_reason)
-        note = input("Item note []: ").strip()
+        note_input = input("Item note [keep]: " if current else "Item note []: ").strip()
+        note = current_note if current and note_input == "" else note_input
+        if current and verdict == current_verdict and reason == current_reason and note == current_note:
+            continue
         connection.execute(
             """
             INSERT INTO item_verdicts (
@@ -1167,6 +1173,7 @@ def command_report(args: argparse.Namespace) -> None:
             ).fetchall()
     scored_item_total = sum(int(row["count"] or 0) for row in verdict_rows)
     run_feedback_total = useful_total + false_positive_total + unclear_total
+    remote_ready_display = f"{remote_ready_total}/{len(scored_rows)}" if scored_rows else "n/a"
     lines = [
         "# Review Benchmark Report",
         "",
@@ -1182,7 +1189,7 @@ def command_report(args: argparse.Namespace) -> None:
         f"- Useful fixed: {useful_total} ({percent(useful_total, run_feedback_total)})",
         f"- False positives: {false_positive_total} ({percent(false_positive_total, run_feedback_total)})",
         f"- Unclear: {unclear_total} ({percent(unclear_total, run_feedback_total)})",
-        f"- Remote review requested: {remote_ready_total}/{len(scored_rows)}",
+        f"- Remote review requested: {remote_ready_display}",
         f"- Remote findings: {remote_findings_total}",
         f"- Normalized item verdict coverage: {scored_item_total}/{normalized_finding_items}",
         "",
