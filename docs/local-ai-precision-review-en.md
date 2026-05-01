@@ -107,6 +107,18 @@ Generic best-practice comments are intentionally filtered out or demoted to
 watch items. Examples: fixed container UIDs, Docker `COPY` "missing error
 handling", `/usr/local/bin` PATH concerns, and telemetry environment variables.
 
+When `covered_by_existing_safeguard` repeats, update prompt/calibration before
+adding suppression rules. Security findings such as path traversal, injection,
+or unsafe file access must inspect downstream validation visible in the diff:
+safe path helpers, absolute/parent path rejection, and artifact-root containment.
+If a safeguard is already visible, demote the concern to a watch item for
+negative tests or runtime verification instead of reporting a finding.
+
+Artifact consistency manifests such as `checksums.txt` are not trust anchors
+that must authenticate themselves. Do not report "known good checksum" or
+self-integrity requirements unless the diff shows a concrete bypass after path
+validation or a real security boundary that trusts the checksum file.
+
 ## Interpreting Output
 
 `Findings` should be actionable enough to comment on a PR.

@@ -92,6 +92,10 @@ pre-PR run は DB に `review_kind=pre_pr` として保存されます。`base_r
 
 generic な best-practice comment は filtered out するか watch item に落とします。例: fixed container UID、Docker `COPY` の missing error handling、`/usr/local/bin` PATH、telemetry environment variable。
 
+`covered_by_existing_safeguard` が続く場合は、まず prompt/calibration を更新します。とくに path traversal、injection、unsafe file access のような security finding は、diff に見えている downstream validation、safe path helper、artifact-root containment を読んでから finding にします。既存対策が見えている場合は finding ではなく、negative test や runtime 確認の watch item に落とします。
+
+`checksums.txt` のような artifact 内整合性用 manifest は、それ自体を trust anchor として扱いません。既知ハッシュで自己認証しろ、という指摘は基本的に空振りです。path validation 後にも成立する具体的な bypass が見える場合だけ finding にします。
+
 ## Output の読み方
 
 `Findings` は PR comment にできる程度に actionable なものです。

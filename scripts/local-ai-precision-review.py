@@ -981,6 +981,13 @@ Calibration from prior high-signal reviews:
   fields are expected to use null.
 - Catch tests that mock the behavior they are supposed to verify.
 - Catch documentation vocabulary drift when labels/statuses are treated inconsistently.
+- Before reporting security issues such as path traversal, injection, or unsafe file access,
+  inspect the downstream validation shown in the diff. If the changed code already routes
+  inputs through a safe path helper, rejects absolute/parent paths, or checks artifact-root
+  containment, do not report a finding; at most add a watch item for missing negative tests.
+- Do not treat a checksum manifest used only for local artifact consistency as a trust anchor
+  that must authenticate itself. Only report checksum handling when the diff shows a concrete
+  bypass after path validation or a security boundary that actually trusts the checksum file.
 
 Return JSON only, with this shape:
 {{
@@ -1201,6 +1208,51 @@ def calibrate_model_finding(path: str, item: dict[str, Any]) -> tuple[Finding | 
     )
     if any(pattern in text for pattern in low_value_patterns):
         return None, None
+
+    existing_safeguard_security_patterns = (
+        (
+            "path traversal",
+            "safe_relative_artifact_path",
+            "absolute paths",
+            "..",
+        ),
+        (
+            "path traversal",
+            "artifact-root",
+            "containment",
+        ),
+        (
+            "path traversal",
+            "safe_artifact_file",
+            "is_relative_to_path",
+        ),
+        (
+            "checksum",
+            "trust anchor",
+            "checksums.txt",
+        ),
+        (
+            "checksum",
+            "known good",
+            "checksums.txt",
+        ),
+        (
+            "checksum",
+            "tampered",
+            "checksums.txt",
+        ),
+    )
+    if any(all(pattern in text for pattern in patterns) for patterns in existing_safeguard_security_patterns):
+        return None, WatchItem(
+            source="model",
+            path=path,
+            title=title,
+            body=body,
+            verification=(
+                fix
+                or "Verify negative tests cover absolute paths, parent paths, and artifact-root containment."
+            ),
+        )
 
     if is_docs_path:
         if any(pattern in text for pattern in ("css import location", "style conflicts")):
@@ -1970,6 +2022,35 @@ diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-
         finding, watch_item = calibrate_model_finding(false_positive_path, false_positive)
         assert finding is None
         assert watch_item is None
+
+    safeguarded_security_finding, safeguarded_security_watch = calibrate_model_finding(
+        "scripts/local_review_eval.py",
+        {
+            "severity": "P2",
+            "confidence": "medium",
+            "title": "Potential path traversal vulnerability",
+            "body": (
+                "While safe_relative_artifact_path checks for absolute paths and '..' "
+                "components, parse_checksums uses raw_path.split which could be risky."
+            ),
+            "fix": "Use a more robust parser for checksums.txt.",
+        },
+    )
+    assert safeguarded_security_finding is None
+    assert safeguarded_security_watch is not None
+
+    checksum_anchor_finding, checksum_anchor_watch = calibrate_model_finding(
+        "scripts/local_review_eval.py",
+        {
+            "severity": "P2",
+            "confidence": "medium",
+            "title": "Insecure checksum validation",
+            "body": "checksums.txt could be tampered with and should be verified against a known good hash.",
+            "fix": "Add a known good checksum for checksums.txt.",
+        },
+    )
+    assert checksum_anchor_finding is None
+    assert checksum_anchor_watch is not None
 
     docs_contract_finding, docs_contract_watch = calibrate_model_finding(
         "docs/uploads.md",
