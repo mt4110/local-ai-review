@@ -118,7 +118,32 @@ such as container smoke tests after read-only filesystem hardening.
 
 The history DB is for measuring whether local review is actually useful before
 remote review. It stores run metadata, pre-PR context, findings, watch items,
-reviewed files, and an optional feedback row you can update later with SQL.
+reviewed files, and an optional feedback row you can update later from the CLI.
+For the v1.0 evidence loop, normalized local items are stored in `review_items`,
+external or human-review items belong in `external_items`, and item-level
+scoring is stored in `item_verdicts`. `missed` belongs to external/human items,
+not to local findings.
+
+Daily entrypoints:
+
+```sh
+./llreview install
+llreview status
+llreview
+llreview --update
+llreview score
+llreview report
+llreview export-jsonl
+```
+
+`llreview score` selects the latest unscored run and records run-level counts.
+In a TTY it also prompts for per-finding verdicts: `useful_fixed`,
+`false_positive`, `unclear`, or `watch_only`. False positives keep a short
+reason code such as `covered_by_existing_safeguard`, `intentional_behavior`,
+`environment_dependent`, `covered_by_tests`, `stale_or_already_fixed`, or
+`diagnostic_watch`. A single false positive is evidence, not an automatic
+suppression rule; repeated reasons become prompt/local-rule candidates in
+`llreview report`.
 
 Default DB path:
 

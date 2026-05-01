@@ -116,6 +116,12 @@ llreview report
 llreview export-jsonl
 ```
 
+`llreview score` は直近の未採点 run を選び、run 単位の `useful` / `false_positive` / `unclear` count を保存します。TTY では続けて finding 単位の verdict も入力できます。local finding の verdict は `useful_fixed` / `false_positive` / `unclear` / `watch_only` に限定し、`missed` は外部・人間レビューで見つかった `external_items` 側にだけ付けます。
+
+finding 単位の false positive は、理由コードも残します。まずは `covered_by_existing_safeguard`、`intentional_behavior`、`environment_dependent`、`covered_by_tests`、`stale_or_already_fixed`、`diagnostic_watch` を使い、同じ理由が複数回出たものだけ prompt または local-rule update 候補として扱います。1回の空振りだけで suppress しないのが基本です。
+
+`llreview report` は直近10件を benchmark markdown として出力し、run 単位の useful/false positive/unclear 率、remote review 差分、runtime、item verdict reason の集計をまとめます。
+
 デフォルトの DB path:
 
 ```text

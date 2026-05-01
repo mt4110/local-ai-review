@@ -161,6 +161,7 @@ CREATE TABLE IF NOT EXISTS item_verdicts (
     target_kind TEXT NOT NULL,
     target_id INTEGER NOT NULL,
     verdict TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
     note TEXT NOT NULL DEFAULT '',
     scorer TEXT NOT NULL DEFAULT '',
     scored_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -277,6 +278,10 @@ REVIEW_RUNS_COLUMN_MIGRATIONS = (
     ),
 )
 
+ITEM_VERDICTS_COLUMN_MIGRATIONS = (
+    ("reason", "ALTER TABLE item_verdicts ADD COLUMN reason TEXT NOT NULL DEFAULT ''"),
+)
+
 
 @dataclasses.dataclass(frozen=True)
 class FilePatch:
@@ -371,15 +376,22 @@ def review_run_summary_view_needs_rebuild(connection: sqlite3.Connection) -> boo
 
 
 def migrate_db_schema(connection: sqlite3.Connection) -> None:
-    existing_columns = {
+    review_run_columns = {
         str(row[1])
         for row in connection.execute("PRAGMA table_info(review_runs)").fetchall()
     }
     migrated = False
     for column, statement in REVIEW_RUNS_COLUMN_MIGRATIONS:
-        if column not in existing_columns:
+        if column not in review_run_columns:
             connection.execute(statement)
             migrated = True
+    item_verdict_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(item_verdicts)").fetchall()
+    }
+    for column, statement in ITEM_VERDICTS_COLUMN_MIGRATIONS:
+        if column not in item_verdict_columns:
+            connection.execute(statement)
     if migrated or review_run_summary_view_needs_rebuild(connection):
         connection.execute("DROP VIEW IF EXISTS review_run_summary")
         connection.executescript(REVIEW_RUN_SUMMARY_VIEW_SQL)
