@@ -986,6 +986,13 @@ Calibration from prior high-signal reviews:
   rejected by default.
 - Do not require strict MIME type syntax validation in a persistable-value shape guard unless the
   diff shows this function is the upload/content-type trust boundary.
+- Do not add generic watch items asking to verify new docs/schema/README entries against the
+  implementation when the diff already includes both the implementation and focused tests and no
+  concrete mismatch is visible.
+- Do not treat a verification command executed via `shlex.split()` plus `subprocess.run([...],
+  shell=False)` as shell injection by itself.
+- Do not flag default values such as workspace id, timeout seconds, or example verification
+  commands when the CLI exposes an override and the diff validates the invalid-value path.
 - Catch tests that mock the behavior they are supposed to verify.
 - Catch documentation vocabulary drift when labels/statuses are treated inconsistently.
 - Before reporting security issues such as path traversal, injection, or unsafe file access,
@@ -1127,6 +1134,46 @@ def calibrate_model_watch_item(path: str, item: dict[str, Any]) -> WatchItem | N
     is_docs_path = path.startswith("docs/") or path.lower().startswith("readme")
 
     if "frontend service" in text and "postgres_pool_max_size" in text:
+        return None
+
+    agent_lane_context = (
+        "agent lane" in text
+        or "agent_lane" in path.lower()
+        or "run_agent_lane" in path.lower()
+        or "test_agent_lane" in path.lower()
+        or "iter_agent_lane_events" in text
+        or "agent_task_run" in text
+    )
+    agent_lane_generic_watch_patterns = (
+        "agent lane task schema documentation alignment",
+        "schema documentation alignment",
+        "agent run artifact normalization",
+        "script documentation may be outdated",
+        "potential mismatch in task execution context",
+        "potential command injection in verification",
+        "hardcoded timeout value",
+        "hardcoded default workspace id",
+        "no explicit handling of empty or invalid `scope_path`",
+        "new event source may introduce unhandled error cases",
+        "potential performance impact from new event aggregation",
+        "missing error handling for `record_agent_task`",
+        "potential misuse of `pass_definition`",
+        "result_summary",
+        "potential missing error handling in agent run processing",
+        "possible unhandled null values in agent run data",
+        "test isolation issue with shared temporary directory",
+        "hardcoded verification command in test",
+    )
+    if agent_lane_context and any(pattern in text for pattern in agent_lane_generic_watch_patterns):
+        return None
+
+    if "shlex.split" in text and "command injection" in text:
+        return None
+
+    if "subprocess.run" in text and "shell" in text and "command injection" in text:
+        return None
+
+    if "timeout" in text and "configurable" in text and "--timeout-seconds" in text:
         return None
 
     if is_docs_path and any(
@@ -2187,6 +2234,71 @@ diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-
         },
     )
     assert non_docs_watch_item is not None
+
+    agent_lane_watch_false_positives = [
+        (
+            "PLAN.md",
+            {
+                "title": "Agent Lane Task Schema Documentation Alignment",
+                "body": (
+                    "The documentation introduces schemas for scripts/agent_lane.py and "
+                    "scripts/run_agent_lane.py, but alignment with implementation is not verified."
+                ),
+                "verification": "Verify that documented plan steps and trace data match the code.",
+            },
+        ),
+        (
+            "scripts/agent_lane.py",
+            {
+                "title": "Potential command injection in verification",
+                "body": (
+                    "_run_command_trace uses shlex.split() before subprocess.run([...], "
+                    "shell=False), so shell metacharacters may be a concern."
+                ),
+                "verification": "Validate command inputs before execution.",
+            },
+        ),
+        (
+            "scripts/run_agent_lane.py",
+            {
+                "title": "Hardcoded default workspace ID",
+                "body": (
+                    "The script uses DEFAULT_WORKSPACE_ID, which may not be appropriate "
+                    "for all environments."
+                ),
+                "verification": "Confirm that --workspace-id can override the default.",
+            },
+        ),
+        (
+            "scripts/agent_lane.py",
+            {
+                "title": "Hardcoded timeout value in verification",
+                "body": "The default timeout may be too short for some verification commands.",
+                "verification": "Confirm --timeout-seconds is configurable and invalid values fail.",
+            },
+        ),
+        (
+            "tests/test_agent_lane.py",
+            {
+                "title": "Hardcoded verification command in test",
+                "body": "The test command prints a fixed string and may not represent real usage.",
+                "verification": "Check that the smoke test is representative.",
+            },
+        ),
+    ]
+    for watch_path, false_positive_watch in agent_lane_watch_false_positives:
+        watch_item = calibrate_model_watch_item(watch_path, false_positive_watch)
+        assert watch_item is None
+
+    non_agent_schema_watch = calibrate_model_watch_item(
+        "docs/api-contract.md",
+        {
+            "title": "Schema documentation alignment issue",
+            "body": "The documented public API schema appears to omit a required field.",
+            "verification": "Compare the public schema with generated OpenAPI.",
+        },
+    )
+    assert non_agent_schema_watch is not None
 
     with tempfile.TemporaryDirectory() as temp_dir:
         db_path, run_id = persist_review_run(

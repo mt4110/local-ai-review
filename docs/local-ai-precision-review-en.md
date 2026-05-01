@@ -116,6 +116,17 @@ be an absolute valid URL unless that is the public contract. Do not require
 strict `mimeType` syntax validation unless the diff shows the guard is the
 upload/content-type trust boundary.
 
+Do not emit generic watch items asking someone to verify new schema/docs/README
+entries against implementation when the diff already shows the implementation,
+focused tests, and no concrete mismatch. CLI default workspace ids, timeout
+seconds, and example verification commands are not issues when overrides and
+invalid-value tests are visible.
+
+A verification command parsed with `shlex.split()` and executed through
+`subprocess.run(..., shell=False)` is not shell injection by itself. Report it
+only when the diff shows a shell boundary, untrusted command construction, or
+`shell=True`.
+
 When `covered_by_existing_safeguard` repeats, update prompt/calibration before
 adding suppression rules. Security findings such as path traversal, injection,
 or unsafe file access must inspect downstream validation visible in the diff:
