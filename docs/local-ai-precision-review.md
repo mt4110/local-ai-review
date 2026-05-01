@@ -114,11 +114,13 @@ v1.0 evidence loop 用に、従来の `findings` / `watch_items` に加えて `r
 ./llreview install
 llreview status
 llreview
-llreview --update
+llreview update
 llreview score
 llreview report
 llreview export-jsonl
 ```
+
+`llreview update` は通常の更新入口です。既存の install path を置き換えたい場合は `llreview update --force` を使います。`llreview --update` は通常更新だけを行うショートカットです。
 
 `llreview score` は直近の未採点 run を選び、run 単位の `useful` / `false_positive` / `unclear` count を保存します。TTY では続けて finding 単位の verdict も入力できます。local finding の verdict は `useful_fixed` / `false_positive` / `unclear` / `watch_only` に限定し、`missed` は外部・人間レビューで見つかった `external_items` 側にだけ付けます。
 

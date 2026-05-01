@@ -142,11 +142,15 @@ Daily entrypoints:
 ./llreview install
 llreview status
 llreview
-llreview --update
+llreview update
 llreview score
 llreview report
 llreview export-jsonl
 ```
+
+`llreview update` is the canonical update entrypoint. Use
+`llreview update --force` when the existing install path should be replaced.
+`llreview --update` remains a normal-update shortcut.
 
 `llreview score` selects the latest unscored run and records run-level counts.
 In a TTY it also prompts for per-finding verdicts: `useful_fixed`,

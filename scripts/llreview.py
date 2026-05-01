@@ -688,6 +688,7 @@ def command_review(args: argparse.Namespace) -> None:
                 path=str(DEFAULT_INSTALL_PATH),
                 branch=args.update_branch,
                 check=args.update_check,
+                force=args.update_force,
             )
         )
         return
@@ -1328,6 +1329,7 @@ def command_install(args: argparse.Namespace) -> None:
 def command_update(args: argparse.Namespace) -> None:
     branch = args.branch or "main"
     install_path = args.path
+    force_install = bool(getattr(args, "force", False))
     before = git(TOOL_ROOT, "rev-parse", "--short", "HEAD")
     current_branch = git(TOOL_ROOT, "branch", "--show-current", check=False) or "(detached)"
     remote_ref = f"origin/{branch}"
@@ -1339,17 +1341,23 @@ def command_update(args: argparse.Namespace) -> None:
         print(f"Update target: {remote_ref}")
         print(f"Working tree: {'dirty' if dirty else 'clean'}")
         print(f"Install path: {install_path}")
+        print(f"Install force: {'yes' if force_install else 'no'}")
         return
     if dirty:
         raise SystemExit(
             f"llreview tool repository has uncommitted changes at {TOOL_ROOT}. "
             "Commit or stash them before running update."
         )
+    if current_branch != branch:
+        hint = f"check out {branch} before running update."
+        if current_branch != "(detached)":
+            hint = f"check out {branch} or pass --branch {current_branch} explicitly."
+        raise SystemExit(f"Refusing to update {TOOL_ROOT} while on {current_branch}; {hint}")
 
     git(TOOL_ROOT, "fetch", "origin", branch)
     git(TOOL_ROOT, "merge", "--ff-only", remote_ref)
     after = git(TOOL_ROOT, "rev-parse", "--short", "HEAD")
-    command_install(argparse.Namespace(path=install_path, force=False))
+    command_install(argparse.Namespace(path=install_path, force=force_install))
     if before == after:
         print(f"OK: llreview is already up to date at {after}")
     else:
@@ -1373,6 +1381,7 @@ def build_review_parser() -> argparse.ArgumentParser:
     parser.add_argument("--update", action="store_true", help="Update the installed llreview command and exit")
     parser.add_argument("--update-check", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--update-branch", help=argparse.SUPPRESS)
+    parser.add_argument("--update-force", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--output", default=str(DEFAULT_REPORT), help="Markdown report output path")
     parser.add_argument("--post", action="store_true", help="Post or update the marker PR comment")
     parser.add_argument("--plain", action="store_true", help="Disable TTY progress animation")
@@ -1446,6 +1455,7 @@ def build_update_parser() -> argparse.ArgumentParser:
     update = argparse.ArgumentParser(description="Update the installed llreview command")
     update.set_defaults(func=command_update)
     update.add_argument("--path", default=str(DEFAULT_INSTALL_PATH), help="Command path to verify")
+    update.add_argument("--force", action="store_true", help="Replace an existing install path")
     update.add_argument("--branch", help="Tool repository branch to fast-forward from origin")
     update.add_argument("--check", action="store_true", help="Show update state without changing files")
     return update
