@@ -39,6 +39,64 @@ DEFAULT_JSONL = TOOL_ROOT / "out" / "review-history" / "review-items.jsonl"
 DEFAULT_INSTALL_PATH = Path.home() / ".local" / "bin" / "llreview"
 GITHUB_API = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
 PROGRESS_PREFIX = "LLREVIEW_EVENT "
+LOCAL_ITEM_VERDICTS = {
+    "u": "useful_fixed",
+    "useful": "useful_fixed",
+    "useful_fixed": "useful_fixed",
+    "f": "false_positive",
+    "fp": "false_positive",
+    "false_positive": "false_positive",
+    "c": "unclear",
+    "unclear": "unclear",
+    "w": "watch_only",
+    "watch": "watch_only",
+    "watch_only": "watch_only",
+    "s": "skip",
+    "skip": "skip",
+}
+REASON_ALIASES = {
+    "1": "covered_by_existing_safeguard",
+    "safeguard": "covered_by_existing_safeguard",
+    "covered": "covered_by_existing_safeguard",
+    "covered_by_existing_safeguard": "covered_by_existing_safeguard",
+    "2": "intentional_behavior",
+    "intentional": "intentional_behavior",
+    "intentional_behavior": "intentional_behavior",
+    "3": "environment_dependent",
+    "env": "environment_dependent",
+    "environment": "environment_dependent",
+    "environment_dependent": "environment_dependent",
+    "4": "covered_by_tests",
+    "tests": "covered_by_tests",
+    "covered_by_tests": "covered_by_tests",
+    "5": "stale_or_already_fixed",
+    "stale": "stale_or_already_fixed",
+    "fixed": "stale_or_already_fixed",
+    "stale_or_already_fixed": "stale_or_already_fixed",
+    "6": "diagnostic_watch",
+    "watch": "diagnostic_watch",
+    "diagnostic": "diagnostic_watch",
+    "diagnostic_watch": "diagnostic_watch",
+    "7": "insufficient_context",
+    "context": "insufficient_context",
+    "insufficient_context": "insufficient_context",
+    "8": "actual_issue",
+    "actual": "actual_issue",
+    "actual_issue": "actual_issue",
+    "9": "other",
+    "other": "other",
+}
+REASON_MENU = [
+    ("1", "covered_by_existing_safeguard"),
+    ("2", "intentional_behavior"),
+    ("3", "environment_dependent"),
+    ("4", "covered_by_tests"),
+    ("5", "stale_or_already_fixed"),
+    ("6", "diagnostic_watch"),
+    ("7", "insufficient_context"),
+    ("8", "actual_issue"),
+    ("9", "other"),
+]
 
 
 @dataclass(frozen=True)
@@ -624,6 +682,16 @@ def build_review_command(args: argparse.Namespace, workspace: Workspace) -> tupl
 
 
 def command_review(args: argparse.Namespace) -> None:
+    if args.update:
+        command_update(
+            argparse.Namespace(
+                path=None,
+                branch=args.update_branch,
+                check=args.update_check,
+                force=args.update_force,
+            )
+        )
+        return
     workspace = detect_workspace(Path(args.project_dir).expanduser().resolve(), args.repo)
     if args.pr:
         pr_payload, token_status = fetch_pr(workspace.repo, args.pr)
@@ -734,6 +802,15 @@ def parse_non_negative(value: str) -> int:
     return parsed
 
 
+def parse_bool_value(value: str) -> int:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y"}:
+        return 1
+    if normalized in {"0", "false", "no", "n"}:
+        return 0
+    raise argparse.ArgumentTypeError("expected yes/no, true/false, or 1/0")
+
+
 def prompt_int(label: str, default: int | None = None) -> int:
     suffix = f" [{default}]" if default is not None else ""
     while True:
@@ -757,6 +834,149 @@ def prompt_bool(label: str, default: bool = True) -> int:
         if raw in {"n", "no", "0", "false"}:
             return 0
         print("expected yes or no")
+
+
+def prompt_item_verdict(existing: str = "") -> str:
+    suffix = f" [{existing or 'skip'}]" if existing else " [skip]"
+    prompt = "Verdict useful/fp/unclear/watch/skip"
+    while True:
+        raw = input(f"{prompt}{suffix}: ").strip().lower()
+        if not raw:
+            return existing or "skip"
+        verdict = LOCAL_ITEM_VERDICTS.get(raw)
+        if verdict:
+            return verdict
+        print("expected useful, fp, unclear, watch, or skip")
+
+
+def default_reason_for_verdict(verdict: str) -> str:
+    if verdict == "useful_fixed":
+        return "actual_issue"
+    if verdict == "watch_only":
+        return "diagnostic_watch"
+    if verdict == "unclear":
+        return "insufficient_context"
+    return "covered_by_existing_safeguard"
+
+
+def prompt_reason(verdict: str, existing: str = "") -> str:
+    default = existing or default_reason_for_verdict(verdict)
+    print("Reason:")
+    for key, reason in REASON_MENU:
+        marker = " (default)" if reason == default else ""
+        print(f"  {key}. {reason}{marker}")
+    while True:
+        raw = input(f"Reason [{default}]: ").strip().lower()
+        if not raw:
+            return default
+        reason = REASON_ALIASES.get(raw, raw)
+        if re.fullmatch(r"[a-z0-9_.-]+", reason):
+            return reason
+        print("expected a simple reason code")
+
+
+def truncate_text(value: str, limit: int = 180) -> str:
+    compact = " ".join(value.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 3)] + "..."
+
+
+def markdown_cell(value: Any) -> str:
+    return str(value if value is not None else "").replace("|", "\\|").replace("\n", " ")
+
+
+def percent(numerator: int | float, denominator: int | float) -> str:
+    if not denominator:
+        return "n/a"
+    return f"{(numerator / denominator) * 100:.1f}%"
+
+
+def latest_item_verdicts(connection: sqlite3.Connection, target_ids: list[int]) -> dict[int, sqlite3.Row]:
+    if not target_ids:
+        return {}
+    placeholders = ",".join("?" for _ in target_ids)
+    rows = connection.execute(
+        f"""
+        SELECT verdicts.*
+        FROM item_verdicts AS verdicts
+        JOIN (
+            SELECT target_id, MAX(id) AS id
+            FROM item_verdicts
+            WHERE target_kind = 'review_item'
+              AND target_id IN ({placeholders})
+            GROUP BY target_id
+        ) AS latest
+        ON latest.id = verdicts.id
+        """,
+        target_ids,
+    ).fetchall()
+    return {int(row["target_id"]): row for row in rows}
+
+
+def score_review_items(connection: sqlite3.Connection, run_id: int) -> None:
+    items = connection.execute(
+        """
+        SELECT *
+        FROM review_items
+        WHERE run_id = ? AND item_type = 'finding'
+        ORDER BY ordinal
+        """,
+        (run_id,),
+    ).fetchall()
+    if not items:
+        print("No finding items to score.")
+        return
+    existing = latest_item_verdicts(connection, [int(item["id"]) for item in items])
+    print("")
+    print("Item feedback")
+    print("missed is reserved for external/human items; local findings use useful/fp/unclear/watch.")
+    saved = 0
+    for item in items:
+        current = existing.get(int(item["id"]))
+        current_verdict = str(current["verdict"]) if current else ""
+        current_reason = str(current["reason"]) if current and "reason" in current.keys() else ""
+        current_note = str(current["note"]) if current and "note" in current.keys() else ""
+        location = item["path"]
+        if item["line"] is not None:
+            location = f"{location}:{item['line']}"
+        print("")
+        print(f"{item['ordinal']}. [{item['severity'] or 'watch'}] {item['title']}")
+        print(f"   {location}")
+        print(f"   why: {truncate_text(item['body'])}")
+        if item["fix"]:
+            print(f"   fix: {truncate_text(item['fix'])}")
+        if current:
+            print(f"   current: {current_verdict} reason={current_reason or '(none)'}")
+            if current_note:
+                print(f"   current note: {truncate_text(current_note)}")
+        verdict = prompt_item_verdict(current_verdict)
+        if verdict == "skip":
+            continue
+        reason = prompt_reason(verdict, current_reason)
+        note_input = input("Item note [keep]: " if current else "Item note []: ").strip()
+        note = current_note if current and note_input == "" else note_input
+        if current and verdict == current_verdict and reason == current_reason and note == current_note:
+            continue
+        connection.execute(
+            """
+            INSERT INTO item_verdicts (
+                target_kind,
+                target_id,
+                verdict,
+                reason,
+                note,
+                scorer,
+                scored_at
+            ) VALUES ('review_item', ?, ?, ?, ?, 'manual', CURRENT_TIMESTAMP)
+            """,
+            (int(item["id"]), verdict, reason, note),
+        )
+        saved += 1
+    if saved:
+        print(f"OK: saved {saved} item verdicts")
+    else:
+        print("OK: no item verdict changes")
 
 
 def command_score(args: argparse.Namespace) -> None:
@@ -790,7 +1010,7 @@ def command_score(args: argparse.Namespace) -> None:
         )
         unclear = args.unclear if args.unclear is not None else prompt_int("Unclear findings", 0)
         remote_ready = (
-            int(args.remote_ready)
+            args.remote_ready
             if args.remote_ready is not None
             else prompt_bool("Would request remote review now", True)
         )
@@ -831,6 +1051,11 @@ def command_score(args: argparse.Namespace) -> None:
                 note,
             ),
         )
+        score_items = args.score_items
+        if score_items is None:
+            score_items = sys.stdin.isatty() and sys.stdout.isatty()
+        if score_items:
+            score_review_items(connection, int(row["id"]))
     print(f"OK: scored run_id={row['id']}")
 
 
@@ -848,37 +1073,145 @@ def command_report(args: argparse.Namespace) -> None:
             """,
             (args.limit,),
         ).fetchall()
-        verdict_rows = connection.execute(
-            """
-            SELECT verdict, COUNT(*) AS count
-            FROM item_verdicts
-            GROUP BY verdict
-            ORDER BY verdict
-            """
-        ).fetchall()
+        run_ids = [int(row["id"]) for row in rows]
+        total_findings = sum(int(row["findings_count"] or 0) for row in rows)
+        total_watch = sum(int(row["watch_items_count"] or 0) for row in rows)
+        scored_rows = [row for row in rows if row["useful_findings_fixed"] is not None]
+        useful_total = sum(int(row["useful_findings_fixed"] or 0) for row in scored_rows)
+        false_positive_total = sum(int(row["false_positives"] or 0) for row in scored_rows)
+        unclear_total = sum(int(row["unclear_findings"] or 0) for row in scored_rows)
+        remote_findings_total = sum(int(row["remote_findings_count"] or 0) for row in scored_rows)
+        remote_ready_total = sum(
+            1 for row in scored_rows if int(row["would_request_remote_review_now"] or 0)
+        )
+        avg_elapsed = (
+            sum(float(row["elapsed_seconds"] or 0.0) for row in rows) / len(rows)
+            if rows
+            else 0.0
+        )
+        normalized_finding_items = 0
+        verdict_rows: list[sqlite3.Row] = []
+        reason_rows: list[sqlite3.Row] = []
+        candidate_rows: list[sqlite3.Row] = []
+        if run_ids:
+            placeholders = ",".join("?" for _ in run_ids)
+            normalized_finding_items = int(
+                connection.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM review_items
+                    WHERE run_id IN ({placeholders})
+                      AND item_type = 'finding'
+                    """,
+                    run_ids,
+                ).fetchone()[0]
+            )
+            verdict_rows = connection.execute(
+                f"""
+                SELECT verdicts.verdict, COUNT(*) AS count
+                FROM item_verdicts AS verdicts
+                JOIN review_items AS items
+                ON items.id = verdicts.target_id
+                JOIN (
+                    SELECT target_kind, target_id, MAX(id) AS id
+                    FROM item_verdicts
+                    GROUP BY target_kind, target_id
+                ) AS latest
+                ON latest.id = verdicts.id
+                WHERE verdicts.target_kind = 'review_item'
+                  AND items.run_id IN ({placeholders})
+                GROUP BY verdicts.verdict
+                ORDER BY verdict
+                """,
+                run_ids,
+            ).fetchall()
+            reason_rows = connection.execute(
+                f"""
+                SELECT
+                    verdicts.verdict,
+                    COALESCE(NULLIF(verdicts.reason, ''), '(none)') AS reason,
+                    COUNT(*) AS count
+                FROM item_verdicts AS verdicts
+                JOIN review_items AS items
+                ON items.id = verdicts.target_id
+                JOIN (
+                    SELECT target_kind, target_id, MAX(id) AS id
+                    FROM item_verdicts
+                    GROUP BY target_kind, target_id
+                ) AS latest
+                ON latest.id = verdicts.id
+                WHERE verdicts.target_kind = 'review_item'
+                  AND items.run_id IN ({placeholders})
+                  AND verdicts.verdict IN ('false_positive', 'watch_only', 'unclear')
+                GROUP BY verdicts.verdict, reason
+                ORDER BY count DESC, verdicts.verdict, reason
+                """,
+                run_ids,
+            ).fetchall()
+            candidate_rows = connection.execute(
+                f"""
+                SELECT
+                    COALESCE(NULLIF(verdicts.reason, ''), '(none)') AS reason,
+                    COUNT(*) AS count
+                FROM item_verdicts AS verdicts
+                JOIN review_items AS items
+                ON items.id = verdicts.target_id
+                JOIN (
+                    SELECT target_kind, target_id, MAX(id) AS id
+                    FROM item_verdicts
+                    GROUP BY target_kind, target_id
+                ) AS latest
+                ON latest.id = verdicts.id
+                WHERE verdicts.target_kind = 'review_item'
+                  AND items.run_id IN ({placeholders})
+                  AND verdicts.verdict IN ('false_positive', 'watch_only')
+                GROUP BY reason
+                HAVING count >= ?
+                ORDER BY count DESC, reason
+                """,
+                [*run_ids, args.rule_threshold],
+            ).fetchall()
+    scored_item_total = sum(int(row["count"] or 0) for row in verdict_rows)
+    run_feedback_total = useful_total + false_positive_total + unclear_total
+    remote_ready_display = f"{remote_ready_total}/{len(scored_rows)}" if scored_rows else "n/a"
     lines = [
         "# Review Benchmark Report",
         "",
         f"- Runs: {len(rows)}",
+        f"- Scored runs: {len(scored_rows)}",
         f"- DB: `{db_path}`",
+        f"- Average runtime: `{avg_elapsed:.1f}s`",
+        "",
+        "## Summary",
+        "",
+        f"- Local findings: {total_findings}",
+        f"- Watch items: {total_watch}",
+        f"- Useful fixed: {useful_total} ({percent(useful_total, run_feedback_total)})",
+        f"- False positives: {false_positive_total} ({percent(false_positive_total, run_feedback_total)})",
+        f"- Unclear: {unclear_total} ({percent(unclear_total, run_feedback_total)})",
+        f"- Remote review requested: {remote_ready_display}",
+        f"- Remote findings: {remote_findings_total}",
+        f"- Normalized item verdict coverage: {scored_item_total}/{normalized_finding_items}",
         "",
         "## Runs",
         "",
-        "| Run | Repo | PR | Findings | Watch | Useful | False positives | Unclear | Runtime |",
-        "|---:|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| Run | Repo | PR | Findings | Watch | Useful | False positives | Unclear | Remote | Runtime | Note |",
+        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for row in rows:
         lines.append(
-            "| {id} | {repo} | {pr} | {findings} | {watch} | {useful} | {fp} | {unclear} | {elapsed:.1f}s |".format(
+            "| {id} | {repo} | {pr} | {findings} | {watch} | {useful} | {fp} | {unclear} | {remote} | {elapsed:.1f}s | {note} |".format(
                 id=row["id"],
-                repo=row["repo"],
+                repo=markdown_cell(row["repo"]),
                 pr=row["pr_number"] or 0,
                 findings=row["findings_count"],
                 watch=row["watch_items_count"],
                 useful=row["useful_findings_fixed"] if row["useful_findings_fixed"] is not None else "",
                 fp=row["false_positives"] if row["false_positives"] is not None else "",
                 unclear=row["unclear_findings"] if row["unclear_findings"] is not None else "",
+                remote=row["remote_findings_count"] if row["remote_findings_count"] is not None else "",
                 elapsed=row["elapsed_seconds"],
+                note=markdown_cell(truncate_text(str(row["note"] or ""), 90)),
             )
         )
     lines.extend(["", "## Item Verdicts", ""])
@@ -887,6 +1220,22 @@ def command_report(args: argparse.Namespace) -> None:
             lines.append(f"- {row['verdict']}: {row['count']}")
     else:
         lines.append("- No item verdicts recorded yet.")
+    lines.extend(["", "## False Positive / Watch Reasons", ""])
+    if reason_rows:
+        for row in reason_rows:
+            lines.append(f"- {row['verdict']} / {row['reason']}: {row['count']}")
+    else:
+        lines.append("- No reason-coded item verdicts recorded yet.")
+    lines.extend(["", "## Prompt And Rule Candidates", ""])
+    if candidate_rows:
+        lines.append("Review these manually before turning them into prompt or local-rule changes.")
+        lines.append("")
+        for row in candidate_rows:
+            lines.append(f"- {row['reason']}: {row['count']} matching verdicts")
+    else:
+        lines.append(
+            f"- No false-positive/watch reason has reached the threshold ({args.rule_threshold}) yet."
+        )
     report = "\n".join(lines) + "\n"
     output = Path(args.output).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -905,6 +1254,7 @@ def command_export_jsonl(args: argparse.Namespace) -> None:
         rows = connection.execute(
             """
             SELECT
+                runs.id AS run_id,
                 runs.repo,
                 runs.pr_number,
                 runs.review_kind,
@@ -914,7 +1264,15 @@ def command_export_jsonl(args: argparse.Namespace) -> None:
                 runs.model,
                 runs.diff_bytes,
                 runs.elapsed_seconds,
+                feedback.useful_findings_fixed,
+                feedback.false_positives,
+                feedback.unclear_findings,
+                feedback.would_request_remote_review_now,
+                feedback.remote_findings_count,
+                feedback.note AS run_note,
+                items.id AS item_id,
                 items.item_type,
+                items.ordinal,
                 items.source,
                 items.severity,
                 items.confidence,
@@ -924,10 +1282,29 @@ def command_export_jsonl(args: argparse.Namespace) -> None:
                 items.body,
                 items.fix,
                 items.verification,
-                items.fingerprint
+                items.fingerprint,
+                verdicts.verdict,
+                verdicts.reason AS verdict_reason,
+                verdicts.note AS verdict_note,
+                verdicts.scorer AS verdict_scorer,
+                verdicts.scored_at AS verdict_scored_at
             FROM review_items AS items
             JOIN review_runs AS runs
             ON runs.id = items.run_id
+            LEFT JOIN run_feedback AS feedback
+            ON feedback.run_id = runs.id
+            LEFT JOIN (
+                SELECT item_verdicts.*
+                FROM item_verdicts
+                JOIN (
+                    SELECT target_kind, target_id, MAX(id) AS id
+                    FROM item_verdicts
+                    GROUP BY target_kind, target_id
+                ) AS latest
+                ON latest.id = item_verdicts.id
+            ) AS verdicts
+            ON verdicts.target_kind = 'review_item'
+            AND verdicts.target_id = items.id
             ORDER BY runs.id, items.item_type, items.ordinal
             """
         )
@@ -938,22 +1315,91 @@ def command_export_jsonl(args: argparse.Namespace) -> None:
     print(f"OK: exported {count} review items to {output}")
 
 
-def command_install(args: argparse.Namespace) -> None:
+def install_paths(path_value: str) -> tuple[Path, Path]:
     source = TOOL_ROOT / "llreview"
-    target = Path(os.path.abspath(os.path.expanduser(args.path)))
+    target = Path(os.path.abspath(os.path.expanduser(path_value)))
+    return source, target
+
+
+def invoked_install_path() -> str:
+    source = (TOOL_ROOT / "llreview").resolve()
+    invoked = os.environ.get("LLREVIEW_INVOKED_PATH", "").strip()
+    if invoked:
+        candidate = Path(os.path.abspath(os.path.expanduser(invoked)))
+        if candidate.is_symlink() and candidate.resolve() == source:
+            return str(candidate)
+    return str(DEFAULT_INSTALL_PATH)
+
+
+def validate_install_target(source: Path, target: Path, *, force: bool) -> None:
+    if target.parent.exists() and not target.parent.is_dir():
+        raise SystemExit(f"{target.parent} is not a directory; choose another install path")
+    if not (target.exists() or target.is_symlink()):
+        return
+    current = target.resolve() if target.is_symlink() else target
+    if current == source.resolve():
+        return
+    if target.is_dir() and not target.is_symlink():
+        raise SystemExit(f"{target} is a directory; remove it before installing llreview")
+    if not force:
+        raise SystemExit(f"{target} already exists; pass --force to replace it")
+
+
+def command_install(args: argparse.Namespace) -> None:
+    source, target = install_paths(args.path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    validate_install_target(source, target, force=args.force)
     if target.exists() or target.is_symlink():
         current = target.resolve() if target.is_symlink() else target
         if current == source.resolve():
             print(f"OK: llreview is already installed at {target}")
             return
-        if not args.force:
-            raise SystemExit(f"{target} already exists; pass --force to replace it")
         target.unlink()
     target.symlink_to(source)
     print(f"OK: installed llreview at {target}")
     if str(target.parent) not in os.environ.get("PATH", "").split(os.pathsep):
         print(f"Note: add {target.parent} to PATH to run `llreview` without a path.")
+
+
+def command_update(args: argparse.Namespace) -> None:
+    branch = args.branch or "main"
+    install_path = args.path or invoked_install_path()
+    force_install = bool(getattr(args, "force", False))
+    before = git(TOOL_ROOT, "rev-parse", "--short", "HEAD")
+    current_branch = git(TOOL_ROOT, "branch", "--show-current", check=False) or "(detached)"
+    remote_ref = f"origin/{branch}"
+    dirty = git(TOOL_ROOT, "status", "--porcelain", check=False)
+    if args.check:
+        print(f"Tool root: {TOOL_ROOT}")
+        print(f"Current branch: {current_branch}")
+        print(f"Current commit: {before}")
+        print(f"Update target: {remote_ref}")
+        print(f"Working tree: {'dirty' if dirty else 'clean'}")
+        print(f"Install path: {install_path}")
+        print(f"Install force: {'yes' if force_install else 'no'}")
+        return
+    if dirty:
+        raise SystemExit(
+            f"llreview tool repository has uncommitted changes at {TOOL_ROOT}. "
+            "Commit or stash them before running update."
+        )
+    if current_branch != branch:
+        hint = f"check out {branch} before running update."
+        if current_branch != "(detached)":
+            hint = f"check out {branch} or pass --branch {current_branch} explicitly."
+        raise SystemExit(f"Refusing to update {TOOL_ROOT} while on {current_branch}; {hint}")
+
+    source, target = install_paths(install_path)
+    validate_install_target(source, target, force=force_install)
+
+    git(TOOL_ROOT, "fetch", "origin", branch)
+    git(TOOL_ROOT, "merge", "--ff-only", remote_ref)
+    after = git(TOOL_ROOT, "rev-parse", "--short", "HEAD")
+    command_install(argparse.Namespace(path=install_path, force=force_install))
+    if before == after:
+        print(f"OK: llreview is already up to date at {after}")
+    else:
+        print(f"OK: updated llreview {before}..{after}")
 
 
 def add_workspace_options(parser: argparse.ArgumentParser) -> None:
@@ -965,11 +1411,15 @@ def add_workspace_options(parser: argparse.ArgumentParser) -> None:
 def build_review_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Auto-detect and run local PR review",
-        epilog="Subcommands: status, score, report, export-jsonl, install",
+        epilog="Subcommands: status, score, report, export-jsonl, install, update",
     )
     parser.set_defaults(func=command_review)
     parser.add_argument("pr", nargs="?", type=int, help="PR number. Omit to auto-detect.")
     add_workspace_options(parser)
+    parser.add_argument("--update", action="store_true", help="Update the installed llreview command and exit")
+    parser.add_argument("--update-check", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--update-branch", help=argparse.SUPPRESS)
+    parser.add_argument("--update-force", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--output", default=str(DEFAULT_REPORT), help="Markdown report output path")
     parser.add_argument("--post", action="store_true", help="Post or update the marker PR comment")
     parser.add_argument("--plain", action="store_true", help="Disable TTY progress animation")
@@ -994,9 +1444,22 @@ def build_score_parser() -> argparse.ArgumentParser:
     score.add_argument("--useful", type=parse_non_negative)
     score.add_argument("--false-positives", type=parse_non_negative)
     score.add_argument("--unclear", type=parse_non_negative)
-    score.add_argument("--remote-ready", type=int, choices=[0, 1])
+    score.add_argument("--remote-ready", type=parse_bool_value)
     score.add_argument("--remote-findings", type=parse_non_negative)
     score.add_argument("--note")
+    score.add_argument(
+        "--items",
+        dest="score_items",
+        action="store_true",
+        default=None,
+        help="Prompt for per-finding verdicts after run-level scoring",
+    )
+    score.add_argument(
+        "--no-items",
+        dest="score_items",
+        action="store_false",
+        help="Only save run-level scoring",
+    )
     return score
 
 
@@ -1005,6 +1468,7 @@ def build_report_parser() -> argparse.ArgumentParser:
     report.set_defaults(func=command_report)
     report.add_argument("--db", default=str(DEFAULT_DB))
     report.add_argument("--limit", type=int, default=10)
+    report.add_argument("--rule-threshold", type=parse_non_negative, default=2)
     report.add_argument("--output", default=str(DEFAULT_BENCHMARK_REPORT))
     return report
 
@@ -1025,12 +1489,23 @@ def build_install_parser() -> argparse.ArgumentParser:
     return install
 
 
+def build_update_parser() -> argparse.ArgumentParser:
+    update = argparse.ArgumentParser(description="Update the installed llreview command")
+    update.set_defaults(func=command_update)
+    update.add_argument("--path", help="Command path to verify")
+    update.add_argument("--force", action="store_true", help="Replace an existing install path")
+    update.add_argument("--branch", help="Tool repository branch to fast-forward from origin")
+    update.add_argument("--check", action="store_true", help="Show update state without changing files")
+    return update
+
+
 COMMAND_PARSERS = {
     "status": build_status_parser,
     "score": build_score_parser,
     "report": build_report_parser,
     "export-jsonl": build_export_parser,
     "install": build_install_parser,
+    "update": build_update_parser,
 }
 
 

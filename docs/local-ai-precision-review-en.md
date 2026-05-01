@@ -107,6 +107,18 @@ Generic best-practice comments are intentionally filtered out or demoted to
 watch items. Examples: fixed container UIDs, Docker `COPY` "missing error
 handling", `/usr/local/bin` PATH concerns, and telemetry environment variables.
 
+When `covered_by_existing_safeguard` repeats, update prompt/calibration before
+adding suppression rules. Security findings such as path traversal, injection,
+or unsafe file access must inspect downstream validation visible in the diff:
+safe path helpers, absolute/parent path rejection, and artifact-root containment.
+If a safeguard is already visible, demote the concern to a watch item for
+negative tests or runtime verification instead of reporting a finding.
+
+Artifact consistency manifests such as `checksums.txt` are not trust anchors
+that must authenticate themselves. Do not report "known good checksum" or
+self-integrity requirements unless the diff shows a concrete bypass after path
+validation or a real security boundary that trusts the checksum file.
+
 ## Interpreting Output
 
 `Findings` should be actionable enough to comment on a PR.
@@ -118,7 +130,36 @@ such as container smoke tests after read-only filesystem hardening.
 
 The history DB is for measuring whether local review is actually useful before
 remote review. It stores run metadata, pre-PR context, findings, watch items,
-reviewed files, and an optional feedback row you can update later with SQL.
+reviewed files, and an optional feedback row you can update later from the CLI.
+For the v1.0 evidence loop, normalized local items are stored in `review_items`,
+external or human-review items belong in `external_items`, and item-level
+scoring is stored in `item_verdicts`. `missed` belongs to external/human items,
+not to local findings.
+
+Daily entrypoints:
+
+```sh
+./llreview install
+llreview status
+llreview
+llreview update
+llreview score
+llreview report
+llreview export-jsonl
+```
+
+`llreview update` is the canonical update entrypoint. Use
+`llreview update --force` when the existing install path should be replaced.
+`llreview --update` remains a normal-update shortcut.
+
+`llreview score` selects the latest unscored run and records run-level counts.
+In a TTY it also prompts for per-finding verdicts: `useful_fixed`,
+`false_positive`, `unclear`, or `watch_only`. False positives keep a short
+reason code such as `covered_by_existing_safeguard`, `intentional_behavior`,
+`environment_dependent`, `covered_by_tests`, `stale_or_already_fixed`, or
+`diagnostic_watch`. A single false positive is evidence, not an automatic
+suppression rule; repeated reasons become prompt/local-rule candidates in
+`llreview report`.
 
 Default DB path:
 

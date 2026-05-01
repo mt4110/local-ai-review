@@ -166,12 +166,14 @@ llreview status
 llreview
 llreview 42
 llreview --post
+llreview update
 llreview score
 llreview report
 llreview export-jsonl
 ```
 
 `./llreview install` は `~/.local/bin/llreview` に symlink を作ります。`~/.local/bin` が PATH に入っていれば、その後は repository root 以外からも `llreview` として実行できます。
+`llreview update` はこの repository に `origin/main` を fast-forward で取り込み、install 済み command の symlink を確認します。既存の install path を置き換える場合は `llreview update --force` を使います。`llreview --update` は通常更新用のショートカットです。作業中の変更がある場合や、更新対象 branch にいない場合は止まります。
 
 TTY では進行中の phase、elapsed、model-reviewed file count、finding/watch count を 1 行で更新します。CI や log 保存では `--plain` を使うと通常の行ログになります。
 

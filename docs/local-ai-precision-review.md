@@ -92,6 +92,10 @@ pre-PR run は DB に `review_kind=pre_pr` として保存されます。`base_r
 
 generic な best-practice comment は filtered out するか watch item に落とします。例: fixed container UID、Docker `COPY` の missing error handling、`/usr/local/bin` PATH、telemetry environment variable。
 
+`covered_by_existing_safeguard` が続く場合は、まず prompt/calibration を更新します。とくに path traversal、injection、unsafe file access のような security finding は、diff に見えている downstream validation、safe path helper、artifact-root containment を読んでから finding にします。既存対策が見えている場合は finding ではなく、negative test や runtime 確認の watch item に落とします。
+
+`checksums.txt` のような artifact 内整合性用 manifest は、それ自体を trust anchor として扱いません。既知ハッシュで自己認証しろ、という指摘は基本的に空振りです。path validation 後にも成立する具体的な bypass が見える場合だけ finding にします。
+
 ## Output の読み方
 
 `Findings` は PR comment にできる程度に actionable なものです。
@@ -110,10 +114,19 @@ v1.0 evidence loop 用に、従来の `findings` / `watch_items` に加えて `r
 ./llreview install
 llreview status
 llreview
+llreview update
 llreview score
 llreview report
 llreview export-jsonl
 ```
+
+`llreview update` は通常の更新入口です。既存の install path を置き換えたい場合は `llreview update --force` を使います。`llreview --update` は通常更新だけを行うショートカットです。
+
+`llreview score` は直近の未採点 run を選び、run 単位の `useful` / `false_positive` / `unclear` count を保存します。TTY では続けて finding 単位の verdict も入力できます。local finding の verdict は `useful_fixed` / `false_positive` / `unclear` / `watch_only` に限定し、`missed` は外部・人間レビューで見つかった `external_items` 側にだけ付けます。
+
+finding 単位の false positive は、理由コードも残します。まずは `covered_by_existing_safeguard`、`intentional_behavior`、`environment_dependent`、`covered_by_tests`、`stale_or_already_fixed`、`diagnostic_watch` を使い、同じ理由が複数回出たものだけ prompt または local-rule update 候補として扱います。1回の空振りだけで suppress しないのが基本です。
+
+`llreview report` は直近10件を benchmark markdown として出力し、run 単位の useful/false positive/unclear 率、remote review 差分、runtime、item verdict reason の集計をまとめます。
 
 デフォルトの DB path:
 
