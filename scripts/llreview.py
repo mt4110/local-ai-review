@@ -1315,17 +1315,35 @@ def command_export_jsonl(args: argparse.Namespace) -> None:
     print(f"OK: exported {count} review items to {output}")
 
 
-def command_install(args: argparse.Namespace) -> None:
+def install_paths(path_value: str) -> tuple[Path, Path]:
     source = TOOL_ROOT / "llreview"
-    target = Path(os.path.abspath(os.path.expanduser(args.path)))
+    target = Path(os.path.abspath(os.path.expanduser(path_value)))
+    return source, target
+
+
+def validate_install_target(source: Path, target: Path, *, force: bool) -> None:
+    if target.parent.exists() and not target.parent.is_dir():
+        raise SystemExit(f"{target.parent} is not a directory; choose another install path")
+    if not (target.exists() or target.is_symlink()):
+        return
+    current = target.resolve() if target.is_symlink() else target
+    if current == source.resolve():
+        return
+    if target.is_dir() and not target.is_symlink():
+        raise SystemExit(f"{target} is a directory; remove it before installing llreview")
+    if not force:
+        raise SystemExit(f"{target} already exists; pass --force to replace it")
+
+
+def command_install(args: argparse.Namespace) -> None:
+    source, target = install_paths(args.path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    validate_install_target(source, target, force=args.force)
     if target.exists() or target.is_symlink():
         current = target.resolve() if target.is_symlink() else target
         if current == source.resolve():
             print(f"OK: llreview is already installed at {target}")
             return
-        if not args.force:
-            raise SystemExit(f"{target} already exists; pass --force to replace it")
         target.unlink()
     target.symlink_to(source)
     print(f"OK: installed llreview at {target}")
@@ -1360,6 +1378,9 @@ def command_update(args: argparse.Namespace) -> None:
         if current_branch != "(detached)":
             hint = f"check out {branch} or pass --branch {current_branch} explicitly."
         raise SystemExit(f"Refusing to update {TOOL_ROOT} while on {current_branch}; {hint}")
+
+    source, target = install_paths(install_path)
+    validate_install_target(source, target, force=force_install)
 
     git(TOOL_ROOT, "fetch", "origin", branch)
     git(TOOL_ROOT, "merge", "--ff-only", remote_ref)
