@@ -1,5 +1,23 @@
 #!/usr/bin/env sh
 set -eu
+INVOKED_PATH=$0
+case "$INVOKED_PATH" in
+  */*) ;;
+  *)
+    RESOLVED_COMMAND=$(command -v "$INVOKED_PATH" 2>/dev/null || true)
+    if [ -n "$RESOLVED_COMMAND" ]; then
+      INVOKED_PATH=$RESOLVED_COMMAND
+    fi
+    ;;
+esac
+case "$INVOKED_PATH" in
+  /*) ;;
+  *)
+    INVOKED_DIR=$(CDPATH= cd -- "$(dirname -- "$INVOKED_PATH")" && pwd)
+    INVOKED_PATH=$INVOKED_DIR/$(basename -- "$INVOKED_PATH")
+    ;;
+esac
+export LLREVIEW_INVOKED_PATH=$INVOKED_PATH
 SCRIPT_PATH=$0
 while [ -L "$SCRIPT_PATH" ]; do
   SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)

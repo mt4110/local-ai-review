@@ -1209,6 +1209,19 @@ def calibrate_model_finding(path: str, item: dict[str, Any]) -> tuple[Finding | 
     if any(pattern in text for pattern in low_value_patterns):
         return None, None
 
+    safeguard_bypass_terms = (
+        "bypass",
+        "circumvent",
+        "evade",
+        "encoded traversal",
+        "percent-encoded",
+        "url-encoded",
+        "double-encoded",
+        "symlink",
+        "normalization bypass",
+    )
+    describes_safeguard_bypass = any(pattern in text for pattern in safeguard_bypass_terms)
+
     existing_safeguard_security_patterns = (
         (
             "path traversal",
@@ -1242,7 +1255,10 @@ def calibrate_model_finding(path: str, item: dict[str, Any]) -> tuple[Finding | 
             "checksums.txt",
         ),
     )
-    if any(all(pattern in text for pattern in patterns) for patterns in existing_safeguard_security_patterns):
+    if (
+        not describes_safeguard_bypass
+        and any(all(pattern in text for pattern in patterns) for patterns in existing_safeguard_security_patterns)
+    ):
         return None, WatchItem(
             source="model",
             path=path,
@@ -1363,6 +1379,18 @@ def calibrate_model_finding(path: str, item: dict[str, Any]) -> tuple[Finding | 
             body=body,
             verification=fix or "Verify with a runtime smoke test.",
         )
+
+    if describes_safeguard_bypass:
+        return Finding(
+            source="model",
+            severity=severity,
+            confidence=confidence,
+            path=path,
+            line=line,
+            title=title,
+            body=body,
+            fix=fix,
+        ), None
 
     calibrated_finding_patterns = (
         "openapi",
@@ -2038,6 +2066,22 @@ diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-
     )
     assert safeguarded_security_finding is None
     assert safeguarded_security_watch is not None
+
+    bypass_security_finding, bypass_security_watch = calibrate_model_finding(
+        "scripts/local_review_eval.py",
+        {
+            "severity": "P2",
+            "confidence": "medium",
+            "title": "Encoded traversal bypasses artifact-root containment",
+            "body": (
+                "safe_relative_artifact_path checks absolute paths and '..', but percent-encoded "
+                "traversal can bypass the existing artifact-root containment check."
+            ),
+            "fix": "Decode and normalize before applying artifact-root containment.",
+        },
+    )
+    assert bypass_security_finding is not None
+    assert bypass_security_watch is None
 
     checksum_anchor_finding, checksum_anchor_watch = calibrate_model_finding(
         "scripts/local_review_eval.py",

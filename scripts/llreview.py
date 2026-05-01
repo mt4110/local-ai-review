@@ -685,7 +685,7 @@ def command_review(args: argparse.Namespace) -> None:
     if args.update:
         command_update(
             argparse.Namespace(
-                path=str(DEFAULT_INSTALL_PATH),
+                path=None,
                 branch=args.update_branch,
                 check=args.update_check,
                 force=args.update_force,
@@ -1321,6 +1321,16 @@ def install_paths(path_value: str) -> tuple[Path, Path]:
     return source, target
 
 
+def invoked_install_path() -> str:
+    source = (TOOL_ROOT / "llreview").resolve()
+    invoked = os.environ.get("LLREVIEW_INVOKED_PATH", "").strip()
+    if invoked:
+        candidate = Path(os.path.abspath(os.path.expanduser(invoked)))
+        if candidate.is_symlink() and candidate.resolve() == source:
+            return str(candidate)
+    return str(DEFAULT_INSTALL_PATH)
+
+
 def validate_install_target(source: Path, target: Path, *, force: bool) -> None:
     if target.parent.exists() and not target.parent.is_dir():
         raise SystemExit(f"{target.parent} is not a directory; choose another install path")
@@ -1353,7 +1363,7 @@ def command_install(args: argparse.Namespace) -> None:
 
 def command_update(args: argparse.Namespace) -> None:
     branch = args.branch or "main"
-    install_path = args.path
+    install_path = args.path or invoked_install_path()
     force_install = bool(getattr(args, "force", False))
     before = git(TOOL_ROOT, "rev-parse", "--short", "HEAD")
     current_branch = git(TOOL_ROOT, "branch", "--show-current", check=False) or "(detached)"
@@ -1482,7 +1492,7 @@ def build_install_parser() -> argparse.ArgumentParser:
 def build_update_parser() -> argparse.ArgumentParser:
     update = argparse.ArgumentParser(description="Update the installed llreview command")
     update.set_defaults(func=command_update)
-    update.add_argument("--path", default=str(DEFAULT_INSTALL_PATH), help="Command path to verify")
+    update.add_argument("--path", help="Command path to verify")
     update.add_argument("--force", action="store_true", help="Replace an existing install path")
     update.add_argument("--branch", help="Tool repository branch to fast-forward from origin")
     update.add_argument("--check", action="store_true", help="Show update state without changing files")
