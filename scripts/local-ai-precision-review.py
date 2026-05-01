@@ -979,6 +979,13 @@ Calibration from prior high-signal reviews:
   submit code strips `previewSrc` before persistence.
 - Do not flag `.nullable()` or `ImageUploadValue | null` field state by itself; empty image
   fields are expected to use null.
+- Do not flag `cdn.example.com` or `blob:` strings in test/consumer fixtures when the code only
+  checks value-shaping and does not fetch the URL.
+- Do not require `toPersistableImageValue()` `src` values to be absolute valid URLs. That API may
+  accept relative paths, CDN URLs, or durable references as long as temporary browser schemes are
+  rejected by default.
+- Do not require strict MIME type syntax validation in a persistable-value shape guard unless the
+  diff shows this function is the upload/content-type trust boundary.
 - Catch tests that mock the behavior they are supposed to verify.
 - Catch documentation vocabulary drift when labels/statuses are treated inconsistently.
 - Before reporting security issues such as path traversal, injection, or unsafe file access,
@@ -1188,6 +1195,13 @@ def calibrate_model_finding(path: str, item: dict[str, Any]) -> tuple[Finding | 
     fix = str(item.get("fix", "")).strip()
     text = f"{title}\n{body}\n{fix}".lower()
     is_docs_path = path.startswith("docs/") or path.lower().startswith("readme")
+    is_fixture_or_test_path = (
+        path.startswith("consumer-fixtures/")
+        or path.startswith("tests/")
+        or "/test" in path
+        or path.endswith(".test.ts")
+        or path.endswith(".test.tsx")
+    )
 
     low_value_patterns = (
         "hardcoded uid",
@@ -1207,6 +1221,28 @@ def calibrate_model_finding(path: str, item: dict[str, Any]) -> tuple[Finding | 
         "next_telemetry_disabled",
     )
     if any(pattern in text for pattern in low_value_patterns):
+        return None, None
+
+    if (
+        is_fixture_or_test_path
+        and "cdn.example.com" in text
+        and any(pattern in text for pattern in ("hardcoded cdn url", "hard-coded cdn url"))
+    ):
+        return None, None
+
+    if (
+        "topersistableimagevalue" in text
+        and "src" in text
+        and any(pattern in text for pattern in ("valid url", "malformed url", "unsafe values"))
+        and any(pattern in text for pattern in ("allowdataurl", "allowbloburl", "durable reference", "reference"))
+    ):
+        return None, None
+
+    if (
+        ("persistable" in text or "persistable-image-value" in path)
+        and "mimetype" in text
+        and any(pattern in text for pattern in ("valid mime", "malformed mime", "mime type string"))
+    ):
         return None, None
 
     safeguard_bypass_terms = (
@@ -2043,6 +2079,39 @@ diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-
                 "title": "Missing validation for `fileName` and `originalFileName`",
                 "body": "These fields could be used in object keys or public URLs.",
                 "fix": "Validate and sanitize them.",
+            },
+        ),
+        (
+            "consumer-fixtures/headless-cjs/index.cjs",
+            {
+                "severity": "P2",
+                "confidence": "high",
+                "title": "Hard-coded CDN URL in test fixture",
+                "body": "The fixture uses https://cdn.example.com/avatar.webp and may depend on a real CDN.",
+                "fix": "Use a dummy valid URL.",
+            },
+        ),
+        (
+            "src/core/persistable-image-value.ts",
+            {
+                "severity": "P2",
+                "confidence": "high",
+                "title": "Missing validation for `src` field in `toPersistableImageValue`",
+                "body": (
+                    "toPersistableImageValue does not validate that src is a valid URL or reference "
+                    "when allowDataUrl or allowBlobUrl are enabled."
+                ),
+                "fix": "Validate src as a URL.",
+            },
+        ),
+        (
+            "src/core/persistable-image-value.ts",
+            {
+                "severity": "P3",
+                "confidence": "medium",
+                "title": "Incomplete validation of `mimeType` field",
+                "body": "validateMetadata only checks that mimeType is a string, not a valid MIME type string.",
+                "fix": "Add MIME syntax validation.",
             },
         ),
     ]

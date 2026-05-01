@@ -92,6 +92,10 @@ pre-PR run は DB に `review_kind=pre_pr` として保存されます。`base_r
 
 generic な best-practice comment は filtered out するか watch item に落とします。例: fixed container UID、Docker `COPY` の missing error handling、`/usr/local/bin` PATH、telemetry environment variable。
 
+fixture / test 内の `cdn.example.com` や `blob:` は、それ自体を実URL依存やruntime不具合として扱いません。値の形を検証するだけの fixture なら空振りです。
+
+`toPersistableImageValue()` のような persistable value guard は、`src` を絶対URLに限定しない場合があります。相対path、CDN URL、durable reference を受ける契約なら、「valid URLでない」というだけでは finding にしません。`mimeType` も、この関数が upload/content-type trust boundary であると diff から分かる場合だけ strict syntax validation を要求します。
+
 `covered_by_existing_safeguard` が続く場合は、まず prompt/calibration を更新します。とくに path traversal、injection、unsafe file access のような security finding は、diff に見えている downstream validation、safe path helper、artifact-root containment を読んでから finding にします。既存対策が見えている場合は finding ではなく、negative test や runtime 確認の watch item に落とします。
 
 `checksums.txt` のような artifact 内整合性用 manifest は、それ自体を trust anchor として扱いません。既知ハッシュで自己認証しろ、という指摘は基本的に空振りです。path validation 後にも成立する具体的な bypass が見える場合だけ finding にします。

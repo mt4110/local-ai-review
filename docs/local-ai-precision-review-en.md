@@ -107,6 +107,15 @@ Generic best-practice comments are intentionally filtered out or demoted to
 watch items. Examples: fixed container UIDs, Docker `COPY` "missing error
 handling", `/usr/local/bin` PATH concerns, and telemetry environment variables.
 
+Do not treat `cdn.example.com` or `blob:` strings in fixtures/tests as real URL
+dependencies when the code only checks value-shaping and never fetches them.
+
+Persistable value guards such as `toPersistableImageValue()` may intentionally
+accept relative paths, CDN URLs, or durable references. Do not require `src` to
+be an absolute valid URL unless that is the public contract. Do not require
+strict `mimeType` syntax validation unless the diff shows the guard is the
+upload/content-type trust boundary.
+
 When `covered_by_existing_safeguard` repeats, update prompt/calibration before
 adding suppression rules. Security findings such as path traversal, injection,
 or unsafe file access must inspect downstream validation visible in the diff:
