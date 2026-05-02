@@ -204,9 +204,12 @@ unlinked external items get `missed_by_local`. If there is no local run
 candidate, the importer does not invent missed verdicts.
 
 Re-importing the same PR updates by GitHub comment id instead of duplicating
-rows. For reproducible checks, save a GitHub `/pulls/comments` JSON array and
-pass it through the same importer path with
-`--comments-json comments.json --repo owner/name --head-sha <sha>`. Add
+rows. It also removes stale GitHub-derived external items, importer links, and
+importer verdicts that are no longer present in the current comment snapshot.
+For reproducible checks, save a GitHub `/pulls/comments` JSON array and pass it
+with `--comments-json comments.json --repo owner/name`; this preserves each
+comment's GitHub `commit_id`. Use `--head-sha <sha>` only when intentionally
+pinning the saved comments to a specific local run SHA. Add
 `--include-issue-comments` only when top-level PR conversation comments should
 also become learning items. In reproducible JSON mode, pass a saved GitHub
 `/issues/comments` array with `--issue-comments-json issue-comments.json`.

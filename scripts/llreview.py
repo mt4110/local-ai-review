@@ -44,6 +44,7 @@ DEFAULT_INSTALL_PATH = Path.home() / ".local" / "bin" / "llreview"
 GITHUB_API = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
 PROGRESS_PREFIX = "LLREVIEW_EVENT "
 IMPORT_LINK_NOTE_PREFIX = "github_importer:"
+GITHUB_IMPORT_COMMENT_ID_PREFIXES = ("review_comment:", "issue_comment:")
 LOCAL_ITEM_VERDICTS = {
     "u": "useful_fixed",
     "useful": "useful_fixed",
@@ -135,6 +136,7 @@ class ExternalReviewItem:
     repo: str
     pr_number: int
     head_sha: str
+    import_head_sha: str
     source: str
     path: str
     line: int | None
@@ -1160,6 +1162,7 @@ def external_item_from_comment(
     repo: str,
     pr_number: int,
     default_head_sha: str,
+    import_head_sha: str,
     prefer_default_head_sha: bool,
     comment: dict[str, Any],
     comment_kind: str,
@@ -1203,6 +1206,7 @@ def external_item_from_comment(
         repo=repo,
         pr_number=pr_number,
         head_sha=head_sha,
+        import_head_sha=str(import_head_sha or ""),
         source=external_source_for_comment(comment),
         path=str(comment.get("path") or ""),
         line=line,
@@ -1217,6 +1221,7 @@ def external_item_from_comment(
         repo=item.repo,
         pr_number=item.pr_number,
         head_sha=item.head_sha,
+        import_head_sha=item.import_head_sha,
         source=item.source,
         path=item.path,
         line=item.line,
@@ -1234,6 +1239,7 @@ def external_items_from_comments(
     repo: str,
     pr_number: int,
     default_head_sha: str,
+    import_head_sha: str,
     prefer_default_head_sha: bool,
     comments: list[Any],
     comment_kind: str,
@@ -1267,6 +1273,7 @@ def external_items_from_comments(
             repo=repo,
             pr_number=pr_number,
             default_head_sha=default_head_sha,
+            import_head_sha=import_head_sha,
             prefer_default_head_sha=prefer_default_head_sha,
             comment=comment,
             comment_kind=comment_kind,
@@ -1315,6 +1322,7 @@ def upsert_external_item(connection: sqlite3.Connection, item: ExternalReviewIte
             UPDATE external_items
             SET
                 head_sha = ?,
+                import_head_sha = ?,
                 source = ?,
                 path = ?,
                 line = ?,
@@ -1328,6 +1336,7 @@ def upsert_external_item(connection: sqlite3.Connection, item: ExternalReviewIte
             """,
             (
                 item.head_sha,
+                item.import_head_sha,
                 item.source,
                 item.path,
                 item.line,
@@ -1347,6 +1356,7 @@ def upsert_external_item(connection: sqlite3.Connection, item: ExternalReviewIte
             repo,
             pr_number,
             head_sha,
+            import_head_sha,
             source,
             path,
             line,
@@ -1356,12 +1366,13 @@ def upsert_external_item(connection: sqlite3.Connection, item: ExternalReviewIte
             github_comment_id,
             github_thread_id,
             fingerprint
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             item.repo,
             item.pr_number,
             item.head_sha,
+            item.import_head_sha,
             item.source,
             item.path,
             item.line,
@@ -1374,6 +1385,63 @@ def upsert_external_item(connection: sqlite3.Connection, item: ExternalReviewIte
         ),
     )
     return int(cursor.lastrowid), True
+
+
+def stale_github_external_item_ids(
+    connection: sqlite3.Connection,
+    *,
+    repo: str,
+    pr_number: int,
+    current_github_comment_ids: set[str],
+) -> list[int]:
+    if pr_number <= 0:
+        return []
+    prefix_sql = " OR ".join("github_comment_id LIKE ?" for _ in GITHUB_IMPORT_COMMENT_ID_PREFIXES)
+    params: list[Any] = [
+        repo,
+        pr_number,
+        *(f"{prefix}%" for prefix in GITHUB_IMPORT_COMMENT_ID_PREFIXES),
+    ]
+    keep_sql = ""
+    if current_github_comment_ids:
+        placeholders = ",".join("?" for _ in current_github_comment_ids)
+        keep_sql = f"AND github_comment_id NOT IN ({placeholders})"
+        params.extend(sorted(current_github_comment_ids))
+    rows = connection.execute(
+        f"""
+        SELECT id
+        FROM external_items
+        WHERE repo = ?
+          AND pr_number = ?
+          AND ({prefix_sql})
+          {keep_sql}
+        """,
+        params,
+    ).fetchall()
+    return [int(row["id"]) for row in rows]
+
+
+def delete_external_items(connection: sqlite3.Connection, external_ids: list[int]) -> int:
+    if not external_ids:
+        return 0
+    placeholders = ",".join("?" for _ in external_ids)
+    connection.execute(
+        f"DELETE FROM item_links WHERE external_item_id IN ({placeholders})",
+        external_ids,
+    )
+    connection.execute(
+        f"""
+        DELETE FROM item_verdicts
+        WHERE target_kind = 'external_item'
+          AND target_id IN ({placeholders})
+        """,
+        external_ids,
+    )
+    cursor = connection.execute(
+        f"DELETE FROM external_items WHERE id IN ({placeholders})",
+        external_ids,
+    )
+    return int(cursor.rowcount or 0)
 
 
 def load_link_candidates(
@@ -1784,9 +1852,10 @@ def external_scope_where_for_runs(rows: list[sqlite3.Row]) -> tuple[str, list[An
             if head_sha:
                 clauses.append(
                     "(external_items.repo = ? AND external_items.pr_number = ? "
-                    "AND (external_items.head_sha = ? OR external_items.head_sha = ''))"
+                    "AND (external_items.import_head_sha = ? "
+                    "OR external_items.head_sha = ? OR external_items.head_sha = ''))"
                 )
-                params.extend([repo, pr_number, head_sha])
+                params.extend([repo, pr_number, head_sha, head_sha])
             else:
                 clauses.append("(external_items.repo = ? AND external_items.pr_number = ?)")
                 params.extend([repo, pr_number])
@@ -1798,8 +1867,11 @@ def external_scope_where_for_runs(rows: list[sqlite3.Row]) -> tuple[str, list[An
         if key in seen:
             continue
         seen.add(key)
-        clauses.append("(external_items.repo = ? AND external_items.head_sha = ?)")
-        params.extend([repo, head_sha])
+        clauses.append(
+            "(external_items.repo = ? "
+            "AND (external_items.import_head_sha = ? OR external_items.head_sha = ?))"
+        )
+        params.extend([repo, head_sha, head_sha])
     if not clauses:
         return "0", []
     return "(" + " OR ".join(clauses) + ")", params
@@ -2082,6 +2154,7 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
         repo=repo.full_name,
         pr_number=pr_number,
         default_head_sha=review_default_head_sha,
+        import_head_sha=head_sha,
         prefer_default_head_sha=explicit_head_sha,
         comments=comments,
         comment_kind="review_comment",
@@ -2092,6 +2165,7 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
                 repo=repo.full_name,
                 pr_number=pr_number,
                 default_head_sha=head_sha,
+                import_head_sha=head_sha,
                 prefer_default_head_sha=True,
                 comments=issue_comments,
                 comment_kind="issue_comment",
@@ -2100,15 +2174,27 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
     source_counts: dict[str, int] = {}
     for item in imported_items:
         source_counts[item.source] = source_counts.get(item.source, 0) + 1
+    current_github_comment_ids = {
+        item.github_comment_id for item in imported_items if item.github_comment_id
+    }
 
     with sqlite3.connect(db_path) as connection:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
+        stale_external_ids = stale_github_external_item_ids(
+            connection,
+            repo=repo.full_name,
+            pr_number=pr_number,
+            current_github_comment_ids=current_github_comment_ids,
+        )
         if explicit_head_sha and head_sha:
             head_shas = {head_sha}
         else:
             head_shas = {item.head_sha for item in imported_items if item.head_sha}
             if not args.comments_json and head_sha:
+                # Live imports preserve each inline comment's commit_id, but the
+                # current PR head is also eligible so older review comments can
+                # match a local run for the revision being imported.
                 head_shas.add(head_sha)
         allow_pr_fallback = not (args.comments_json and not explicit_head_sha)
         candidate_run_count = count_link_candidate_runs(
@@ -2142,6 +2228,7 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
             print(f"Link candidate runs: {candidate_run_count}")
             print(f"Link candidates: {len(candidates)}")
             print(f"Would create/update links: {len(dry_matches)}")
+            print(f"Would remove stale external items: {len(stale_external_ids)}")
             if source_counts:
                 print(
                     "Sources: "
@@ -2151,6 +2238,7 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
 
         created = 0
         updated = 0
+        stale_removed = delete_external_items(connection, stale_external_ids)
         imported: list[tuple[int, ExternalReviewItem]] = []
         for item in imported_items:
             item_id, was_created = upsert_external_item(connection, item)
@@ -2175,6 +2263,8 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
         f"OK: imported {len(imported_items)} external review items "
         f"for {repo.full_name}#{pr_number} (created={created}, updated={updated})"
     )
+    if stale_removed:
+        print(f"Stale external items removed: {stale_removed}")
     print(f"Links: {len(matches)} / candidates={len(candidates)}")
     if not args.no_verdicts:
         if candidate_run_count:
@@ -2503,6 +2593,7 @@ def command_export_jsonl(args: argparse.Namespace) -> None:
                 external_items.repo,
                 external_items.pr_number,
                 external_items.head_sha,
+                external_items.import_head_sha,
                 external_items.source,
                 external_items.path,
                 external_items.line,
@@ -2778,7 +2869,7 @@ def build_import_github_reviews_parser() -> argparse.ArgumentParser:
     )
     importer.add_argument(
         "--head-sha",
-        help="Head SHA to store when using --comments-json or overriding GitHub metadata",
+        help="Override comment commit SHA and pin the import/link scope to this local run SHA",
     )
     importer.add_argument(
         "--min-link-score",
