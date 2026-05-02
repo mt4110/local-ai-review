@@ -193,6 +193,8 @@ make review-db-down
 
 `pre-pr-review` は PR 作成前の branch 差分も `review_kind=pre_pr` として保存します。DB には `BASE...HEAD` の base/head、head SHA、未commit差分を含めたかどうかも残るため、PR 作成後の remote review 結果と同じ run を照合しやすくなります。
 
+`llreview` の pre-PR mode では、対象 workspace 直下に `.private_docs/` がある場合、その Markdown を compact な trusted design context として model prompt に追加します。context は finding の根拠そのものにはせず、diff に見えている evidence を解釈するためだけに使います。各 context document の path と sha256 は DB の `artifacts(kind='context_digest')` に保存されます。無効化する場合は `llreview --no-trusted-context`、明示的に別 directory を渡す場合は `llreview --trusted-context-dir /path/to/.private_docs` を使います。
+
 `make review-db-web` は Datasette を Docker でバックグラウンド起動し、`http://127.0.0.1:8003` を開きます。Datasette のデフォルトは `8001` なので、この repository では衝突を避けて `8003` にしています。停止は `make review-db-down` です。Datasette は read-only で立てているため、手動採点は `make review-db-score ...` で入れます。手元の DB client を使いたい場合は `out/review-history/local-ai-review.db` を DBeaver で開けます。
 
 ## テスト手順

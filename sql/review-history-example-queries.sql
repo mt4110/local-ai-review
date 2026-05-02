@@ -8,6 +8,8 @@ SELECT
   base_ref,
   head_ref,
   model,
+  prompt_version,
+  SUBSTR(diff_fingerprint, 1, 16) AS diff_fp,
   findings_count,
   watch_items_count,
   ROUND(elapsed_seconds, 1) AS elapsed_s
@@ -37,6 +39,20 @@ FROM review_items AS items
 JOIN review_runs AS runs
 ON runs.id = items.run_id
 ORDER BY runs.id DESC, items.item_type, items.ordinal
+LIMIT 50;
+
+-- Trusted context documents recorded for a run
+SELECT
+  runs.id AS run_id,
+  runs.repo,
+  runs.review_kind,
+  artifacts.path,
+  artifacts.sha256
+FROM artifacts
+JOIN review_runs AS runs
+ON runs.id = artifacts.run_id
+WHERE artifacts.kind = 'context_digest'
+ORDER BY runs.id DESC, artifacts.path
 LIMIT 50;
 
 -- Repo and model level health

@@ -87,6 +87,15 @@ Pre-PR runs are stored with `review_kind=pre_pr`. The DB also keeps `base_ref`,
 preflight findings, false positives, and manual score against the later remote
 review.
 
+In pre-PR mode, if the target workspace contains `.private_docs/`, `llreview`
+summarizes its Markdown files as compact trusted design context for the model
+prompt. This context helps interpret visible diff evidence; it is not evidence
+by itself. The run stores only each context document path and sha256 in
+`artifacts(kind='context_digest')`. Use `llreview --no-trusted-context` to
+disable the auto-load path, or `llreview --trusted-context-dir /path/to/.private_docs`
+to pass a trusted context directory explicitly. Direct
+`scripts/local-ai-precision-review.py` runs can also use `--trusted-context-dir`.
+
 ## Calibration Rules
 
 Past high-signal review comments in `mt4110/geo-line-ranker` show that useful
@@ -106,6 +115,26 @@ findings tend to be small and grounded:
 Generic best-practice comments are intentionally filtered out or demoted to
 watch items. Examples: fixed container UIDs, Docker `COPY` "missing error
 handling", `/usr/local/bin` PATH concerns, and telemetry environment variables.
+
+Do not treat `cdn.example.com` or `blob:` strings in fixtures/tests as real URL
+dependencies when the code only checks value-shaping and never fetches them.
+
+Persistable value guards such as `toPersistableImageValue()` may intentionally
+accept relative paths, CDN URLs, or durable references. Do not require `src` to
+be an absolute valid URL unless that is the public contract. Do not require
+strict `mimeType` syntax validation unless the diff shows the guard is the
+upload/content-type trust boundary.
+
+Do not emit generic watch items asking someone to verify new schema/docs/README
+entries against implementation when the diff already shows the implementation,
+focused tests, and no concrete mismatch. CLI default workspace ids, timeout
+seconds, and example verification commands are not issues when overrides and
+invalid-value tests are visible.
+
+A verification command parsed with `shlex.split()` and executed through
+`subprocess.run(..., shell=False)` is not shell injection by itself. Report it
+only when the diff shows a shell boundary, untrusted command construction, or
+`shell=True`.
 
 When `covered_by_existing_safeguard` repeats, update prompt/calibration before
 adding suppression rules. Security findings such as path traversal, injection,
@@ -131,6 +160,10 @@ such as container smoke tests after read-only filesystem hardening.
 The history DB is for measuring whether local review is actually useful before
 remote review. It stores run metadata, pre-PR context, findings, watch items,
 reviewed files, and an optional feedback row you can update later from the CLI.
+Run metadata includes `prompt_family`, `prompt_version`, `prompt_hash`,
+`model_options_hash`, `diff_fingerprint`, and trusted-context document count /
+summary bytes. These fields make later calibration and learning exports
+reconstructable without storing raw private rows.
 For the v1.0 evidence loop, normalized local items are stored in `review_items`,
 external or human-review items belong in `external_items`, and item-level
 scoring is stored in `item_verdicts`. `missed` belongs to external/human items,
@@ -160,6 +193,10 @@ reason code such as `covered_by_existing_safeguard`, `intentional_behavior`,
 `diagnostic_watch`. A single false positive is evidence, not an automatic
 suppression rule; repeated reasons become prompt/local-rule candidates in
 `llreview report`.
+
+`llreview export-jsonl` writes one record per review item, including
+`prompt_hash`, `model_options_hash`, and `diff_fingerprint`. If trusted context
+was used for the run, each record also includes a `context_digests` sha256 list.
 
 Default DB path:
 

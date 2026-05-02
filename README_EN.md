@@ -177,6 +177,14 @@ The DB also records the `BASE...HEAD` base/head, head SHA, and whether
 uncommitted changes were included, which makes the run easier to compare with
 the later remote review.
 
+In pre-PR mode, `llreview` auto-loads Markdown files from the target workspace's
+`.private_docs/` directory as compact trusted design context when that directory
+exists. Context helps interpret visible diff evidence; it is not evidence by
+itself. The run stores context document path and sha256 records in
+`artifacts(kind='context_digest')`. Use `llreview --no-trusted-context` to
+disable this, or `llreview --trusted-context-dir /path/to/.private_docs` to pass
+an explicit trusted context directory.
+
 `make review-db-web` starts Datasette in Docker in the background and opens the DB at `http://127.0.0.1:8003`. Datasette defaults to `8001`, so this repo binds `8003` to stay two ports above the default. Stop it with `make review-db-down`. Datasette is intentionally read-only here, so manual scoring goes through `make review-db-score ...`. If you prefer a desktop client, open `out/review-history/local-ai-review.db` in DBeaver.
 
 ## Test Procedure
