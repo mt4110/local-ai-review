@@ -655,7 +655,7 @@ def build_review_command(args: argparse.Namespace, workspace: Workspace) -> tupl
 
     trusted_context_dirs: list[Path] = []
     for raw_dir in args.trusted_context_dir or []:
-        trusted_context_dirs.append(Path(raw_dir).expanduser().resolve())
+        trusted_context_dirs.append(Path(os.path.abspath(os.path.expanduser(raw_dir))))
 
     if workspace.open_pr:
         pr_number = str(args.pr or workspace.open_pr["number"])

@@ -405,7 +405,8 @@ def resolve_path(value: str) -> Path:
 
 def context_document_path(context_dir: Path, path: Path) -> str:
     relative_path = path.relative_to(context_dir).as_posix()
-    return f"{context_dir.name}/{relative_path}"
+    context_dir_id = hashlib.sha256(str(context_dir).encode("utf-8")).hexdigest()[:12]
+    return f"{context_dir.name}-{context_dir_id}/{relative_path}"
 
 
 def sha256_file(path: Path) -> str:
@@ -417,7 +418,7 @@ def sha256_file(path: Path) -> str:
 
 
 def markdown_context_summary(text: str, *, limit: int) -> str:
-    """Build a compact, non-verbatim design summary from a trusted markdown file."""
+    """Build a compact design summary by extracting selected trusted markdown lines."""
     lines: list[str] = []
     for raw in text.splitlines():
         line = raw.strip()
@@ -2546,7 +2547,7 @@ diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-
             max_summary_chars=2000,
         )
         assert len(context_docs) == 1
-        assert context_docs[0].path == ".private_docs/README.md"
+        assert re.fullmatch(r"\.private_docs-[0-9a-f]{12}/README\.md", context_docs[0].path)
         assert "Findings must cite visible diff evidence" in context_docs[0].summary
         if symlink_supported:
             linked_context_dir = Path(temp_dir) / "linked-private-docs"
