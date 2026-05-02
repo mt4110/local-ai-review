@@ -87,6 +87,15 @@ Pre-PR runs are stored with `review_kind=pre_pr`. The DB also keeps `base_ref`,
 preflight findings, false positives, and manual score against the later remote
 review.
 
+In pre-PR mode, if the target workspace contains `.private_docs/`, `llreview`
+summarizes its Markdown files as compact trusted design context for the model
+prompt. This context helps interpret visible diff evidence; it is not evidence
+by itself. The run stores only each context document path and sha256 in
+`artifacts(kind='context_digest')`. Use `llreview --no-trusted-context` to
+disable the auto-load path, or `llreview --trusted-context-dir /path/to/.private_docs`
+to pass a trusted context directory explicitly. Direct
+`scripts/local-ai-precision-review.py` runs can also use `--trusted-context-dir`.
+
 ## Calibration Rules
 
 Past high-signal review comments in `mt4110/geo-line-ranker` show that useful
@@ -151,6 +160,10 @@ such as container smoke tests after read-only filesystem hardening.
 The history DB is for measuring whether local review is actually useful before
 remote review. It stores run metadata, pre-PR context, findings, watch items,
 reviewed files, and an optional feedback row you can update later from the CLI.
+Run metadata includes `prompt_family`, `prompt_version`, `prompt_hash`,
+`model_options_hash`, `diff_fingerprint`, and trusted-context document count /
+summary bytes. These fields make later calibration and learning exports
+reconstructable without storing raw private rows.
 For the v1.0 evidence loop, normalized local items are stored in `review_items`,
 external or human-review items belong in `external_items`, and item-level
 scoring is stored in `item_verdicts`. `missed` belongs to external/human items,
@@ -180,6 +193,10 @@ reason code such as `covered_by_existing_safeguard`, `intentional_behavior`,
 `diagnostic_watch`. A single false positive is evidence, not an automatic
 suppression rule; repeated reasons become prompt/local-rule candidates in
 `llreview report`.
+
+`llreview export-jsonl` writes one record per review item, including
+`prompt_hash`, `model_options_hash`, and `diff_fingerprint`. If trusted context
+was used for the run, each record also includes a `context_digests` sha256 list.
 
 Default DB path:
 

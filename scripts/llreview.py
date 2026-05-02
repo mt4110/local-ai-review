@@ -653,9 +653,15 @@ def build_review_command(args: argparse.Namespace, workspace: Workspace) -> tupl
     elif args.max_model_files is not None:
         cmd.extend(["--max-model-files", str(args.max_model_files)])
 
+    trusted_context_dirs: list[Path] = []
+    for raw_dir in args.trusted_context_dir or []:
+        trusted_context_dirs.append(Path(raw_dir).expanduser().resolve())
+
     if workspace.open_pr:
         pr_number = str(args.pr or workspace.open_pr["number"])
         cmd.extend(["--pr", pr_number])
+        for context_dir in trusted_context_dirs:
+            cmd.extend(["--trusted-context-dir", str(context_dir)])
         return cmd, None
 
     diff_path, working_tree_included = build_pre_pr_diff(
@@ -663,6 +669,16 @@ def build_review_command(args: argparse.Namespace, workspace: Workspace) -> tupl
         workspace.base_ref,
         include_working_tree=not args.no_working_tree,
     )
+    if not args.no_trusted_context:
+        local_context = workspace.root / ".private_docs"
+        if local_context.is_dir():
+            trusted_context_dirs.insert(0, local_context.resolve())
+    seen_context_dirs: set[Path] = set()
+    for context_dir in trusted_context_dirs:
+        if context_dir in seen_context_dirs:
+            continue
+        seen_context_dirs.add(context_dir)
+        cmd.extend(["--trusted-context-dir", str(context_dir)])
     subject = workspace.branch or workspace.head_sha[:12]
     cmd.extend(
         [
@@ -1251,6 +1267,17 @@ def command_export_jsonl(args: argparse.Namespace) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path) as connection, output.open("w", encoding="utf-8") as file:
         connection.row_factory = sqlite3.Row
+        context_digest_rows = connection.execute(
+            """
+            SELECT run_id, sha256
+            FROM artifacts
+            WHERE kind = 'context_digest'
+            ORDER BY path
+            """
+        ).fetchall()
+        context_digests: dict[int, list[str]] = {}
+        for digest_row in context_digest_rows:
+            context_digests.setdefault(int(digest_row["run_id"]), []).append(str(digest_row["sha256"]))
         rows = connection.execute(
             """
             SELECT
@@ -1262,6 +1289,11 @@ def command_export_jsonl(args: argparse.Namespace) -> None:
                 runs.head_ref,
                 runs.head_sha,
                 runs.model,
+                runs.prompt_family,
+                runs.prompt_version,
+                runs.prompt_hash,
+                runs.model_options_hash,
+                runs.diff_fingerprint,
                 runs.diff_bytes,
                 runs.elapsed_seconds,
                 feedback.useful_findings_fixed,
@@ -1310,7 +1342,9 @@ def command_export_jsonl(args: argparse.Namespace) -> None:
         )
         count = 0
         for row in rows:
-            file.write(json.dumps(dict(row), sort_keys=True, ensure_ascii=False) + "\n")
+            record = dict(row)
+            record["context_digests"] = context_digests.get(int(row["run_id"]), [])
+            file.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
             count += 1
     print(f"OK: exported {count} review items to {output}")
 
@@ -1426,6 +1460,17 @@ def build_review_parser() -> argparse.ArgumentParser:
     parser.add_argument("--static", action="store_true", help="Run static checks only")
     parser.add_argument("--max-model-files", type=int, help="Override model-reviewed file limit")
     parser.add_argument("--no-working-tree", action="store_true", help="Do not include dirty working tree in pre-PR mode")
+    parser.add_argument(
+        "--trusted-context-dir",
+        action="append",
+        default=[],
+        help="Trusted markdown context directory to include in model review",
+    )
+    parser.add_argument(
+        "--no-trusted-context",
+        action="store_true",
+        help="Do not auto-load .private_docs in pre-PR mode",
+    )
     return parser
 
 
