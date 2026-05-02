@@ -1632,15 +1632,24 @@ def write_external_verdicts(
 ) -> int:
     if not imported_ids:
         return 0
+    if not candidates_exist:
+        placeholders = ",".join("?" for _ in imported_ids)
+        cursor = connection.execute(
+            f"""
+            DELETE FROM item_verdicts
+            WHERE target_kind = 'external_item'
+              AND target_id IN ({placeholders})
+              AND scorer = 'github_importer'
+              AND note LIKE ?
+            """,
+            [*imported_ids, f"{IMPORT_LINK_NOTE_PREFIX}%"],
+        )
+        return int(cursor.rowcount or 0)
     match_by_external = {match.external_item_id: match for match in matches}
     existing = latest_external_verdicts(connection, imported_ids)
     saved = 0
     for external_id in imported_ids:
-        if not candidates_exist:
-            verdict = "out_of_scope"
-            reason = "no_local_run_candidates"
-            note = f"{IMPORT_LINK_NOTE_PREFIX} no local review run candidates"
-        elif match := match_by_external.get(external_id):
+        if match := match_by_external.get(external_id):
             verdict = "covered_by_local"
             reason = "linked_by_importer"
             note = f"{IMPORT_LINK_NOTE_PREFIX} {match.relation} score={match.score:.2f}"
@@ -1709,19 +1718,27 @@ def external_scope_counts(
 def external_scope_where_for_runs(rows: list[sqlite3.Row]) -> tuple[str, list[Any]]:
     clauses: list[str] = []
     params: list[Any] = []
-    seen: set[tuple[str, str, Any]] = set()
+    seen: set[tuple[Any, ...]] = set()
     for row in rows:
         repo = str(row["repo"] or "")
         if not repo:
             continue
         pr_number = as_optional_int(row["pr_number"])
         if pr_number is not None and pr_number > 0:
-            key = ("pr", repo, pr_number)
+            head_sha = str(row["head_sha"] or "")
+            key = ("pr", repo, pr_number, head_sha)
             if key in seen:
                 continue
             seen.add(key)
-            clauses.append("(external_items.repo = ? AND external_items.pr_number = ?)")
-            params.extend([repo, pr_number])
+            if head_sha:
+                clauses.append(
+                    "(external_items.repo = ? AND external_items.pr_number = ? "
+                    "AND (external_items.head_sha = ? OR external_items.head_sha = ''))"
+                )
+                params.extend([repo, pr_number, head_sha])
+            else:
+                clauses.append("(external_items.repo = ? AND external_items.pr_number = ?)")
+                params.extend([repo, pr_number])
             continue
         head_sha = str(row["head_sha"] or "")
         if not head_sha:
@@ -1998,10 +2015,11 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
         except GitHubRequestError as exc:
             raise SystemExit(str(exc)) from exc
 
+    review_default_head_sha = head_sha if explicit_head_sha else ""
     imported_items = external_items_from_comments(
         repo=repo.full_name,
         pr_number=pr_number,
-        default_head_sha=head_sha,
+        default_head_sha=review_default_head_sha,
         prefer_default_head_sha=explicit_head_sha,
         comments=comments,
         comment_kind="review_comment",
@@ -2026,8 +2044,10 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
         connection.execute("PRAGMA foreign_keys = ON")
         if args.comments_json and not explicit_head_sha:
             head_shas: set[str] = set()
+        elif explicit_head_sha and head_sha:
+            head_shas = {head_sha}
         else:
-            head_shas = {head_sha} if head_sha else {item.head_sha for item in imported_items}
+            head_shas = {item.head_sha for item in imported_items}
         candidates = load_link_candidates(
             connection,
             repo=repo.full_name,
@@ -2087,8 +2107,8 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
             print(f"External verdicts written: {verdicts}")
         else:
             print(
-                f"External verdicts written: {verdicts} "
-                "(marked out_of_scope: no matching local review run candidates)"
+                f"External importer verdicts cleared: {verdicts} "
+                "(no matching local review run candidates)"
             )
     if source_counts:
         print(
