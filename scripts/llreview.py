@@ -1160,6 +1160,7 @@ def external_item_from_comment(
     repo: str,
     pr_number: int,
     default_head_sha: str,
+    prefer_default_head_sha: bool,
     comment: dict[str, Any],
     comment_kind: str,
 ) -> ExternalReviewItem | None:
@@ -1177,12 +1178,31 @@ def external_item_from_comment(
     github_id = str(comment.get("id") or comment.get("node_id") or "")
     if github_id:
         github_id = f"{comment_kind}:{github_id}"
-    review_id = str(comment.get("pull_request_review_id") or "")
-    thread_id = f"review:{review_id}" if review_id else ""
+    raw_thread_id = str(
+        comment.get("pull_request_review_thread_id")
+        or comment.get("review_thread_id")
+        or comment.get("thread_id")
+        or ""
+    )
+    root_comment_id = str(
+        comment.get("in_reply_to_id") or comment.get("id") or comment.get("node_id") or ""
+    )
+    if raw_thread_id:
+        thread_id = f"review_thread:{raw_thread_id}"
+    elif root_comment_id:
+        thread_id = f"{comment_kind}:{root_comment_id}"
+    else:
+        thread_id = ""
+    comment_head_sha = str(comment.get("commit_id") or "")
+    head_sha = (
+        str(default_head_sha or comment_head_sha or "")
+        if prefer_default_head_sha
+        else str(comment_head_sha or default_head_sha or "")
+    )
     item = ExternalReviewItem(
         repo=repo,
         pr_number=pr_number,
-        head_sha=str(default_head_sha or comment.get("commit_id") or ""),
+        head_sha=head_sha,
         source=external_source_for_comment(comment),
         path=str(comment.get("path") or ""),
         line=line,
@@ -1214,6 +1234,7 @@ def external_items_from_comments(
     repo: str,
     pr_number: int,
     default_head_sha: str,
+    prefer_default_head_sha: bool,
     comments: list[Any],
     comment_kind: str,
 ) -> list[ExternalReviewItem]:
@@ -1246,6 +1267,7 @@ def external_items_from_comments(
             repo=repo,
             pr_number=pr_number,
             default_head_sha=default_head_sha,
+            prefer_default_head_sha=prefer_default_head_sha,
             comment=comment,
             comment_kind=comment_kind,
         )
@@ -1373,7 +1395,9 @@ def load_link_candidates(
         if pr_number > 0:
             if clean_head_shas:
                 placeholders = ",".join("?" for _ in clean_head_shas)
-                clauses.append(f"(runs.pr_number = ? AND runs.head_sha IN ({placeholders}))")
+                clauses.append(
+                    f"(runs.pr_number = ? AND (runs.head_sha IN ({placeholders}) OR runs.head_sha = ''))"
+                )
                 params.append(pr_number)
                 params.extend(clean_head_shas)
             else:
@@ -1932,6 +1956,7 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
 
     comments: list[Any] = []
     issue_comments: list[Any] = []
+    explicit_head_sha = bool(args.head_sha)
     head_ref = ""
     head_sha = str(args.head_sha or "")
 
@@ -1977,6 +2002,7 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
         repo=repo.full_name,
         pr_number=pr_number,
         default_head_sha=head_sha,
+        prefer_default_head_sha=explicit_head_sha,
         comments=comments,
         comment_kind="review_comment",
     )
@@ -1986,6 +2012,7 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
                 repo=repo.full_name,
                 pr_number=pr_number,
                 default_head_sha=head_sha,
+                prefer_default_head_sha=True,
                 comments=issue_comments,
                 comment_kind="issue_comment",
             )
@@ -1997,7 +2024,10 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
     with sqlite3.connect(db_path) as connection:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        head_shas = {head_sha} if head_sha else {item.head_sha for item in imported_items}
+        if args.comments_json and not explicit_head_sha:
+            head_shas: set[str] = set()
+        else:
+            head_shas = {head_sha} if head_sha else {item.head_sha for item in imported_items}
         candidates = load_link_candidates(
             connection,
             repo=repo.full_name,
