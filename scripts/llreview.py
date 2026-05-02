@@ -409,8 +409,24 @@ def detect_workspace(project_dir: Path, repo_override: str | None = None) -> Wor
     token, token_status = github_token()
     open_pr = None
     if token and branch and not repo.is_local:
-        pr_repo, open_pr, lookup_error = find_open_pr_across_remotes(repo, remotes, branch, token)
-        repo = pr_repo
+        if repo_override:
+            lookup_errors: list[str] = []
+            head_owners = [repo.owner]
+            for _, remote_repo in remotes:
+                if remote_repo.owner not in head_owners:
+                    head_owners.append(remote_repo.owner)
+            for head_owner in head_owners:
+                try:
+                    open_pr = find_open_pr(repo, branch, token, head_owner=head_owner)
+                except GitHubRequestError as exc:
+                    lookup_errors.append(str(exc))
+                    continue
+                if open_pr:
+                    break
+            lookup_error = "; ".join(lookup_errors)
+        else:
+            pr_repo, open_pr, lookup_error = find_open_pr_across_remotes(repo, remotes, branch, token)
+            repo = pr_repo
         if lookup_error:
             token_status = f"{token_status}; PR lookup failed ({lookup_error})"
     if open_pr:
@@ -1352,6 +1368,7 @@ def load_link_candidates(
         JOIN review_runs AS runs
         ON runs.id = items.run_id
         WHERE {where_sql}
+          AND items.item_type = 'finding'
         ORDER BY runs.id DESC, items.item_type, items.ordinal
         """,
         params,
@@ -1898,15 +1915,18 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
         token, token_source = github_token()
         if not token:
             raise SystemExit(f"GitHub auth unavailable: {token_source}")
-        comments = github_paginated_request(
-            f"/repos/{repo.full_name}/pulls/{pr_number}/comments",
-            token,
-        )
-        if args.include_issue_comments:
-            issue_comments = github_paginated_request(
-                f"/repos/{repo.full_name}/issues/{pr_number}/comments",
+        try:
+            comments = github_paginated_request(
+                f"/repos/{repo.full_name}/pulls/{pr_number}/comments",
                 token,
             )
+            if args.include_issue_comments:
+                issue_comments = github_paginated_request(
+                    f"/repos/{repo.full_name}/issues/{pr_number}/comments",
+                    token,
+                )
+        except GitHubRequestError as exc:
+            raise SystemExit(str(exc)) from exc
 
     imported_items = external_items_from_comments(
         repo=repo.full_name,
