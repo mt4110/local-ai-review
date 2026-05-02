@@ -403,6 +403,16 @@ def resolve_path(value: str) -> Path:
     return Path(value).expanduser().resolve()
 
 
+def has_symlink_component(path: Path) -> bool:
+    candidate = Path(path.anchor)
+    parts = path.parts[1:] if path.anchor else path.parts
+    for part in parts:
+        candidate = candidate / part
+        if candidate.is_symlink():
+            return True
+    return False
+
+
 def context_document_path(context_dir: Path, path: Path) -> str:
     relative_path = path.relative_to(context_dir).as_posix()
     context_dir_id = hashlib.sha256(str(context_dir).encode("utf-8")).hexdigest()[:12]
@@ -454,9 +464,11 @@ def load_trusted_context_docs(
     docs: list[TrustedContextDoc] = []
     seen: set[Path] = set()
     for raw_dir in context_dirs:
-        raw_context_dir = Path(raw_dir).expanduser()
-        if raw_context_dir.is_symlink():
-            raise SystemExit(f"trusted context dir must not be a symlink: {raw_context_dir}")
+        raw_context_dir = Path(os.path.abspath(os.path.expanduser(raw_dir)))
+        if has_symlink_component(raw_context_dir):
+            raise SystemExit(
+                f"trusted context dir path must not contain symlinks: {raw_context_dir}"
+            )
         context_dir = raw_context_dir.resolve()
         if not context_dir.is_dir():
             raise SystemExit(f"trusted context dir does not exist or is not a directory: {context_dir}")
@@ -1309,11 +1321,27 @@ def model_review_file(
     return findings, watch
 
 
+def describes_safe_subprocess_argv_execution(text: str) -> bool:
+    normalized = text.lower()
+    compact = re.sub(r"\s+", "", normalized)
+    return (
+        "command injection" in normalized
+        and "subprocess.run" in normalized
+        and "shell=false" in compact
+        and (
+            "shlex.split" in normalized
+            or "argv" in normalized
+            or "subprocess.run([" in normalized
+        )
+    )
+
+
 def calibrate_model_watch_item(path: str, item: dict[str, Any]) -> WatchItem | None:
     title = str(item.get("title", "")).strip() or "Watch item"
     body = str(item.get("body", "")).strip()
     verification = str(item.get("verification", "")).strip()
     text = f"{title}\n{body}\n{verification}".lower()
+    issue_text = f"{title}\n{body}".lower()
     is_docs_path = path.startswith("docs/") or path.lower().startswith("readme")
 
     if "frontend service" in text and "postgres_pool_max_size" in text:
@@ -1333,7 +1361,6 @@ def calibrate_model_watch_item(path: str, item: dict[str, Any]) -> WatchItem | N
         "agent run artifact normalization",
         "script documentation may be outdated",
         "potential mismatch in task execution context",
-        "potential command injection in verification",
         "hardcoded timeout value",
         "hardcoded default workspace id",
         "no explicit handling of empty or invalid `scope_path`",
@@ -1350,10 +1377,7 @@ def calibrate_model_watch_item(path: str, item: dict[str, Any]) -> WatchItem | N
     if agent_lane_context and any(pattern in text for pattern in agent_lane_generic_watch_patterns):
         return None
 
-    if "shlex.split" in text and "command injection" in text:
-        return None
-
-    if "subprocess.run" in text and "shell" in text and "command injection" in text:
+    if describes_safe_subprocess_argv_execution(issue_text):
         return None
 
     if "timeout" in text and "configurable" in text and "--timeout-seconds" in text:
@@ -2517,6 +2541,29 @@ diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-
         watch_item = calibrate_model_watch_item(watch_path, false_positive_watch)
         assert watch_item is None
 
+    safe_argv_watch = calibrate_model_watch_item(
+        "scripts/review.py",
+        {
+            "title": "Potential command injection in verification",
+            "body": (
+                "The command is parsed with shlex.split() and then passed as argv to "
+                "subprocess.run([...], shell=False)."
+            ),
+            "verification": "Confirm argv execution is retained.",
+        },
+    )
+    assert safe_argv_watch is None
+
+    unsafe_shell_watch = calibrate_model_watch_item(
+        "scripts/review.py",
+        {
+            "title": "Potential command injection in verification",
+            "body": "subprocess.run(command, shell=True) may execute untrusted shell metacharacters.",
+            "verification": "Reject untrusted input or use argv execution with shell=False.",
+        },
+    )
+    assert unsafe_shell_watch is not None
+
     non_agent_schema_watch = calibrate_model_watch_item(
         "docs/api-contract.md",
         {
@@ -2527,7 +2574,7 @@ diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-
     )
     assert non_agent_schema_watch is not None
 
-    with tempfile.TemporaryDirectory() as temp_dir:
+    with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
         context_dir = Path(temp_dir) / ".private_docs"
         context_dir.mkdir()
         context_file = context_dir / "README.md"
@@ -2563,6 +2610,25 @@ diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-
                 pass
             else:
                 raise AssertionError("symlinked trusted context dir should be rejected")
+
+            parent_target = Path(temp_dir) / "parent-target"
+            parent_target.mkdir()
+            nested_context_dir = parent_target / ".private_docs"
+            nested_context_dir.mkdir()
+            (nested_context_dir / "README.md").write_text("# Nested\n", encoding="utf-8")
+            linked_parent = Path(temp_dir) / "linked-parent"
+            linked_parent.symlink_to(parent_target, target_is_directory=True)
+            try:
+                load_trusted_context_docs(
+                    [str(linked_parent / ".private_docs")],
+                    max_docs=4,
+                    max_doc_bytes=20000,
+                    max_summary_chars=2000,
+                )
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError("trusted context dir with symlinked parent should be rejected")
 
         large_context_dir = Path(temp_dir) / "large_context"
         large_context_dir.mkdir()
