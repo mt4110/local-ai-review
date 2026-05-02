@@ -165,6 +165,10 @@ ON external_items(repo, pr_number, head_sha, source);
 CREATE INDEX IF NOT EXISTS external_items_fingerprint_idx
 ON external_items(fingerprint);
 
+CREATE UNIQUE INDEX IF NOT EXISTS external_items_github_comment_idx
+ON external_items(repo, pr_number, github_comment_id)
+WHERE github_comment_id <> '';
+
 CREATE TABLE IF NOT EXISTS item_verdicts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     target_kind TEXT NOT NULL,
@@ -190,6 +194,9 @@ CREATE TABLE IF NOT EXISTS item_links (
 
 CREATE UNIQUE INDEX IF NOT EXISTS item_links_pair_idx
 ON item_links(review_item_id, external_item_id, relation);
+
+CREATE INDEX IF NOT EXISTS item_links_external_idx
+ON item_links(external_item_id);
 
 CREATE TABLE IF NOT EXISTS rule_updates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

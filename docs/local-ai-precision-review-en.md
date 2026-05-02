@@ -177,6 +177,7 @@ llreview status
 llreview
 llreview update
 llreview score
+llreview import-github-reviews 42
 llreview report
 llreview export-jsonl
 ```
@@ -194,9 +195,26 @@ reason code such as `covered_by_existing_safeguard`, `intentional_behavior`,
 suppression rule; repeated reasons become prompt/local-rule candidates in
 `llreview report`.
 
-`llreview export-jsonl` writes one record per review item, including
-`prompt_hash`, `model_options_hash`, and `diff_fingerprint`. If trusted context
-was used for the run, each record also includes a `context_digests` sha256 list.
+`llreview import-github-reviews 42` imports GitHub inline PR review comments
+into `external_items`. It classifies Copilot, automated, and human reviewer
+comments, then links them to local `review_items` with a loose match over
+fingerprint, file, line, and normalized text. When local review run candidates
+exist, linked external items get a `covered_by_local` external-side verdict and
+unlinked external items get `missed_by_local`. If there is no local run
+candidate, the importer does not invent missed verdicts.
+
+Re-importing the same PR updates by GitHub comment id instead of duplicating
+rows. For reproducible checks, save a GitHub `/pulls/comments` JSON array and
+pass it through the same importer path with
+`--comments-json comments.json --repo owner/name --head-sha <sha>`. Add
+`--include-issue-comments` only when top-level PR conversation comments should
+also become learning items.
+
+`llreview export-jsonl` writes local review items and imported external items.
+Local records include `prompt_hash`, `model_options_hash`, and
+`diff_fingerprint`. If trusted context was used for the run, each local record
+also includes a `context_digests` sha256 list. External records include the
+GitHub comment id, source, linked local item ids, and external-side verdict.
 
 Default DB path:
 

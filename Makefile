@@ -1,4 +1,4 @@
-.PHONY: install-local llreview update-local precision-review precision-review-static precision-review-self-test pre-pr-review pre-pr-review-static review-db-init review-db-stats review-db-up review-db-web review-db-down review-db-score
+.PHONY: install-local llreview update-local precision-review precision-review-static precision-review-self-test pre-pr-review pre-pr-review-static review-db-init review-db-stats review-db-up review-db-web review-db-down review-db-score review-db-import-github-reviews
 
 REPO ?=
 PR ?=
@@ -162,3 +162,10 @@ review-db-score: review-db-init
 		--would-request-remote-review-now "$(REMOTE_READY)" \
 		$(if $(REMOTE_FINDINGS),--remote-findings-count "$(REMOTE_FINDINGS)",) \
 		--note "$(NOTE)"
+
+review-db-import-github-reviews: review-db-init
+	@test -n "$(REPO)" || { echo "REPO=owner/name is required"; exit 2; }
+	@test -n "$(PR)" || { echo "PR=<number> is required"; exit 2; }
+	./llreview import-github-reviews "$(PR)" \
+		--repo "$(REPO)" \
+		--db "$(REVIEW_DB)"

@@ -12,6 +12,9 @@ falls back to a pre-PR diff when no PR exists yet.
 from __future__ import annotations
 
 import argparse
+import difflib
+import hashlib
+import html
 import json
 import os
 import re
@@ -39,6 +42,7 @@ DEFAULT_JSONL = TOOL_ROOT / "out" / "review-history" / "review-items.jsonl"
 DEFAULT_INSTALL_PATH = Path.home() / ".local" / "bin" / "llreview"
 GITHUB_API = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
 PROGRESS_PREFIX = "LLREVIEW_EVENT "
+IMPORT_LINK_NOTE_PREFIX = "github_importer:"
 LOCAL_ITEM_VERDICTS = {
     "u": "useful_fixed",
     "useful": "useful_fixed",
@@ -123,6 +127,46 @@ class Workspace:
     dirty: bool
     open_pr: dict[str, Any] | None
     token_status: str
+
+
+@dataclass(frozen=True)
+class ExternalReviewItem:
+    repo: str
+    pr_number: int
+    head_sha: str
+    source: str
+    path: str
+    line: int | None
+    title: str
+    body: str
+    url: str
+    github_comment_id: str
+    github_thread_id: str
+    fingerprint: str
+
+
+@dataclass(frozen=True)
+class LinkCandidate:
+    id: int
+    run_id: int
+    item_type: str
+    source: str
+    path: str
+    line: int | None
+    title: str
+    body: str
+    fix: str
+    verification: str
+    fingerprint: str
+
+
+@dataclass(frozen=True)
+class LinkMatch:
+    review_item_id: int
+    external_item_id: int
+    relation: str
+    score: float
+    note: str
 
 
 class GitHubRequestError(Exception):
@@ -251,6 +295,20 @@ def github_request(path: str, token: str) -> Any:
     if not raw:
         return None
     return json.loads(raw.decode("utf-8"))
+
+
+def github_paginated_request(path: str, token: str) -> list[Any]:
+    items: list[Any] = []
+    page = 1
+    separator = "&" if "?" in path else "?"
+    while True:
+        payload = github_request(f"{path}{separator}per_page=100&page={page}", token)
+        if not isinstance(payload, list):
+            return items
+        items.extend(payload)
+        if len(payload) < 100:
+            return items
+        page += 1
 
 
 def detect_base_ref(root: Path) -> str:
@@ -780,12 +838,20 @@ def command_status(args: argparse.Namespace) -> None:
     ensure_db_schema(db_path)
     last_run = fetch_last_run(db_path, workspace)
     unscored = 0
+    external_total = 0
+    external_linked = 0
     if db_path.is_file():
         with sqlite3.connect(db_path) as connection:
             row = connection.execute(
                 "SELECT COUNT(*) FROM review_run_summary WHERE useful_findings_fixed IS NULL"
             ).fetchone()
             unscored = int(row[0] if row else 0)
+            pr_number = int(workspace.open_pr["number"]) if workspace.open_pr else None
+            external_total, external_linked = external_scope_counts(
+                connection,
+                repo=workspace.repo.full_name,
+                pr_number=pr_number,
+            )
     print(f"Workspace: {workspace.root}")
     print(f"Repository: {workspace.repo.full_name}")
     print(f"Branch: {workspace.branch or '(detached)'}")
@@ -806,6 +872,10 @@ def command_status(args: argparse.Namespace) -> None:
     else:
         print("Last run: none")
     print(f"Unscored runs: {unscored}")
+    print(
+        "External review items: "
+        f"total={external_total} linked={external_linked} unlinked={external_total - external_linked}"
+    )
     print(f"DB: {db_path}")
 
 
@@ -907,6 +977,590 @@ def percent(numerator: int | float, denominator: int | float) -> str:
     if not denominator:
         return "n/a"
     return f"{(numerator / denominator) * 100:.1f}%"
+
+
+def stable_fingerprint(*parts: Any) -> str:
+    normalized = "\n".join("" if part is None else str(part) for part in parts)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def as_optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def strip_review_boilerplate(value: str) -> str:
+    text = re.sub(r"<details\b.*?</details>", " ", value, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"\n\s*Useful\?\s*React with.*$", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"\n\s*---\s*\n.*$", "", text, flags=re.DOTALL)
+    return text.strip()
+
+
+def markdown_to_plain_text(value: str) -> str:
+    text = html.unescape(strip_review_boilerplate(value))
+    text = re.sub(r"!\[[^\]]*]\([^)]+\)", " ", text)
+    text = re.sub(r"\[([^\]]+)]\([^)]+\)", r"\1", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"[*>#~]+", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def normalize_review_text(value: str) -> str:
+    text = markdown_to_plain_text(value).lower()
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"[^a-z0-9_./:-]+", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def review_tokens(value: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9_./:-]{3,}", normalize_review_text(value))
+        if token not in {"the", "and", "for", "with", "that", "this", "from", "into", "when"}
+    }
+
+
+def text_similarity(left: str, right: str) -> float:
+    left_normalized = normalize_review_text(left)
+    right_normalized = normalize_review_text(right)
+    if not left_normalized or not right_normalized:
+        return 0.0
+    left_tokens = review_tokens(left_normalized)
+    right_tokens = review_tokens(right_normalized)
+    token_score = 0.0
+    if left_tokens and right_tokens:
+        token_score = len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+    sequence_score = difflib.SequenceMatcher(None, left_normalized, right_normalized).ratio()
+    return max(token_score, sequence_score * 0.65)
+
+
+def external_source_for_comment(comment: dict[str, Any]) -> str:
+    login = str((comment.get("user") or {}).get("login", "")).lower()
+    if "copilot" in login:
+        return "copilot"
+    if login.endswith("[bot]"):
+        return "automated"
+    if login.endswith("-bot"):
+        return "bot_review"
+    return "human"
+
+
+def external_title_from_body(body: str) -> str:
+    clean = strip_review_boilerplate(body)
+    for raw_line in clean.splitlines():
+        line = markdown_to_plain_text(raw_line)
+        line = re.sub(r"\bP[0-3]\s+Badge\b", " ", line, flags=re.IGNORECASE)
+        line = re.sub(r"^\s*\[?P[0-3]\]?\s+", "", line)
+        line = re.sub(r"\s+", " ", line).strip(" :-")
+        if line:
+            return truncate_text(line, 140)
+    return "External review comment"
+
+
+def should_skip_issue_comment(body: str) -> bool:
+    normalized = normalize_review_text(body)
+    if not normalized:
+        return True
+    if "<!-- local-ai-precision-review -->" in body or "<!-- local-llm-review -->" in body:
+        return True
+    if re.search(r"(?im)^\s*@[-a-z0-9_]+\s+review\s*$", body):
+        return True
+    if re.fullmatch(r"@?[a-z0-9_-]+\s+review", normalized):
+        return True
+    if "didn t find any major issues" in normalized:
+        return True
+    return False
+
+
+def external_item_fingerprint(item: ExternalReviewItem) -> str:
+    return stable_fingerprint(
+        "external",
+        item.repo,
+        item.pr_number,
+        item.source,
+        item.path,
+        item.line or "",
+        normalize_review_text(f"{item.title}\n{item.body}"),
+    )
+
+
+def external_item_from_comment(
+    *,
+    repo: str,
+    pr_number: int,
+    default_head_sha: str,
+    comment: dict[str, Any],
+    comment_kind: str,
+) -> ExternalReviewItem | None:
+    body = str(comment.get("body") or "")
+    if comment_kind == "issue_comment" and should_skip_issue_comment(body):
+        return None
+    clean_body = strip_review_boilerplate(body)
+    if not normalize_review_text(clean_body):
+        return None
+    line = as_optional_int(comment.get("line"))
+    if line is None:
+        line = as_optional_int(comment.get("original_line"))
+    github_id = str(comment.get("id") or comment.get("node_id") or "")
+    if github_id:
+        github_id = f"{comment_kind}:{github_id}"
+    review_id = str(comment.get("pull_request_review_id") or "")
+    thread_id = f"review:{review_id}" if review_id else ""
+    item = ExternalReviewItem(
+        repo=repo,
+        pr_number=pr_number,
+        head_sha=str(comment.get("commit_id") or default_head_sha or ""),
+        source=external_source_for_comment(comment),
+        path=str(comment.get("path") or ""),
+        line=line,
+        title=external_title_from_body(clean_body),
+        body=clean_body,
+        url=str(comment.get("html_url") or comment.get("url") or ""),
+        github_comment_id=github_id,
+        github_thread_id=thread_id,
+        fingerprint="",
+    )
+    return ExternalReviewItem(
+        repo=item.repo,
+        pr_number=item.pr_number,
+        head_sha=item.head_sha,
+        source=item.source,
+        path=item.path,
+        line=item.line,
+        title=item.title,
+        body=item.body,
+        url=item.url,
+        github_comment_id=item.github_comment_id,
+        github_thread_id=item.github_thread_id,
+        fingerprint=external_item_fingerprint(item),
+    )
+
+
+def external_items_from_comments(
+    *,
+    repo: str,
+    pr_number: int,
+    default_head_sha: str,
+    comments: list[Any],
+    comment_kind: str,
+) -> list[ExternalReviewItem]:
+    items: list[ExternalReviewItem] = []
+    seen: set[str] = set()
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        item = external_item_from_comment(
+            repo=repo,
+            pr_number=pr_number,
+            default_head_sha=default_head_sha,
+            comment=comment,
+            comment_kind=comment_kind,
+        )
+        if item is None:
+            continue
+        dedupe_key = item.github_comment_id or item.fingerprint
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        items.append(item)
+    return items
+
+
+def load_json_list(path: Path) -> list[Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise SystemExit(f"{path} must contain a JSON array")
+    return payload
+
+
+def upsert_external_item(connection: sqlite3.Connection, item: ExternalReviewItem) -> tuple[int, bool]:
+    existing = None
+    if item.github_comment_id:
+        existing = connection.execute(
+            """
+            SELECT id
+            FROM external_items
+            WHERE repo = ? AND pr_number = ? AND github_comment_id = ?
+            """,
+            (item.repo, item.pr_number, item.github_comment_id),
+        ).fetchone()
+    if existing is None:
+        existing = connection.execute(
+            """
+            SELECT id
+            FROM external_items
+            WHERE repo = ? AND pr_number = ? AND fingerprint = ? AND github_comment_id = ''
+            """,
+            (item.repo, item.pr_number, item.fingerprint),
+        ).fetchone()
+    if existing:
+        item_id = int(existing["id"])
+        connection.execute(
+            """
+            UPDATE external_items
+            SET
+                head_sha = ?,
+                source = ?,
+                path = ?,
+                line = ?,
+                title = ?,
+                body = ?,
+                url = ?,
+                github_comment_id = ?,
+                github_thread_id = ?,
+                fingerprint = ?
+            WHERE id = ?
+            """,
+            (
+                item.head_sha,
+                item.source,
+                item.path,
+                item.line,
+                item.title,
+                item.body,
+                item.url,
+                item.github_comment_id,
+                item.github_thread_id,
+                item.fingerprint,
+                item_id,
+            ),
+        )
+        return item_id, False
+    cursor = connection.execute(
+        """
+        INSERT INTO external_items (
+            repo,
+            pr_number,
+            head_sha,
+            source,
+            path,
+            line,
+            title,
+            body,
+            url,
+            github_comment_id,
+            github_thread_id,
+            fingerprint
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            item.repo,
+            item.pr_number,
+            item.head_sha,
+            item.source,
+            item.path,
+            item.line,
+            item.title,
+            item.body,
+            item.url,
+            item.github_comment_id,
+            item.github_thread_id,
+            item.fingerprint,
+        ),
+    )
+    return int(cursor.lastrowid), True
+
+
+def load_link_candidates(
+    connection: sqlite3.Connection,
+    *,
+    repo: str,
+    pr_number: int,
+    head_shas: set[str],
+    head_ref: str,
+    run_id: int | None,
+) -> list[LinkCandidate]:
+    params: list[Any] = []
+    if run_id is not None:
+        where_sql = "runs.id = ? AND runs.repo = ?"
+        params.extend([run_id, repo])
+    else:
+        clauses: list[str] = []
+        if pr_number > 0:
+            clauses.append("runs.pr_number = ?")
+            params.append(pr_number)
+        clean_head_shas = sorted(sha for sha in head_shas if sha)
+        if clean_head_shas:
+            placeholders = ",".join("?" for _ in clean_head_shas)
+            clauses.append(f"(runs.pr_number = 0 AND runs.head_sha IN ({placeholders}))")
+            params.extend(clean_head_shas)
+        if head_ref:
+            clauses.append("(runs.pr_number = 0 AND runs.head_ref = ?)")
+            params.append(head_ref)
+        if not clauses:
+            return []
+        where_sql = f"runs.repo = ? AND ({' OR '.join(clauses)})"
+        params.insert(0, repo)
+    rows = connection.execute(
+        f"""
+        SELECT
+            items.id,
+            items.run_id,
+            items.item_type,
+            items.source,
+            items.path,
+            items.line,
+            items.title,
+            items.body,
+            items.fix,
+            items.verification,
+            items.fingerprint
+        FROM review_items AS items
+        JOIN review_runs AS runs
+        ON runs.id = items.run_id
+        WHERE {where_sql}
+        ORDER BY runs.id DESC, items.item_type, items.ordinal
+        """,
+        params,
+    ).fetchall()
+    return [
+        LinkCandidate(
+            id=int(row["id"]),
+            run_id=int(row["run_id"]),
+            item_type=str(row["item_type"]),
+            source=str(row["source"]),
+            path=str(row["path"]),
+            line=as_optional_int(row["line"]),
+            title=str(row["title"]),
+            body=str(row["body"]),
+            fix=str(row["fix"]),
+            verification=str(row["verification"]),
+            fingerprint=str(row["fingerprint"]),
+        )
+        for row in rows
+    ]
+
+
+def candidate_review_text(candidate: LinkCandidate) -> str:
+    return "\n".join(
+        part
+        for part in (
+            candidate.title,
+            candidate.body,
+            candidate.fix,
+            candidate.verification,
+        )
+        if part
+    )
+
+
+def line_match_score(left: int | None, right: int | None) -> float:
+    if left is None or right is None:
+        return 0.0
+    distance = abs(left - right)
+    if distance == 0:
+        return 0.35
+    if distance <= 2:
+        return 0.25
+    if distance <= 5:
+        return 0.15
+    return 0.0
+
+
+def link_score(item: ExternalReviewItem, candidate: LinkCandidate) -> tuple[float, str]:
+    if item.fingerprint and item.fingerprint == candidate.fingerprint:
+        return 1.0, "same_fingerprint"
+    if item.path and candidate.path and item.path != candidate.path:
+        return 0.0, "different_file"
+    score = 0.0
+    if item.path and candidate.path and item.path == candidate.path:
+        score += 0.30
+    score += line_match_score(item.line, candidate.line)
+    similarity = text_similarity(f"{item.title}\n{item.body}", candidate_review_text(candidate))
+    score += similarity * 0.45
+    if item.path and candidate.path and item.path == candidate.path and item.line == candidate.line:
+        relation = "same_location"
+    elif similarity >= 0.45:
+        relation = "similar_text"
+    elif score >= 0.55:
+        relation = "near_location"
+    else:
+        relation = "weak_match"
+    return min(score, 0.99), relation
+
+
+def build_link_matches(
+    imported: list[tuple[int, ExternalReviewItem]],
+    candidates: list[LinkCandidate],
+    *,
+    min_score: float,
+) -> list[LinkMatch]:
+    matches: list[LinkMatch] = []
+    for external_id, item in imported:
+        best_candidate: LinkCandidate | None = None
+        best_score = 0.0
+        best_relation = ""
+        for candidate in candidates:
+            score, relation = link_score(item, candidate)
+            if score > best_score:
+                best_candidate = candidate
+                best_score = score
+                best_relation = relation
+        if best_candidate is None or best_score < min_score:
+            continue
+        note = (
+            f"{IMPORT_LINK_NOTE_PREFIX} score={best_score:.2f} "
+            f"run_id={best_candidate.run_id} path={item.path or '(none)'}"
+        )
+        matches.append(
+            LinkMatch(
+                review_item_id=best_candidate.id,
+                external_item_id=external_id,
+                relation=best_relation,
+                score=best_score,
+                note=note,
+            )
+        )
+    return matches
+
+
+def refresh_import_links(
+    connection: sqlite3.Connection,
+    imported_ids: list[int],
+    matches: list[LinkMatch],
+) -> None:
+    if not imported_ids:
+        return
+    placeholders = ",".join("?" for _ in imported_ids)
+    connection.execute(
+        f"""
+        DELETE FROM item_links
+        WHERE external_item_id IN ({placeholders})
+          AND note LIKE ?
+        """,
+        [*imported_ids, f"{IMPORT_LINK_NOTE_PREFIX}%"],
+    )
+    for match in matches:
+        connection.execute(
+            """
+            INSERT INTO item_links (
+                review_item_id,
+                external_item_id,
+                relation,
+                note
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(review_item_id, external_item_id, relation) DO UPDATE SET
+                note = excluded.note
+            """,
+            (
+                match.review_item_id,
+                match.external_item_id,
+                match.relation,
+                match.note,
+            ),
+        )
+
+
+def latest_external_verdicts(
+    connection: sqlite3.Connection,
+    external_ids: list[int],
+) -> dict[int, sqlite3.Row]:
+    if not external_ids:
+        return {}
+    placeholders = ",".join("?" for _ in external_ids)
+    rows = connection.execute(
+        f"""
+        SELECT verdicts.*
+        FROM item_verdicts AS verdicts
+        JOIN (
+            SELECT target_id, MAX(id) AS id
+            FROM item_verdicts
+            WHERE target_kind = 'external_item'
+              AND target_id IN ({placeholders})
+            GROUP BY target_id
+        ) AS latest
+        ON latest.id = verdicts.id
+        """,
+        external_ids,
+    ).fetchall()
+    return {int(row["target_id"]): row for row in rows}
+
+
+def write_external_verdicts(
+    connection: sqlite3.Connection,
+    imported_ids: list[int],
+    matches: list[LinkMatch],
+    *,
+    candidates_exist: bool,
+) -> int:
+    if not imported_ids or not candidates_exist:
+        return 0
+    match_by_external = {match.external_item_id: match for match in matches}
+    existing = latest_external_verdicts(connection, imported_ids)
+    saved = 0
+    for external_id in imported_ids:
+        match = match_by_external.get(external_id)
+        if match:
+            verdict = "covered_by_local"
+            reason = "linked_by_importer"
+            note = f"{IMPORT_LINK_NOTE_PREFIX} {match.relation} score={match.score:.2f}"
+        else:
+            verdict = "missed_by_local"
+            reason = "no_local_match"
+            note = f"{IMPORT_LINK_NOTE_PREFIX} no link above threshold"
+        current = existing.get(external_id)
+        if (
+            current
+            and str(current["verdict"]) == verdict
+            and str(current["reason"]) == reason
+            and str(current["note"]) == note
+        ):
+            continue
+        connection.execute(
+            """
+            INSERT INTO item_verdicts (
+                target_kind,
+                target_id,
+                verdict,
+                reason,
+                note,
+                scorer,
+                scored_at
+            ) VALUES ('external_item', ?, ?, ?, ?, 'github_importer', CURRENT_TIMESTAMP)
+            """,
+            (external_id, verdict, reason, note),
+        )
+        saved += 1
+    return saved
+
+
+def external_scope_counts(
+    connection: sqlite3.Connection,
+    *,
+    repo: str,
+    pr_number: int | None,
+) -> tuple[int, int]:
+    params: list[Any] = [repo]
+    pr_filter = ""
+    if pr_number is not None:
+        pr_filter = " AND pr_number = ?"
+        params.append(pr_number)
+    total = int(
+        connection.execute(
+            f"SELECT COUNT(*) FROM external_items WHERE repo = ?{pr_filter}",
+            params,
+        ).fetchone()[0]
+    )
+    linked = int(
+        connection.execute(
+            f"""
+            SELECT COUNT(DISTINCT external_items.id)
+            FROM external_items
+            JOIN item_links
+            ON item_links.external_item_id = external_items.id
+            WHERE external_items.repo = ?{pr_filter}
+            """,
+            params,
+        ).fetchone()[0]
+    )
+    return total, linked
 
 
 def latest_item_verdicts(connection: sqlite3.Connection, target_ids: list[int]) -> dict[int, sqlite3.Row]:
@@ -1076,6 +1730,141 @@ def command_score(args: argparse.Namespace) -> None:
     print(f"OK: scored run_id={row['id']}")
 
 
+def command_import_github_reviews(args: argparse.Namespace) -> None:
+    db_path = Path(args.db).expanduser().resolve()
+    ensure_db_schema(db_path)
+
+    comments: list[Any] = []
+    issue_comments: list[Any] = []
+    head_ref = ""
+    head_sha = str(args.head_sha or "")
+
+    if args.comments_json:
+        if not args.repo:
+            raise SystemExit("--repo is required with --comments-json")
+        if not args.pr:
+            raise SystemExit("PR number is required with --comments-json")
+        if "/" not in args.repo:
+            raise SystemExit("--repo must be owner/name")
+        owner, name = args.repo.split("/", 1)
+        repo = GitHubRepo(owner, name)
+        pr_number = int(args.pr)
+        comments = load_json_list(Path(args.comments_json).expanduser().resolve())
+    else:
+        workspace = detect_workspace(Path(args.project_dir).expanduser().resolve(), args.repo)
+        repo = workspace.repo
+        pr_number = int(args.pr or (workspace.open_pr or {}).get("number") or 0)
+        if pr_number <= 0:
+            raise SystemExit("PR number is required when no open PR is detected")
+        pr_payload, token_status = fetch_pr(repo, pr_number)
+        if pr_payload is None:
+            raise SystemExit(f"Could not fetch PR #{pr_number}: {token_status}")
+        head_ref = str((pr_payload.get("head") or {}).get("ref") or "")
+        head_sha = str((pr_payload.get("head") or {}).get("sha") or head_sha)
+        token, token_source = github_token()
+        if not token:
+            raise SystemExit(f"GitHub auth unavailable: {token_source}")
+        comments = github_paginated_request(
+            f"/repos/{repo.full_name}/pulls/{pr_number}/comments",
+            token,
+        )
+        if args.include_issue_comments:
+            issue_comments = github_paginated_request(
+                f"/repos/{repo.full_name}/issues/{pr_number}/comments",
+                token,
+            )
+
+    imported_items = external_items_from_comments(
+        repo=repo.full_name,
+        pr_number=pr_number,
+        default_head_sha=head_sha,
+        comments=comments,
+        comment_kind="review_comment",
+    )
+    if issue_comments:
+        imported_items.extend(
+            external_items_from_comments(
+                repo=repo.full_name,
+                pr_number=pr_number,
+                default_head_sha=head_sha,
+                comments=issue_comments,
+                comment_kind="issue_comment",
+            )
+        )
+    source_counts: dict[str, int] = {}
+    for item in imported_items:
+        source_counts[item.source] = source_counts.get(item.source, 0) + 1
+
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        head_shas = {head_sha, *(item.head_sha for item in imported_items)}
+        candidates = load_link_candidates(
+            connection,
+            repo=repo.full_name,
+            pr_number=pr_number,
+            head_shas=head_shas,
+            head_ref=head_ref,
+            run_id=args.run,
+        )
+        dry_matches = build_link_matches(
+            [(index + 1, item) for index, item in enumerate(imported_items)],
+            candidates,
+            min_score=args.min_link_score,
+        )
+        if args.dry_run:
+            print(
+                f"DRY RUN: would import {len(imported_items)} external review items "
+                f"from {repo.full_name}#{pr_number}"
+            )
+            print(f"Link candidates: {len(candidates)}")
+            print(f"Would create/update links: {len(dry_matches)}")
+            if source_counts:
+                print(
+                    "Sources: "
+                    + ", ".join(f"{source}={count}" for source, count in sorted(source_counts.items()))
+                )
+            return
+
+        created = 0
+        updated = 0
+        imported: list[tuple[int, ExternalReviewItem]] = []
+        for item in imported_items:
+            item_id, was_created = upsert_external_item(connection, item)
+            imported.append((item_id, item))
+            if was_created:
+                created += 1
+            else:
+                updated += 1
+        imported_ids = [item_id for item_id, _ in imported]
+        matches = build_link_matches(imported, candidates, min_score=args.min_link_score)
+        refresh_import_links(connection, imported_ids, matches)
+        verdicts = 0
+        if not args.no_verdicts:
+            verdicts = write_external_verdicts(
+                connection,
+                imported_ids,
+                matches,
+                candidates_exist=bool(candidates),
+            )
+
+    print(
+        f"OK: imported {len(imported_items)} external review items "
+        f"for {repo.full_name}#{pr_number} (created={created}, updated={updated})"
+    )
+    print(f"Links: {len(matches)} / candidates={len(candidates)}")
+    if not args.no_verdicts:
+        if candidates:
+            print(f"External verdicts written: {verdicts}")
+        else:
+            print("External verdicts written: 0 (no matching local review run candidates)")
+    if source_counts:
+        print(
+            "Sources: "
+            + ", ".join(f"{source}={count}" for source, count in sorted(source_counts.items()))
+        )
+
+
 def command_report(args: argparse.Namespace) -> None:
     db_path = Path(args.db).expanduser().resolve()
     ensure_db_schema(db_path)
@@ -1110,6 +1899,30 @@ def command_report(args: argparse.Namespace) -> None:
         verdict_rows: list[sqlite3.Row] = []
         reason_rows: list[sqlite3.Row] = []
         candidate_rows: list[sqlite3.Row] = []
+        external_total = int(connection.execute("SELECT COUNT(*) FROM external_items").fetchone()[0])
+        external_linked = int(
+            connection.execute(
+                """
+                SELECT COUNT(DISTINCT external_item_id)
+                FROM item_links
+                """
+            ).fetchone()[0]
+        )
+        external_verdict_rows = connection.execute(
+            """
+            SELECT verdicts.verdict, COUNT(*) AS count
+            FROM item_verdicts AS verdicts
+            JOIN (
+                SELECT target_kind, target_id, MAX(id) AS id
+                FROM item_verdicts
+                GROUP BY target_kind, target_id
+            ) AS latest
+            ON latest.id = verdicts.id
+            WHERE verdicts.target_kind = 'external_item'
+            GROUP BY verdicts.verdict
+            ORDER BY verdicts.verdict
+            """
+        ).fetchall()
         if run_ids:
             placeholders = ",".join("?" for _ in run_ids)
             normalized_finding_items = int(
@@ -1209,6 +2022,8 @@ def command_report(args: argparse.Namespace) -> None:
         f"- Remote review requested: {remote_ready_display}",
         f"- Remote findings: {remote_findings_total}",
         f"- Normalized item verdict coverage: {scored_item_total}/{normalized_finding_items}",
+        f"- Imported external review items: {external_total}",
+        f"- Linked external review items: {external_linked}/{external_total}",
         "",
         "## Runs",
         "",
@@ -1243,6 +2058,16 @@ def command_report(args: argparse.Namespace) -> None:
             lines.append(f"- {row['verdict']} / {row['reason']}: {row['count']}")
     else:
         lines.append("- No reason-coded item verdicts recorded yet.")
+    lines.extend(["", "## External Review Items", ""])
+    if external_total:
+        lines.append(f"- Imported: {external_total}")
+        lines.append(f"- Linked to local items: {external_linked}")
+        lines.append(f"- Unlinked: {external_total - external_linked}")
+        if external_verdict_rows:
+            for row in external_verdict_rows:
+                lines.append(f"- {row['verdict']}: {row['count']}")
+    else:
+        lines.append("- No external review items imported yet.")
     lines.extend(["", "## Prompt And Rule Candidates", ""])
     if candidate_rows:
         lines.append("Review these manually before turning them into prompt or local-rule changes.")
@@ -1279,6 +2104,18 @@ def command_export_jsonl(args: argparse.Namespace) -> None:
         context_digests: dict[int, list[str]] = {}
         for digest_row in context_digest_rows:
             context_digests.setdefault(int(digest_row["run_id"]), []).append(str(digest_row["sha256"]))
+        link_rows = connection.execute(
+            """
+            SELECT review_item_id, external_item_id, relation
+            FROM item_links
+            ORDER BY review_item_id, external_item_id, relation
+            """
+        ).fetchall()
+        links_by_review_item: dict[int, list[sqlite3.Row]] = {}
+        links_by_external_item: dict[int, list[sqlite3.Row]] = {}
+        for link_row in link_rows:
+            links_by_review_item.setdefault(int(link_row["review_item_id"]), []).append(link_row)
+            links_by_external_item.setdefault(int(link_row["external_item_id"]), []).append(link_row)
         rows = connection.execute(
             """
             SELECT
@@ -1341,13 +2178,98 @@ def command_export_jsonl(args: argparse.Namespace) -> None:
             ORDER BY runs.id, items.item_type, items.ordinal
             """
         )
-        count = 0
+        review_count = 0
         for row in rows:
             record = dict(row)
+            record["record_kind"] = "review_item"
             record["context_digests"] = context_digests.get(int(row["run_id"]), [])
+            linked_rows = links_by_review_item.get(int(row["item_id"]), [])
+            record["linked_external_item_ids"] = [
+                int(link_row["external_item_id"]) for link_row in linked_rows
+            ]
+            record["link_relations"] = [str(link_row["relation"]) for link_row in linked_rows]
             file.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
-            count += 1
-    print(f"OK: exported {count} review items to {output}")
+            review_count += 1
+
+        external_rows = connection.execute(
+            """
+            SELECT
+                external_items.id AS external_item_id,
+                external_items.repo,
+                external_items.pr_number,
+                external_items.head_sha,
+                external_items.source,
+                external_items.path,
+                external_items.line,
+                external_items.title,
+                external_items.body,
+                external_items.url,
+                external_items.github_comment_id,
+                external_items.github_thread_id,
+                external_items.fingerprint,
+                external_items.created_at,
+                verdicts.verdict,
+                verdicts.reason AS verdict_reason,
+                verdicts.note AS verdict_note,
+                verdicts.scorer AS verdict_scorer,
+                verdicts.scored_at AS verdict_scored_at
+            FROM external_items
+            LEFT JOIN (
+                SELECT item_verdicts.*
+                FROM item_verdicts
+                JOIN (
+                    SELECT target_kind, target_id, MAX(id) AS id
+                    FROM item_verdicts
+                    GROUP BY target_kind, target_id
+                ) AS latest
+                ON latest.id = item_verdicts.id
+            ) AS verdicts
+            ON verdicts.target_kind = 'external_item'
+            AND verdicts.target_id = external_items.id
+            ORDER BY external_items.repo, external_items.pr_number, external_items.id
+            """
+        )
+        external_count = 0
+        for row in external_rows:
+            record = dict(row)
+            external_id = int(row["external_item_id"])
+            linked_rows = links_by_external_item.get(external_id, [])
+            record.update(
+                {
+                    "record_kind": "external_item",
+                    "review_kind": "",
+                    "base_ref": "",
+                    "head_ref": "",
+                    "model": "",
+                    "prompt_family": "",
+                    "prompt_version": "",
+                    "prompt_hash": "",
+                    "model_options_hash": "",
+                    "diff_fingerprint": "",
+                    "diff_bytes": None,
+                    "elapsed_seconds": None,
+                    "run_id": None,
+                    "item_id": None,
+                    "item_type": "external",
+                    "ordinal": None,
+                    "severity": "",
+                    "confidence": "",
+                    "fix": "",
+                    "verification": "",
+                    "context_digests": [],
+                    "linked_review_item_ids": [
+                        int(link_row["review_item_id"]) for link_row in linked_rows
+                    ],
+                    "link_relations": [
+                        str(link_row["relation"]) for link_row in linked_rows
+                    ],
+                }
+            )
+            file.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
+            external_count += 1
+    print(
+        f"OK: exported {review_count} review items and {external_count} external items to {output}"
+    )
 
 
 def install_paths(path_value: str) -> tuple[Path, Path]:
@@ -1446,7 +2368,10 @@ def add_workspace_options(parser: argparse.ArgumentParser) -> None:
 def build_review_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Auto-detect and run local PR review",
-        epilog="Subcommands: status, score, report, export-jsonl, install, update",
+        epilog=(
+            "Subcommands: status, score, report, export-jsonl, "
+            "import-github-reviews, install, update"
+        ),
     )
     parser.set_defaults(func=command_review)
     parser.add_argument("pr", nargs="?", type=int, help="PR number. Omit to auto-detect.")
@@ -1527,6 +2452,40 @@ def build_export_parser() -> argparse.ArgumentParser:
     return export
 
 
+def build_import_github_reviews_parser() -> argparse.ArgumentParser:
+    importer = argparse.ArgumentParser(description="Import GitHub PR review comments into the review DB")
+    importer.set_defaults(func=command_import_github_reviews)
+    importer.add_argument("pr", nargs="?", type=parse_non_negative, help="PR number. Omit for current open PR.")
+    add_workspace_options(importer)
+    importer.add_argument("--run", type=parse_non_negative, help="Only link against one local review run")
+    importer.add_argument(
+        "--include-issue-comments",
+        action="store_true",
+        help="Also import top-level PR conversation comments after filtering command/no-op comments",
+    )
+    importer.add_argument(
+        "--comments-json",
+        help="Read a saved GitHub /pulls/comments JSON array instead of calling GitHub",
+    )
+    importer.add_argument(
+        "--head-sha",
+        help="Head SHA to store when using --comments-json or overriding GitHub metadata",
+    )
+    importer.add_argument(
+        "--min-link-score",
+        type=float,
+        default=0.55,
+        help="Minimum fuzzy score for item_links",
+    )
+    importer.add_argument("--dry-run", action="store_true", help="Fetch and match without writing to the DB")
+    importer.add_argument(
+        "--no-verdicts",
+        action="store_true",
+        help="Do not write covered_by_local/missed_by_local verdicts for imported external items",
+    )
+    return importer
+
+
 def build_install_parser() -> argparse.ArgumentParser:
     install = argparse.ArgumentParser(description="Install llreview into a local PATH directory")
     install.set_defaults(func=command_install)
@@ -1550,6 +2509,7 @@ COMMAND_PARSERS = {
     "score": build_score_parser,
     "report": build_report_parser,
     "export-jsonl": build_export_parser,
+    "import-github-reviews": build_import_github_reviews_parser,
     "install": build_install_parser,
     "update": build_update_parser,
 }

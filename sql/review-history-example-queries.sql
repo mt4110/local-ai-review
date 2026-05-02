@@ -55,6 +55,49 @@ WHERE artifacts.kind = 'context_digest'
 ORDER BY runs.id DESC, artifacts.path
 LIMIT 50;
 
+-- Imported external review items and local-link coverage
+SELECT
+  external_items.repo,
+  external_items.pr_number,
+  external_items.source,
+  COUNT(DISTINCT external_items.id) AS external_items,
+  COUNT(DISTINCT item_links.external_item_id) AS linked_external_items,
+  COUNT(DISTINCT external_items.id) - COUNT(DISTINCT item_links.external_item_id) AS unlinked_external_items
+FROM external_items
+LEFT JOIN item_links
+ON item_links.external_item_id = external_items.id
+GROUP BY external_items.repo, external_items.pr_number, external_items.source
+ORDER BY external_items.repo, external_items.pr_number DESC, external_items.source;
+
+-- External items that may represent local misses
+SELECT
+  external_items.repo,
+  external_items.pr_number,
+  external_items.source,
+  external_items.path,
+  external_items.line,
+  external_items.title,
+  verdicts.verdict,
+  verdicts.reason
+FROM external_items
+LEFT JOIN item_links
+ON item_links.external_item_id = external_items.id
+LEFT JOIN (
+  SELECT item_verdicts.*
+  FROM item_verdicts
+  JOIN (
+    SELECT target_kind, target_id, MAX(id) AS id
+    FROM item_verdicts
+    GROUP BY target_kind, target_id
+  ) AS latest
+  ON latest.id = item_verdicts.id
+) AS verdicts
+ON verdicts.target_kind = 'external_item'
+AND verdicts.target_id = external_items.id
+WHERE item_links.id IS NULL
+ORDER BY external_items.created_at DESC
+LIMIT 50;
+
 -- Repo and model level health
 SELECT
   repo,
