@@ -1328,6 +1328,7 @@ def describes_safe_subprocess_argv_execution(text: str) -> bool:
         "command injection" in normalized
         and "subprocess.run" in normalized
         and "shell=false" in compact
+        and "shell=true" not in compact
         and (
             "shlex.split" in normalized
             or "argv" in normalized
@@ -2563,6 +2564,19 @@ diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-
         },
     )
     assert unsafe_shell_watch is not None
+
+    unsafe_shell_with_safe_fix_watch = calibrate_model_watch_item(
+        "scripts/review.py",
+        {
+            "title": "Potential command injection in verification",
+            "body": (
+                "subprocess.run(command, shell=True) may execute untrusted shell metacharacters. "
+                "Use argv execution with subprocess.run([...], shell=False) instead."
+            ),
+            "verification": "Replace shell execution before accepting user-controlled input.",
+        },
+    )
+    assert unsafe_shell_with_safe_fix_watch is not None
 
     non_agent_schema_watch = calibrate_model_watch_item(
         "docs/api-contract.md",
