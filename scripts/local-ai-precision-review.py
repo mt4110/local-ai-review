@@ -147,6 +147,7 @@ CREATE TABLE IF NOT EXISTS external_items (
     repo TEXT NOT NULL,
     pr_number INTEGER,
     head_sha TEXT NOT NULL DEFAULT '',
+    import_head_sha TEXT NOT NULL DEFAULT '',
     source TEXT NOT NULL,
     path TEXT NOT NULL DEFAULT '',
     line INTEGER,
@@ -164,6 +165,10 @@ ON external_items(repo, pr_number, head_sha, source);
 
 CREATE INDEX IF NOT EXISTS external_items_fingerprint_idx
 ON external_items(fingerprint);
+
+CREATE UNIQUE INDEX IF NOT EXISTS external_items_github_comment_idx
+ON external_items(repo, pr_number, github_comment_id)
+WHERE github_comment_id <> '';
 
 CREATE TABLE IF NOT EXISTS item_verdicts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -190,6 +195,9 @@ CREATE TABLE IF NOT EXISTS item_links (
 
 CREATE UNIQUE INDEX IF NOT EXISTS item_links_pair_idx
 ON item_links(review_item_id, external_item_id, relation);
+
+CREATE INDEX IF NOT EXISTS item_links_external_idx
+ON item_links(external_item_id);
 
 CREATE TABLE IF NOT EXISTS rule_updates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -315,6 +323,13 @@ REVIEW_RUNS_COLUMN_MIGRATIONS = (
 
 ITEM_VERDICTS_COLUMN_MIGRATIONS = (
     ("reason", "ALTER TABLE item_verdicts ADD COLUMN reason TEXT NOT NULL DEFAULT ''"),
+)
+
+EXTERNAL_ITEMS_COLUMN_MIGRATIONS = (
+    (
+        "import_head_sha",
+        "ALTER TABLE external_items ADD COLUMN import_head_sha TEXT NOT NULL DEFAULT ''",
+    ),
 )
 
 
@@ -562,6 +577,19 @@ def migrate_db_schema(connection: sqlite3.Connection) -> None:
     for column, statement in ITEM_VERDICTS_COLUMN_MIGRATIONS:
         if column not in item_verdict_columns:
             connection.execute(statement)
+    external_item_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(external_items)").fetchall()
+    }
+    for column, statement in EXTERNAL_ITEMS_COLUMN_MIGRATIONS:
+        if column not in external_item_columns:
+            connection.execute(statement)
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS external_items_import_scope_idx
+        ON external_items(repo, pr_number, import_head_sha)
+        """
+    )
     if migrated or review_run_summary_view_needs_rebuild(connection):
         connection.execute("DROP VIEW IF EXISTS review_run_summary")
         connection.executescript(REVIEW_RUN_SUMMARY_VIEW_SQL)

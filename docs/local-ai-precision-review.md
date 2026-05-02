@@ -128,6 +128,7 @@ llreview status
 llreview
 llreview update
 llreview score
+llreview import-github-reviews 42
 llreview report
 llreview export-jsonl
 ```
@@ -136,11 +137,15 @@ llreview export-jsonl
 
 `llreview score` は直近の未採点 run を選び、run 単位の `useful` / `false_positive` / `unclear` count を保存します。TTY では続けて finding 単位の verdict も入力できます。local finding の verdict は `useful_fixed` / `false_positive` / `unclear` / `watch_only` に限定し、`missed` は外部・人間レビューで見つかった `external_items` 側にだけ付けます。
 
+`llreview import-github-reviews 42` は GitHub の inline PR review comments を取り込みます。Copilot / automated / human の comment を `external_items` に保存し、既存の local `review_items` と fingerprint、file、line、normalized text でゆるく照合して `item_links` を作ります。local review run がある場合だけ、link 済み external item に `covered_by_local`、unlinked external item に `missed_by_local` を外部側 verdict として保存します。local run candidate が無い場合、missed verdict は自動では書きません。
+
+同じ GitHub comment id は update されるため、同じ PR を再 import しても row は増えません。再 import 時には、今回の GitHub comment snapshot に含まれない GitHub 由来の古い external item / link / importer verdict を削除します。API 取得結果を固定して再現確認したい場合は、GitHub `/pulls/comments` の JSON array を保存し、`--comments-json comments.json --repo owner/name` で通します。この場合は各 comment の GitHub `commit_id` を保持します。`--head-sha <sha>` は保存済み comment を特定の local run SHA に意図的に固定したい場合だけ使います。top-level PR conversation comments も保存済み JSON で取り込む場合は、GitHub `/issues/comments` の JSON array を別に保存し、`--include-issue-comments --issue-comments-json issue-comments.json` を併用します。
+
 finding 単位の false positive は、理由コードも残します。まずは `covered_by_existing_safeguard`、`intentional_behavior`、`environment_dependent`、`covered_by_tests`、`stale_or_already_fixed`、`diagnostic_watch` を使い、同じ理由が複数回出たものだけ prompt または local-rule update 候補として扱います。1回の空振りだけで suppress しないのが基本です。
 
 `llreview report` は直近10件を benchmark markdown として出力し、run 単位の useful/false positive/unclear 率、remote review 差分、runtime、item verdict reason の集計をまとめます。
 
-`llreview export-jsonl` は review item ごとに 1 行を出力し、`prompt_hash`、`model_options_hash`、`diff_fingerprint` を含めます。run に trusted context が使われた場合は `context_digests` に sha256 list も含めます。
+`llreview export-jsonl` は local review item と imported external item を JSONL に出力します。local item には `prompt_hash`、`model_options_hash`、`diff_fingerprint` を含めます。run に trusted context が使われた場合は `context_digests` に sha256 list も含めます。external item には GitHub comment id、source、link 先の local item id、外部側 verdict を含めます。
 
 デフォルトの DB path:
 

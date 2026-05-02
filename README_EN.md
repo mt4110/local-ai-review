@@ -185,6 +185,17 @@ itself. The run stores context document path and sha256 records in
 disable this, or `llreview --trusted-context-dir /path/to/.private_docs` to pass
 an explicit trusted context directory.
 
+Use `llreview import-github-reviews 42` to import GitHub inline PR review
+comments into `external_items`. The importer classifies Copilot, automated,
+and human reviewer comments, then links them to local `review_items` through a
+loose match on fingerprint, file, line, and normalized text. Re-importing the
+same PR updates rows by comment id instead of duplicating them, and removes
+stale GitHub-derived external items that are no longer in the current comment
+snapshot. Add `--include-issue-comments` only when top-level PR conversation
+comments should also become learning items. For reproducible JSON imports, pass
+saved issue comments separately with `--issue-comments-json`; use `--head-sha`
+only when intentionally pinning the import to a specific local run SHA.
+
 `make review-db-web` starts Datasette in Docker in the background and opens the DB at `http://127.0.0.1:8003`. Datasette defaults to `8001`, so this repo binds `8003` to stay two ports above the default. Stop it with `make review-db-down`. Datasette is intentionally read-only here, so manual scoring goes through `make review-db-score ...`. If you prefer a desktop client, open `out/review-history/local-ai-review.db` in DBeaver.
 
 ## Test Procedure
