@@ -364,10 +364,6 @@ def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def sha256_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
-
-
 def sha256_json(value: Any) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
     return sha256_text(encoded)
@@ -407,11 +403,17 @@ def resolve_path(value: str) -> Path:
     return Path(value).expanduser().resolve()
 
 
-def display_path(path: Path) -> str:
-    try:
-        return str(path.relative_to(Path.cwd()))
-    except ValueError:
-        return str(path)
+def context_document_path(context_dir: Path, path: Path) -> str:
+    relative_path = path.relative_to(context_dir).as_posix()
+    return f"{context_dir.name}/{relative_path}"
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def markdown_context_summary(text: str, *, limit: int) -> str:
@@ -451,23 +453,32 @@ def load_trusted_context_docs(
     docs: list[TrustedContextDoc] = []
     seen: set[Path] = set()
     for raw_dir in context_dirs:
-        context_dir = resolve_path(raw_dir)
+        raw_context_dir = Path(raw_dir).expanduser()
+        if raw_context_dir.is_symlink():
+            raise SystemExit(f"trusted context dir must not be a symlink: {raw_context_dir}")
+        context_dir = raw_context_dir.resolve()
         if not context_dir.is_dir():
             raise SystemExit(f"trusted context dir does not exist or is not a directory: {context_dir}")
         for path in sorted(context_dir.glob("*.md")):
-            resolved = path.resolve()
-            if resolved in seen or not resolved.is_file() or resolved.is_symlink():
+            # Reject workspace-controlled links before resolving; trusted context must stay in its root.
+            if path.is_symlink():
                 continue
+            resolved = path.resolve()
+            if resolved in seen or not resolved.is_file():
+                continue
+            size = resolved.stat().st_size
+            if size > max_doc_bytes:
+                raise SystemExit(
+                    f"trusted context doc exceeds --max-context-doc-bytes "
+                    f"({size} > {max_doc_bytes}): {context_document_path(context_dir, resolved)}"
+                )
             seen.add(resolved)
-            raw = resolved.read_bytes()
-            digest = sha256_bytes(raw)
-            text = raw[:max_doc_bytes].decode("utf-8", errors="replace")
+            digest = sha256_file(resolved)
+            text = resolved.read_text(encoding="utf-8", errors="replace")
             summary = markdown_context_summary(text, limit=max_summary_chars)
-            if len(raw) > max_doc_bytes:
-                summary = summary.rstrip() + "\n[source truncated before summarization]"
             docs.append(
                 TrustedContextDoc(
-                    path=display_path(resolved),
+                    path=context_document_path(context_dir, resolved),
                     sha256=digest,
                     summary=summary,
                 )
@@ -2523,6 +2534,11 @@ diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-
             "# Design contract\n\n- Findings must cite visible diff evidence.\n",
             encoding="utf-8",
         )
+        try:
+            (context_dir / "leak.md").symlink_to(context_file)
+            symlink_supported = True
+        except OSError:
+            symlink_supported = False
         context_docs = load_trusted_context_docs(
             [str(context_dir)],
             max_docs=4,
@@ -2530,7 +2546,37 @@ diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-
             max_summary_chars=2000,
         )
         assert len(context_docs) == 1
+        assert context_docs[0].path == ".private_docs/README.md"
         assert "Findings must cite visible diff evidence" in context_docs[0].summary
+        if symlink_supported:
+            linked_context_dir = Path(temp_dir) / "linked-private-docs"
+            linked_context_dir.symlink_to(context_dir, target_is_directory=True)
+            try:
+                load_trusted_context_docs(
+                    [str(linked_context_dir)],
+                    max_docs=4,
+                    max_doc_bytes=20000,
+                    max_summary_chars=2000,
+                )
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError("symlinked trusted context dir should be rejected")
+
+        large_context_dir = Path(temp_dir) / "large_context"
+        large_context_dir.mkdir()
+        (large_context_dir / "large.md").write_text("x" * 32, encoding="utf-8")
+        try:
+            load_trusted_context_docs(
+                [str(large_context_dir)],
+                max_docs=4,
+                max_doc_bytes=8,
+                max_summary_chars=2000,
+            )
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("oversized trusted context doc should be rejected")
         db_path, run_id = persist_review_run(
             str(Path(temp_dir) / "review.db"),
             repo="self/test",

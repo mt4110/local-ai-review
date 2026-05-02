@@ -671,7 +671,8 @@ def build_review_command(args: argparse.Namespace, workspace: Workspace) -> tupl
     )
     if not args.no_trusted_context:
         local_context = workspace.root / ".private_docs"
-        if local_context.is_dir():
+        # Auto-loaded context must not follow workspace-controlled links outside the repo.
+        if local_context.is_dir() and not local_context.is_symlink():
             trusted_context_dirs.insert(0, local_context.resolve())
     seen_context_dirs: set[Path] = set()
     for context_dir in trusted_context_dirs:
