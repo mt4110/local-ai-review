@@ -1384,36 +1384,18 @@ def load_link_candidates(
     head_shas: set[str],
     head_ref: str,
     run_id: int | None,
+    allow_pr_fallback: bool = True,
 ) -> list[LinkCandidate]:
-    params: list[Any] = []
-    if run_id is not None:
-        where_sql = "runs.id = ? AND runs.repo = ?"
-        params.extend([run_id, repo])
-    else:
-        clauses: list[str] = []
-        clean_head_shas = sorted(sha for sha in head_shas if sha)
-        if pr_number > 0:
-            if clean_head_shas:
-                placeholders = ",".join("?" for _ in clean_head_shas)
-                clauses.append(
-                    f"(runs.pr_number = ? AND (runs.head_sha IN ({placeholders}) OR runs.head_sha = ''))"
-                )
-                params.append(pr_number)
-                params.extend(clean_head_shas)
-            else:
-                clauses.append("runs.pr_number = ?")
-                params.append(pr_number)
-        if clean_head_shas:
-            placeholders = ",".join("?" for _ in clean_head_shas)
-            clauses.append(f"(runs.pr_number = 0 AND runs.head_sha IN ({placeholders}))")
-            params.extend(clean_head_shas)
-        if head_ref and not clean_head_shas:
-            clauses.append("(runs.pr_number = 0 AND runs.head_ref = ?)")
-            params.append(head_ref)
-        if not clauses:
-            return []
-        where_sql = f"runs.repo = ? AND ({' OR '.join(clauses)})"
-        params.insert(0, repo)
+    where_sql, params = link_candidate_run_scope(
+        repo=repo,
+        pr_number=pr_number,
+        head_shas=head_shas,
+        head_ref=head_ref,
+        run_id=run_id,
+        allow_pr_fallback=allow_pr_fallback,
+    )
+    if not where_sql:
+        return []
     rows = connection.execute(
         f"""
         SELECT
@@ -1453,6 +1435,75 @@ def load_link_candidates(
         )
         for row in rows
     ]
+
+
+def link_candidate_run_scope(
+    *,
+    repo: str,
+    pr_number: int,
+    head_shas: set[str],
+    head_ref: str,
+    run_id: int | None,
+    allow_pr_fallback: bool,
+) -> tuple[str, list[Any]]:
+    params: list[Any] = []
+    if run_id is not None:
+        return "runs.id = ? AND runs.repo = ?", [run_id, repo]
+    clauses: list[str] = []
+    clean_head_shas = sorted(sha for sha in head_shas if sha)
+    if pr_number > 0:
+        if clean_head_shas:
+            placeholders = ",".join("?" for _ in clean_head_shas)
+            clauses.append(
+                f"(runs.pr_number = ? AND (runs.head_sha IN ({placeholders}) OR runs.head_sha = ''))"
+            )
+            params.append(pr_number)
+            params.extend(clean_head_shas)
+        elif allow_pr_fallback:
+            clauses.append("runs.pr_number = ?")
+            params.append(pr_number)
+    if clean_head_shas:
+        placeholders = ",".join("?" for _ in clean_head_shas)
+        clauses.append(f"(runs.pr_number = 0 AND runs.head_sha IN ({placeholders}))")
+        params.extend(clean_head_shas)
+    if head_ref and not clean_head_shas:
+        clauses.append("(runs.pr_number = 0 AND runs.head_ref = ?)")
+        params.append(head_ref)
+    if not clauses:
+        return "", []
+    return f"runs.repo = ? AND ({' OR '.join(clauses)})", [repo, *params]
+
+
+def count_link_candidate_runs(
+    connection: sqlite3.Connection,
+    *,
+    repo: str,
+    pr_number: int,
+    head_shas: set[str],
+    head_ref: str,
+    run_id: int | None,
+    allow_pr_fallback: bool = True,
+) -> int:
+    where_sql, params = link_candidate_run_scope(
+        repo=repo,
+        pr_number=pr_number,
+        head_shas=head_shas,
+        head_ref=head_ref,
+        run_id=run_id,
+        allow_pr_fallback=allow_pr_fallback,
+    )
+    if not where_sql:
+        return 0
+    return int(
+        connection.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM review_runs AS runs
+            WHERE {where_sql}
+            """,
+            params,
+        ).fetchone()[0]
+    )
 
 
 @functools.lru_cache(maxsize=8192)
@@ -1976,6 +2027,10 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
     explicit_head_sha = bool(args.head_sha)
     head_ref = ""
     head_sha = str(args.head_sha or "")
+    if args.issue_comments_json and not args.include_issue_comments:
+        raise SystemExit("--issue-comments-json requires --include-issue-comments")
+    if args.issue_comments_json and not args.comments_json:
+        raise SystemExit("--issue-comments-json is only supported with --comments-json")
 
     if args.comments_json:
         if not args.repo:
@@ -1988,6 +2043,13 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
         repo = GitHubRepo(owner, name)
         pr_number = int(args.pr)
         comments = load_json_list(Path(args.comments_json).expanduser().resolve())
+        if args.include_issue_comments:
+            if not args.issue_comments_json:
+                raise SystemExit(
+                    "--issue-comments-json is required with --include-issue-comments "
+                    "when using --comments-json"
+                )
+            issue_comments = load_json_list(Path(args.issue_comments_json).expanduser().resolve())
     else:
         workspace = detect_workspace(Path(args.project_dir).expanduser().resolve(), args.repo)
         repo = workspace.repo
@@ -2042,12 +2104,22 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
     with sqlite3.connect(db_path) as connection:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        if args.comments_json and not explicit_head_sha:
-            head_shas: set[str] = set()
-        elif explicit_head_sha and head_sha:
+        if explicit_head_sha and head_sha:
             head_shas = {head_sha}
         else:
-            head_shas = {item.head_sha for item in imported_items}
+            head_shas = {item.head_sha for item in imported_items if item.head_sha}
+            if not args.comments_json and head_sha:
+                head_shas.add(head_sha)
+        allow_pr_fallback = not (args.comments_json and not explicit_head_sha)
+        candidate_run_count = count_link_candidate_runs(
+            connection,
+            repo=repo.full_name,
+            pr_number=pr_number,
+            head_shas=head_shas,
+            head_ref=head_ref,
+            run_id=args.run,
+            allow_pr_fallback=allow_pr_fallback,
+        )
         candidates = load_link_candidates(
             connection,
             repo=repo.full_name,
@@ -2055,6 +2127,7 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
             head_shas=head_shas,
             head_ref=head_ref,
             run_id=args.run,
+            allow_pr_fallback=allow_pr_fallback,
         )
         dry_matches = build_link_matches(
             [(index + 1, item) for index, item in enumerate(imported_items)],
@@ -2066,6 +2139,7 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
                 f"DRY RUN: would import {len(imported_items)} external review items "
                 f"from {repo.full_name}#{pr_number}"
             )
+            print(f"Link candidate runs: {candidate_run_count}")
             print(f"Link candidates: {len(candidates)}")
             print(f"Would create/update links: {len(dry_matches)}")
             if source_counts:
@@ -2094,7 +2168,7 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
                 connection,
                 imported_ids,
                 matches,
-                candidates_exist=bool(candidates),
+                candidates_exist=candidate_run_count > 0,
             )
 
     print(
@@ -2103,7 +2177,7 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
     )
     print(f"Links: {len(matches)} / candidates={len(candidates)}")
     if not args.no_verdicts:
-        if candidates:
+        if candidate_run_count:
             print(f"External verdicts written: {verdicts}")
         else:
             print(
@@ -2697,6 +2771,10 @@ def build_import_github_reviews_parser() -> argparse.ArgumentParser:
     importer.add_argument(
         "--comments-json",
         help="Read a saved GitHub /pulls/comments JSON array instead of calling GitHub",
+    )
+    importer.add_argument(
+        "--issue-comments-json",
+        help="Read a saved GitHub /issues/comments JSON array with --comments-json",
     )
     importer.add_argument(
         "--head-sha",

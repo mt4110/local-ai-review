@@ -208,7 +208,8 @@ rows. For reproducible checks, save a GitHub `/pulls/comments` JSON array and
 pass it through the same importer path with
 `--comments-json comments.json --repo owner/name --head-sha <sha>`. Add
 `--include-issue-comments` only when top-level PR conversation comments should
-also become learning items.
+also become learning items. In reproducible JSON mode, pass a saved GitHub
+`/issues/comments` array with `--issue-comments-json issue-comments.json`.
 
 `llreview export-jsonl` writes local review items and imported external items.
 Local records include `prompt_hash`, `model_options_hash`, and
