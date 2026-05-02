@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import functools
 import hashlib
 import html
 import json
@@ -862,12 +863,12 @@ def command_status(args: argparse.Namespace) -> None:
                 "SELECT COUNT(*) FROM review_run_summary WHERE useful_findings_fixed IS NULL"
             ).fetchone()
             unscored = int(row[0] if row else 0)
-            pr_number = int(workspace.open_pr["number"]) if workspace.open_pr else None
-            external_total, external_linked = external_scope_counts(
-                connection,
-                repo=workspace.repo.full_name,
-                pr_number=pr_number,
-            )
+            if workspace.open_pr:
+                external_total, external_linked = external_scope_counts(
+                    connection,
+                    repo=workspace.repo.full_name,
+                    pr_number=int(workspace.open_pr["number"]),
+                )
     print(f"Workspace: {workspace.root}")
     print(f"Repository: {workspace.repo.full_name}")
     print(f"Branch: {workspace.branch or '(detached)'}")
@@ -1035,14 +1036,16 @@ def normalize_review_text(value: str) -> str:
     return text.strip()
 
 
-def review_tokens(value: str) -> set[str]:
-    return {
+@functools.lru_cache(maxsize=8192)
+def review_tokens(value: str) -> frozenset[str]:
+    return frozenset(
         token
         for token in re.findall(r"[a-z0-9_./:-]{3,}", normalize_review_text(value))
         if token not in {"the", "and", "for", "with", "that", "this", "from", "into", "when"}
-    }
+    )
 
 
+@functools.lru_cache(maxsize=8192)
 def text_similarity(left: str, right: str) -> float:
     left_normalized = normalize_review_text(left)
     right_normalized = normalize_review_text(right)
@@ -1107,6 +1110,7 @@ def external_item_fingerprint(item: ExternalReviewItem) -> str:
     )
 
 
+@functools.lru_cache(maxsize=8192)
 def link_match_fingerprint(path: str, line: int | None, text: str) -> str:
     normalized = normalize_review_text(text)
     if not normalized:
@@ -1114,25 +1118,41 @@ def link_match_fingerprint(path: str, line: int | None, text: str) -> str:
     return stable_fingerprint("review-link-v1", path, line or "", normalized)
 
 
-def link_match_fingerprints(path: str, line: int | None, texts: list[str]) -> set[str]:
+def link_match_fingerprints(path: str, line: int | None, texts: tuple[str, ...]) -> frozenset[str]:
     fingerprints: set[str] = set()
     for text in texts:
         fingerprint = link_match_fingerprint(path, line, text)
         if fingerprint:
             fingerprints.add(fingerprint)
-    return fingerprints
+    return frozenset(fingerprints)
 
 
+@functools.lru_cache(maxsize=8192)
 def external_review_text(item: ExternalReviewItem) -> str:
     return "\n".join(part for part in (item.title, item.body) if part)
 
 
-def external_link_match_fingerprints(item: ExternalReviewItem) -> set[str]:
+@functools.lru_cache(maxsize=8192)
+def external_link_match_fingerprints(item: ExternalReviewItem) -> frozenset[str]:
     return link_match_fingerprints(
         item.path,
         item.line,
-        [external_review_text(item), item.body, item.title],
+        (external_review_text(item), item.body, item.title),
     )
+
+
+def reply_body_block(replies: list[dict[str, Any]], *, parent_author: str) -> str:
+    parts: list[str] = []
+    for reply in replies:
+        reply_author = str((reply.get("user") or {}).get("login") or "")
+        if parent_author and reply_author != parent_author:
+            continue
+        clean = strip_review_boilerplate(str(reply.get("body") or ""))
+        if normalize_review_text(clean):
+            parts.append(clean)
+    if not parts:
+        return ""
+    return "\n\nThread replies:\n\n" + "\n\n".join(parts)
 
 
 def external_item_from_comment(
@@ -1162,7 +1182,7 @@ def external_item_from_comment(
     item = ExternalReviewItem(
         repo=repo,
         pr_number=pr_number,
-        head_sha=str(comment.get("commit_id") or default_head_sha or ""),
+        head_sha=str(default_head_sha or comment.get("commit_id") or ""),
         source=external_source_for_comment(comment),
         path=str(comment.get("path") or ""),
         line=line,
@@ -1199,9 +1219,29 @@ def external_items_from_comments(
 ) -> list[ExternalReviewItem]:
     items: list[ExternalReviewItem] = []
     seen: set[str] = set()
+    replies_by_parent: dict[str, list[dict[str, Any]]] = {}
+    if comment_kind != "issue_comment":
+        for comment in comments:
+            if not isinstance(comment, dict):
+                continue
+            parent_id = comment.get("in_reply_to_id")
+            if parent_id is None:
+                continue
+            replies_by_parent.setdefault(str(parent_id), []).append(comment)
     for comment in comments:
         if not isinstance(comment, dict):
             continue
+        if comment_kind != "issue_comment":
+            if comment.get("in_reply_to_id") is not None:
+                continue
+            replies = replies_by_parent.get(str(comment.get("id") or ""), [])
+            if replies:
+                parent_author = str((comment.get("user") or {}).get("login") or "")
+                comment = {
+                    **comment,
+                    "body": str(comment.get("body") or "")
+                    + reply_body_block(replies, parent_author=parent_author),
+                }
         item = external_item_from_comment(
             repo=repo,
             pr_number=pr_number,
@@ -1391,6 +1431,7 @@ def load_link_candidates(
     ]
 
 
+@functools.lru_cache(maxsize=8192)
 def candidate_review_text(candidate: LinkCandidate) -> str:
     return "\n".join(
         part
@@ -1404,16 +1445,17 @@ def candidate_review_text(candidate: LinkCandidate) -> str:
     )
 
 
-def candidate_link_match_fingerprints(candidate: LinkCandidate) -> set[str]:
+@functools.lru_cache(maxsize=8192)
+def candidate_link_match_fingerprints(candidate: LinkCandidate) -> frozenset[str]:
     return link_match_fingerprints(
         candidate.path,
         candidate.line,
-        [
+        (
             candidate_review_text(candidate),
             "\n".join(part for part in (candidate.title, candidate.body) if part),
             candidate.body,
             candidate.title,
-        ],
+        ),
     )
 
 
@@ -1564,14 +1606,17 @@ def write_external_verdicts(
     *,
     candidates_exist: bool,
 ) -> int:
-    if not imported_ids or not candidates_exist:
+    if not imported_ids:
         return 0
     match_by_external = {match.external_item_id: match for match in matches}
     existing = latest_external_verdicts(connection, imported_ids)
     saved = 0
     for external_id in imported_ids:
-        match = match_by_external.get(external_id)
-        if match:
+        if not candidates_exist:
+            verdict = "out_of_scope"
+            reason = "no_local_run_candidates"
+            note = f"{IMPORT_LINK_NOTE_PREFIX} no local review run candidates"
+        elif match := match_by_external.get(external_id):
             verdict = "covered_by_local"
             reason = "linked_by_importer"
             note = f"{IMPORT_LINK_NOTE_PREFIX} {match.relation} score={match.score:.2f}"
@@ -1911,7 +1956,7 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
         if pr_payload is None:
             raise SystemExit(f"Could not fetch PR #{pr_number}: {token_status}")
         head_ref = str((pr_payload.get("head") or {}).get("ref") or "")
-        head_sha = str((pr_payload.get("head") or {}).get("sha") or head_sha)
+        head_sha = str(head_sha or (pr_payload.get("head") or {}).get("sha") or "")
         token, token_source = github_token()
         if not token:
             raise SystemExit(f"GitHub auth unavailable: {token_source}")
@@ -2011,7 +2056,10 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
         if candidates:
             print(f"External verdicts written: {verdicts}")
         else:
-            print("External verdicts written: 0 (no matching local review run candidates)")
+            print(
+                f"External verdicts written: {verdicts} "
+                "(marked out_of_scope: no matching local review run candidates)"
+            )
     if source_counts:
         print(
             "Sources: "
