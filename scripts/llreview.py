@@ -1091,6 +1091,34 @@ def external_item_fingerprint(item: ExternalReviewItem) -> str:
     )
 
 
+def link_match_fingerprint(path: str, line: int | None, text: str) -> str:
+    normalized = normalize_review_text(text)
+    if not normalized:
+        return ""
+    return stable_fingerprint("review-link-v1", path, line or "", normalized)
+
+
+def link_match_fingerprints(path: str, line: int | None, texts: list[str]) -> set[str]:
+    fingerprints: set[str] = set()
+    for text in texts:
+        fingerprint = link_match_fingerprint(path, line, text)
+        if fingerprint:
+            fingerprints.add(fingerprint)
+    return fingerprints
+
+
+def external_review_text(item: ExternalReviewItem) -> str:
+    return "\n".join(part for part in (item.title, item.body) if part)
+
+
+def external_link_match_fingerprints(item: ExternalReviewItem) -> set[str]:
+    return link_match_fingerprints(
+        item.path,
+        item.line,
+        [external_review_text(item), item.body, item.title],
+    )
+
+
 def external_item_from_comment(
     *,
     repo: str,
@@ -1100,6 +1128,8 @@ def external_item_from_comment(
     comment_kind: str,
 ) -> ExternalReviewItem | None:
     body = str(comment.get("body") or "")
+    if comment_kind != "issue_comment" and comment.get("in_reply_to_id") is not None:
+        return None
     if comment_kind == "issue_comment" and should_skip_issue_comment(body):
         return None
     clean_body = strip_review_boilerplate(body)
@@ -1283,15 +1313,21 @@ def load_link_candidates(
         params.extend([run_id, repo])
     else:
         clauses: list[str] = []
-        if pr_number > 0:
-            clauses.append("runs.pr_number = ?")
-            params.append(pr_number)
         clean_head_shas = sorted(sha for sha in head_shas if sha)
+        if pr_number > 0:
+            if clean_head_shas:
+                placeholders = ",".join("?" for _ in clean_head_shas)
+                clauses.append(f"(runs.pr_number = ? AND runs.head_sha IN ({placeholders}))")
+                params.append(pr_number)
+                params.extend(clean_head_shas)
+            else:
+                clauses.append("runs.pr_number = ?")
+                params.append(pr_number)
         if clean_head_shas:
             placeholders = ",".join("?" for _ in clean_head_shas)
             clauses.append(f"(runs.pr_number = 0 AND runs.head_sha IN ({placeholders}))")
             params.extend(clean_head_shas)
-        if head_ref:
+        if head_ref and not clean_head_shas:
             clauses.append("(runs.pr_number = 0 AND runs.head_ref = ?)")
             params.append(head_ref)
         if not clauses:
@@ -1351,6 +1387,19 @@ def candidate_review_text(candidate: LinkCandidate) -> str:
     )
 
 
+def candidate_link_match_fingerprints(candidate: LinkCandidate) -> set[str]:
+    return link_match_fingerprints(
+        candidate.path,
+        candidate.line,
+        [
+            candidate_review_text(candidate),
+            "\n".join(part for part in (candidate.title, candidate.body) if part),
+            candidate.body,
+            candidate.title,
+        ],
+    )
+
+
 def line_match_score(left: int | None, right: int | None) -> float:
     if left is None or right is None:
         return 0.0
@@ -1365,21 +1414,29 @@ def line_match_score(left: int | None, right: int | None) -> float:
 
 
 def link_score(item: ExternalReviewItem, candidate: LinkCandidate) -> tuple[float, str]:
-    if item.fingerprint and item.fingerprint == candidate.fingerprint:
-        return 1.0, "same_fingerprint"
+    if external_link_match_fingerprints(item) & candidate_link_match_fingerprints(candidate):
+        return 1.0, "same_match_fingerprint"
     if item.path and candidate.path and item.path != candidate.path:
         return 0.0, "different_file"
+    item_text = external_review_text(item)
+    candidate_text = candidate_review_text(candidate)
+    similarity = text_similarity(item_text, candidate_text)
+    shared_tokens = review_tokens(item_text) & review_tokens(candidate_text)
+    if similarity < 0.15 or (not shared_tokens and similarity < 0.35):
+        return 0.0, "weak_match"
     score = 0.0
-    if item.path and candidate.path and item.path == candidate.path:
+    same_file = bool(item.path and candidate.path and item.path == candidate.path)
+    if same_file:
         score += 0.30
-    score += line_match_score(item.line, candidate.line)
-    similarity = text_similarity(f"{item.title}\n{item.body}", candidate_review_text(candidate))
-    score += similarity * 0.45
-    if item.path and candidate.path and item.path == candidate.path and item.line == candidate.line:
+    line_score = line_match_score(item.line, candidate.line)
+    score += line_score
+    text_weight = 0.70 if not item.path and item.line is None else 0.45
+    score += similarity * text_weight
+    if same_file and item.line is not None and item.line == candidate.line:
         relation = "same_location"
     elif similarity >= 0.45:
         relation = "similar_text"
-    elif score >= 0.55:
+    elif line_score > 0.0:
         relation = "near_location"
     else:
         relation = "weak_match"
@@ -1561,6 +1618,83 @@ def external_scope_counts(
         ).fetchone()[0]
     )
     return total, linked
+
+
+def external_scope_where_for_runs(rows: list[sqlite3.Row]) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    seen: set[tuple[str, str, Any]] = set()
+    for row in rows:
+        repo = str(row["repo"] or "")
+        if not repo:
+            continue
+        pr_number = as_optional_int(row["pr_number"])
+        if pr_number is not None and pr_number > 0:
+            key = ("pr", repo, pr_number)
+            if key in seen:
+                continue
+            seen.add(key)
+            clauses.append("(external_items.repo = ? AND external_items.pr_number = ?)")
+            params.extend([repo, pr_number])
+            continue
+        head_sha = str(row["head_sha"] or "")
+        if not head_sha:
+            continue
+        key = ("head", repo, head_sha)
+        if key in seen:
+            continue
+        seen.add(key)
+        clauses.append("(external_items.repo = ? AND external_items.head_sha = ?)")
+        params.extend([repo, head_sha])
+    if not clauses:
+        return "0", []
+    return "(" + " OR ".join(clauses) + ")", params
+
+
+def external_report_counts(
+    connection: sqlite3.Connection, rows: list[sqlite3.Row]
+) -> tuple[int, int, list[sqlite3.Row]]:
+    where_sql, params = external_scope_where_for_runs(rows)
+    if not params:
+        return 0, 0, []
+    total = int(
+        connection.execute(
+            f"SELECT COUNT(*) FROM external_items WHERE {where_sql}",
+            params,
+        ).fetchone()[0]
+    )
+    linked = int(
+        connection.execute(
+            f"""
+            SELECT COUNT(DISTINCT external_items.id)
+            FROM external_items
+            JOIN item_links
+            ON item_links.external_item_id = external_items.id
+            WHERE {where_sql}
+            """,
+            params,
+        ).fetchone()[0]
+    )
+    verdict_rows = connection.execute(
+        f"""
+        SELECT verdicts.verdict, COUNT(*) AS count
+        FROM item_verdicts AS verdicts
+        JOIN external_items
+        ON external_items.id = verdicts.target_id
+        JOIN (
+            SELECT target_kind, target_id, MAX(id) AS id
+            FROM item_verdicts
+            GROUP BY target_kind, target_id
+        ) AS latest
+        ON latest.id = verdicts.id
+        WHERE verdicts.target_kind = 'external_item'
+          AND {where_sql}
+        GROUP BY verdicts.verdict
+        ORDER BY verdicts.verdict
+        """,
+        params,
+    ).fetchall()
+    return total, linked, verdict_rows
 
 
 def latest_item_verdicts(connection: sqlite3.Connection, target_ids: list[int]) -> dict[int, sqlite3.Row]:
@@ -1798,7 +1932,7 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
     with sqlite3.connect(db_path) as connection:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        head_shas = {head_sha, *(item.head_sha for item in imported_items)}
+        head_shas = {head_sha} if head_sha else {item.head_sha for item in imported_items}
         candidates = load_link_candidates(
             connection,
             repo=repo.full_name,
@@ -1899,30 +2033,9 @@ def command_report(args: argparse.Namespace) -> None:
         verdict_rows: list[sqlite3.Row] = []
         reason_rows: list[sqlite3.Row] = []
         candidate_rows: list[sqlite3.Row] = []
-        external_total = int(connection.execute("SELECT COUNT(*) FROM external_items").fetchone()[0])
-        external_linked = int(
-            connection.execute(
-                """
-                SELECT COUNT(DISTINCT external_item_id)
-                FROM item_links
-                """
-            ).fetchone()[0]
+        external_total, external_linked, external_verdict_rows = external_report_counts(
+            connection, rows
         )
-        external_verdict_rows = connection.execute(
-            """
-            SELECT verdicts.verdict, COUNT(*) AS count
-            FROM item_verdicts AS verdicts
-            JOIN (
-                SELECT target_kind, target_id, MAX(id) AS id
-                FROM item_verdicts
-                GROUP BY target_kind, target_id
-            ) AS latest
-            ON latest.id = verdicts.id
-            WHERE verdicts.target_kind = 'external_item'
-            GROUP BY verdicts.verdict
-            ORDER BY verdicts.verdict
-            """
-        ).fetchall()
         if run_ids:
             placeholders = ",".join("?" for _ in run_ids)
             normalized_finding_items = int(
