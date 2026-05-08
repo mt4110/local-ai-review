@@ -175,6 +175,7 @@ Daily entrypoints:
 ./llreview install
 llreview status
 llreview target set --project-dir /absolute/path/to/repo --repo owner/name
+llreview daily
 llreview
 llreview second-opinion
 llreview async-status
