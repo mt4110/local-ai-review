@@ -1979,6 +1979,7 @@ def persist_review_run(
     report: str,
     context_docs: list[TrustedContextDoc],
     history_calibration: str,
+    history_calibration_path: str = "",
 ) -> tuple[Path, int]:
     resolved = init_db(db_path)
     static_findings_count = sum(1 for item in findings if item.source == "static")
@@ -2216,6 +2217,7 @@ def persist_review_run(
             ],
         )
         if history_calibration.strip():
+            calibration_source_path = history_calibration_path or "inline_history_calibration"
             connection.execute(
                 """
                 INSERT INTO artifacts (run_id, kind, path, sha256)
@@ -2224,7 +2226,7 @@ def persist_review_run(
                 (
                     run_id,
                     "history_calibration_digest",
-                    "review_history_calibration",
+                    calibration_source_path,
                     sha256_text(history_calibration),
                 ),
             )
@@ -2850,7 +2852,12 @@ diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-
             pass
         else:
             raise AssertionError("oversized trusted context doc should be rejected")
-        self_test_calibration = "self-test aggregate calibration"
+        self_test_calibration_path = Path(temp_dir) / "history-calibration.md"
+        self_test_calibration_path.write_text("self-test aggregate calibration\n", encoding="utf-8")
+        self_test_calibration = load_history_calibration(
+            str(self_test_calibration_path),
+            max_bytes=12000,
+        )
         db_path, run_id = persist_review_run(
             str(Path(temp_dir) / "review.db"),
             repo="self/test",
@@ -2884,6 +2891,7 @@ diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-
             report="self test",
             context_docs=context_docs,
             history_calibration=self_test_calibration,
+            history_calibration_path=str(self_test_calibration_path.resolve()),
         )
         with sqlite3.connect(db_path) as connection:
             row = connection.execute(
@@ -2922,6 +2930,14 @@ diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-
                 """,
                 (run_id,),
             ).fetchone()[0]
+            history_artifact_path = connection.execute(
+                """
+                SELECT path
+                FROM artifacts
+                WHERE run_id = ? AND kind = 'history_calibration_digest'
+                """,
+                (run_id,),
+            ).fetchone()[0]
         assert row == (
             "precision",
             "main",
@@ -2935,6 +2951,7 @@ diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-
         assert review_item_count == 2
         assert context_artifact_count == 1
         assert history_artifact_count == 1
+        assert history_artifact_path == str(self_test_calibration_path.resolve())
     print("OK: local AI precision review self-test passed")
 
 
@@ -3041,6 +3058,11 @@ def main() -> None:
     history_calibration = load_history_calibration(
         args.history_calibration_file or "",
         max_bytes=args.max_history_calibration_bytes,
+    )
+    history_calibration_path = (
+        str(resolve_path(args.history_calibration_file))
+        if history_calibration.strip() and args.history_calibration_file
+        else ""
     )
     prompt_hash = prompt_hash_for_run(
         args.max_findings_per_file,
@@ -3183,6 +3205,7 @@ def main() -> None:
             report=report,
             context_docs=context_docs,
             history_calibration=history_calibration,
+            history_calibration_path=history_calibration_path,
         )
         print(
             f"OK: saved review run to {saved_db_path} (run_id={run_id})",
