@@ -16241,25 +16241,9 @@ def insert_external_item_verdict(
             note,
             scorer,
             scored_at
-        )
-        SELECT 'external_item', ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM item_verdicts
-            WHERE target_kind = 'external_item'
-              AND target_id = ?
-              AND verdict = ?
-              AND reason = ?
-              AND note = ?
-              AND scorer = ?
-        )
+        ) VALUES ('external_item', ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """,
         (
-            external_item_id,
-            verdict,
-            reason,
-            note,
-            scorer,
             external_item_id,
             verdict,
             reason,
