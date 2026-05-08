@@ -211,6 +211,9 @@ manually activate learning candidates every time, explicit opt-in with
 `llreview daily --auto-activate-learning` or
 `LLREVIEW_DAILY_AUTO_ACTIVATE_LEARNING=1` activates at most one highest-ranked
 proposed prompt/rule candidate as an active DB calibration. Include the
+completed-teacher import, unscored runs, external item stamp queue, and link
+diagnostics in one inbox with `llreview learn-pump`, or include it in daily with
+`llreview daily --learning-pump` or `LLREVIEW_DAILY_LEARNING_PUMP=1`. Include the
 unscored-run scoring inbox with `llreview daily --scoring-pump` or
 `LLREVIEW_DAILY_SCORING_PUMP=1`. Include the human-gate review-gap stamp inbox
 with `llreview daily --review-gap-stamp-pump` or
@@ -256,6 +259,7 @@ export LLREVIEW_DAILY_AUTO_ACTIVATE_LEARNING=1
 export LLREVIEW_DAILY_NOTIFY=1
 export LLREVIEW_NOTIFY_SOUND=Glass
 export LLREVIEW_DAILY_APP_DEVELOPER_REVIEW=1
+export LLREVIEW_DAILY_LEARNING_PUMP=1
 export LLREVIEW_DAILY_SCORING_PUMP=1
 export LLREVIEW_DAILY_REVIEW_GAP_STAMP_PUMP=1
 export LLREVIEW_DAILY_RECALL_PATTERN_MINER=1
