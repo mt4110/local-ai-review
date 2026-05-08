@@ -470,6 +470,28 @@ def github_request(path: str, token: str) -> Any:
     return json.loads(raw.decode("utf-8"))
 
 
+def github_request_text(path: str, token: str, *, accept: str) -> str:
+    request = urllib.request.Request(
+        f"{GITHUB_API}{path}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": accept,
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "llreview",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        raw_error = exc.read().decode("utf-8", errors="replace").strip()
+        detail = f": {raw_error}" if raw_error else ""
+        raise GitHubRequestError(f"GitHub API {path} failed with HTTP {exc.code}{detail}") from exc
+    except urllib.error.URLError as exc:
+        raise GitHubRequestError(f"GitHub API {path} failed: {exc.reason}") from exc
+    return raw.decode("utf-8", errors="replace")
+
+
 def github_paginated_request(path: str, token: str) -> list[Any]:
     items: list[Any] = []
     page = 1
@@ -3702,6 +3724,32 @@ def app_developer_review_prompt(workspace: Workspace, *, diff_text: str) -> str:
     ) + "\n"
 
 
+def app_developer_review_diff(args: argparse.Namespace, workspace: Workspace) -> tuple[str, bool, str]:
+    if workspace.open_pr:
+        token, token_status = github_token()
+        if not token:
+            raise GitHubRequestError(f"GitHub auth unavailable for PR diff fetch: {token_status}")
+        pr_number = int(workspace.open_pr["number"])
+        diff_text = github_request_text(
+            f"/repos/{workspace.repo.full_name}/pulls/{pr_number}",
+            token,
+            accept="application/vnd.github.v3.diff",
+        )
+        return diff_text, False, "pull_request"
+
+    temp_diff_path, working_tree_included = build_pre_pr_diff(
+        workspace.root,
+        workspace.base_ref,
+        include_working_tree=not args.no_working_tree,
+    )
+    try:
+        diff_text = temp_diff_path.read_text(encoding="utf-8", errors="replace")
+    finally:
+        temp_diff_path.unlink(missing_ok=True)
+    subject = workspace.branch or workspace.head_sha[:12]
+    return diff_text, working_tree_included, f"pre_pr:{workspace.base_ref}...{subject}"
+
+
 def start_app_developer_review(
     args: argparse.Namespace,
     *,
@@ -3729,15 +3777,11 @@ def start_app_developer_review(
     diff_path = job_dir / "diff.patch"
     manifest_path = job_dir / "manifest.json"
 
-    temp_diff_path, _working_tree_included = build_pre_pr_diff(
-        workspace.root,
-        workspace.base_ref,
-        include_working_tree=not args.no_working_tree,
-    )
     try:
-        diff_text = temp_diff_path.read_text(encoding="utf-8", errors="replace")
-    finally:
-        temp_diff_path.unlink(missing_ok=True)
+        diff_text, working_tree_included, diff_source = app_developer_review_diff(args, workspace)
+    except GitHubRequestError as exc:
+        print(f"SKIP: app-developer review harness could not fetch PR diff: {exc}")
+        return None
     diff_bytes = len(diff_text.encode("utf-8"))
     if diff_bytes > args.app_developer_review_max_diff_bytes:
         print(
@@ -3801,6 +3845,8 @@ def start_app_developer_review(
         "branch": workspace.branch,
         "head_sha": workspace.head_sha,
         "base_ref": workspace.base_ref,
+        "diff_source": diff_source,
+        "working_tree_included": working_tree_included,
         "model": args.app_developer_review_model,
         "command": cmd,
         "policy": {
