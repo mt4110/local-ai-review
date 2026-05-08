@@ -529,10 +529,16 @@ reviewer or app-developer teacher review; run `llreview daily` first, or
 shows only candidates still waiting for a stamp and keeps the output compact. For
 teacher/external samples, press `y` for a valid missed item, `c` when it was
 covered locally, `f` when it is not actionable, `n` when unsure, `s` to skip, or
-`q` to quit. For prompt/rule candidates, pressing `y` after the instruction
-preview and Calibration Risk Gate writes an active DB calibration that affects
-future review prompts; press `v` to view the preview, or `s` to skip. Use
-`llreview learn-review --no-activate` for a stamp-only pass. It hides full body
+`q` to quit. Use `llreview learn-review --language ja` or `--ja` for Japanese
+operator prompts, or set `LLREVIEW_LEARN_REVIEW_LANGUAGE=ja` to make that the
+default. This changes the interactive display only; DB verdicts, reasons, and
+export schemas remain stable English-coded values. Once an operator stamps an
+external verdict, later importer `no_local_match` / `linked_by_importer`
+verdicts do not override it, so the same teacher gap does not return to the
+stamp inbox after re-import. For prompt/rule candidates, pressing `y` after the
+instruction preview and Calibration Risk Gate writes an active DB calibration
+that affects future review prompts; press `v` to view the preview, or `s` to
+skip. Use `llreview learn-review --no-activate` for a stamp-only pass. It hides full body
 text and body digests by default; use `--verbose` or `--include-active` only
 when you want the longer audit view. Use `llreview learn-review --dry-run` to
 preview the queue.
