@@ -12597,14 +12597,14 @@ def next_remote_backfill_row(connection: sqlite3.Connection) -> sqlite3.Row | No
         SELECT *
         FROM github_backfill_queue
         WHERE source_kind = 'remote_github'
-          AND state = 'pending'
+          AND state IN ('pending', 'failed_retryable')
           AND pr_number > 0
           AND (
               next_attempt_at IS NULL
               OR next_attempt_at = ''
               OR datetime(next_attempt_at) <= datetime('now')
           )
-        ORDER BY priority, id
+        ORDER BY priority, CASE state WHEN 'failed_retryable' THEN 1 ELSE 0 END, id
         LIMIT 1
         """
     ).fetchone()
@@ -12617,7 +12617,7 @@ def print_no_remote_backfill_candidate(connection: sqlite3.Connection) -> None:
             SELECT COUNT(*)
             FROM github_backfill_queue
             WHERE source_kind = 'remote_github'
-              AND state = 'pending'
+              AND state IN ('pending', 'failed_retryable')
               AND pr_number > 0
             """
         ).fetchone()[0]
@@ -12633,9 +12633,9 @@ def print_no_remote_backfill_candidate(connection: sqlite3.Connection) -> None:
             """
         ).fetchone()[0]
     )
-    print("No eligible remote_github pending queue row.")
+    print("No eligible remote_github pending or retryable queue row.")
     if remote_pending:
-        print(f"Remote pending rows exist but are waiting for next_attempt_at: {remote_pending}")
+        print(f"Remote pending/retryable rows exist but are waiting for next_attempt_at: {remote_pending}")
     if local_pending:
         print(
             "Local pending rows exist, but --one imports external GitHub review evidence only: "
@@ -12801,7 +12801,7 @@ def print_backfill_preview(candidates: list[BackfillCandidate], *, limit: int) -
 
 
 def command_import_github_history(args: argparse.Namespace) -> None:
-    if not args.dry_run and not args.one:
+    if not args.dry_run and not (args.one or args.refresh_queue):
         raise SystemExit("import-github-history writes only with --one or --refresh-queue; use --dry-run to preview")
     db_path = Path(args.db).expanduser().resolve()
     ensure_db_schema(db_path)
@@ -12893,7 +12893,7 @@ def backfill_queue_summary(connection: sqlite3.Connection) -> dict[str, Any]:
             SELECT COUNT(*)
             FROM github_backfill_queue
             WHERE source_kind = 'remote_github'
-              AND state = 'pending'
+              AND state IN ('pending', 'failed_retryable')
               AND pr_number > 0
               AND (
                   next_attempt_at IS NULL
@@ -12909,7 +12909,7 @@ def backfill_queue_summary(connection: sqlite3.Connection) -> dict[str, Any]:
             SELECT COUNT(*)
             FROM github_backfill_queue
             WHERE source_kind = 'remote_github'
-              AND state = 'pending'
+              AND state IN ('pending', 'failed_retryable')
               AND pr_number > 0
               AND next_attempt_at IS NOT NULL
               AND next_attempt_at != ''
@@ -13093,8 +13093,8 @@ def backfill_pump_report(payload: dict[str, Any]) -> str:
         "## Summary",
         "",
         f"- Queue rows: {queue['total']}",
-        f"- Eligible remote pending: {queue['eligible_remote_pending']}",
-        f"- Waiting remote pending: {queue['waiting_remote_pending']}",
+        f"- Eligible remote pending/retryable: {queue['eligible_remote_pending']}",
+        f"- Waiting remote pending/retryable: {queue['waiting_remote_pending']}",
         f"- External items: {payload['external_items']['linked']}/{payload['external_items']['total']} linked; unlinked={payload['external_items']['unlinked']}; delta={external_delta:+d}",
         f"- Import attempted: {str(payload['import']['attempted']).lower()}",
         f"- Import dry-run: {str(payload['import']['dry_run']).lower()}",
