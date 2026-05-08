@@ -16206,7 +16206,7 @@ def prompt_learning_activation() -> str:
         "q": "quit",
     }
     while True:
-        raw = input("Approve? [y / v / s / q]: ").strip().lower()
+        raw = input("Activate DB calibration? [y / v / s / q]: ").strip().lower()
         action = choices.get(raw)
         if action:
             return action
@@ -16246,7 +16246,7 @@ def review_activation_learning_candidate(
         if args.verbose:
             print(f"  markdown={output_dir / f'{candidate.candidate_id}.md'}")
             print(f"  json={json_path}")
-        print("DRY RUN: would ask for approval.")
+        print("DRY RUN: would ask for active DB calibration approval.")
         return False, False
     proposal, markdown_path, json_path, created = load_or_write_next_learning_proposal(
         candidate=candidate,
@@ -16259,6 +16259,10 @@ def review_activation_learning_candidate(
     print("")
     instruction = str(calibration["instruction"])
     print(f"Calibration ({artifact_state}): {instruction if args.verbose else truncate_text(instruction, 180)}")
+    print(
+        "Activation step: approving here writes an active DB calibration that will influence future review prompts. "
+        "Use `llreview learn-review --no-activate` for stamp-only review."
+    )
     enforce_calibration_risk_gate(connection, candidate, args=args)
     if args.verbose:
         print(f"  markdown={markdown_path}")
@@ -16318,7 +16322,10 @@ def command_learn_review(args: argparse.Namespace) -> None:
                     )
                 )
             )
-            if has_external_samples or learning_candidate_is_activatable(candidate):
+            if has_external_samples or (
+                learning_candidate_is_activatable(candidate)
+                and not getattr(args, "no_activate", False)
+            ):
                 review_candidates.append(candidate)
             elif args.include_needs_data and candidate.candidate_kind == "needs_data":
                 review_candidates.append(candidate)
@@ -16328,7 +16335,12 @@ def command_learn_review(args: argparse.Namespace) -> None:
                 break
         print("# Learning Review")
         print("")
-        print("This command only stamps existing learning evidence; it does not run local or teacher reviews.")
+        print("This command reviews existing learning evidence; it does not run local or teacher reviews.")
+        print(
+            "If activation is enabled, activatable prompt/rule candidates may also ask to write active DB calibrations "
+            "after the calibration risk gate."
+        )
+        print("Use `llreview learn-review --no-activate` for a stamp-only pass.")
         print("Run `llreview daily` first, or `llreview daily --force-review` when you want a fresh local review.")
         print("")
         print(f"- DB: `{db_path}`")
@@ -16336,6 +16348,8 @@ def command_learn_review(args: argparse.Namespace) -> None:
         print(f"- Candidates: `{len(review_candidates)}`")
         if args.dry_run:
             print("- Mode: `dry-run`")
+        if args.no_activate:
+            print("- Activation: `disabled`")
         if not review_candidates:
             print("")
             print("No learning candidates need review at the current threshold.")
@@ -16358,7 +16372,7 @@ def command_learn_review(args: argparse.Namespace) -> None:
                 stamped += saved
                 if quit_requested:
                     break
-            if learning_candidate_is_activatable(candidate):
+            if learning_candidate_is_activatable(candidate) and not args.no_activate:
                 did_activate, quit_requested = review_activation_learning_candidate(
                     connection,
                     candidate,
@@ -16367,6 +16381,8 @@ def command_learn_review(args: argparse.Namespace) -> None:
                 activated += 1 if did_activate else 0
                 if quit_requested:
                     break
+            elif learning_candidate_is_activatable(candidate) and args.no_activate:
+                print("- Activation skipped: --no-activate was passed.")
             elif candidate.candidate_kind == "needs_data":
                 print(f"- Needs data: {candidate.recommended_action}")
         print("")
@@ -18266,7 +18282,7 @@ def build_learn_pump_parser() -> argparse.ArgumentParser:
 
 def build_learn_review_parser() -> argparse.ArgumentParser:
     review = argparse.ArgumentParser(
-        description="Interactively review learning candidates and stamp only the items that need operator judgment"
+        description="Interactively review learning candidates, stamp evidence, and optionally approve calibrations"
     )
     review.set_defaults(func=command_learn_review)
     add_workspace_options(review)
@@ -18305,6 +18321,11 @@ def build_learn_review_parser() -> argparse.ArgumentParser:
         "--force-risk",
         action="store_true",
         help="Allow manual activation even when the calibration risk gate blocks it",
+    )
+    review.add_argument(
+        "--no-activate",
+        action="store_true",
+        help="Stamp external evidence only; do not offer active DB calibration approval",
     )
     review.add_argument("--scorer", default="manual")
     review.add_argument("--dry-run", action="store_true", help="Preview the review queue without writing verdicts")
