@@ -71,6 +71,16 @@ GITHUB_API = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("
 PROGRESS_PREFIX = "LLREVIEW_EVENT "
 IMPORT_LINK_NOTE_PREFIX = "github_importer:"
 APP_DEVELOPER_LINK_NOTE_PREFIX = "app_developer_importer:"
+IMPORTER_EXTERNAL_REASON_CODES = {"linked_by_importer", "no_local_match"}
+OPERATOR_EXTERNAL_REASON_CODES = {
+    "teacher_model_valid",
+    "external_valid",
+    "teacher_model_false_positive",
+    "external_false_positive",
+    "external_not_actionable",
+    "needs_human_review",
+    "covered_by_local_after_review",
+}
 GITHUB_IMPORT_COMMENT_ID_PREFIXES = ("review_comment:", "issue_comment:")
 AUTO_LEARNING_CANDIDATE = "__llreview_auto_learning_candidate__"
 DEFAULT_PRIMARY_REVIEW_MODEL = "qwen3-coder:30b-a3b-q4_K_M"
@@ -88,6 +98,7 @@ SECOND_OPINION_NUM_CTX = 12288
 SECOND_OPINION_MODEL_MEMORY_GB = 54.0
 SECOND_OPINION_MAX_MEMORY_PERCENT = 90.0
 BACKFILL_DOC_EXTENSIONS = (".md", ".mdx", ".rst")
+SQLITE_BIND_BATCH_SIZE = 800
 BACKFILL_DOC_PREFIXES = ("docs/", "adr/", ".private_docs/")
 BACKFILL_DOC_FILENAMES = ("readme",)
 BACKFILL_GENERATED_FILENAMES = (
@@ -826,6 +837,20 @@ def env_text(name: str, default: str) -> str:
     if value is None or value.strip() == "":
         return default
     return value.strip()
+
+
+def sqlite_batched_values(values: list[int], *, batch_size: int = SQLITE_BIND_BATCH_SIZE) -> list[list[int]]:
+    unique_values = list(dict.fromkeys(values))
+    return [
+        unique_values[index : index + batch_size]
+        for index in range(0, len(unique_values), batch_size)
+    ]
+
+
+def sqlite_placeholders(count: int) -> str:
+    if count <= 0:
+        raise ValueError("placeholder count must be positive")
+    return ",".join("?" for _ in range(count))
 
 
 def replace_namespace(args: argparse.Namespace, **updates: Any) -> argparse.Namespace:
@@ -2152,6 +2177,10 @@ def external_item_samples(
         """,
         params,
     ).fetchall()
+    operator_locked_ids = external_ids_with_operator_verdicts(
+        connection,
+        [int(row["external_item_id"]) for row in rows],
+    )
     samples: list[dict[str, Any]] = []
     for row in rows:
         path = str(row["path"] or "")
@@ -2159,25 +2188,25 @@ def external_item_samples(
             continue
         if str(row["verdict"] or "") != candidate.verdict:
             continue
-        samples.append(
-            learning_support_record(
-                candidate,
-                sample_kind="external_item",
-                sample_id=int(row["external_item_id"]),
-                repo=str(row["repo"] or ""),
-                pr_number=int(row["pr_number"] or 0),
-                run_id=0,
-                path=path,
-                line=as_optional_int(row["line"]),
-                source=str(row["source"] or ""),
-                verdict=str(row["verdict"] or ""),
-                reason=str(row["reason"] or ""),
-                title=str(row["title"] or ""),
-                body=str(row["body"] or ""),
-                show_text=show_text,
-                excerpt_chars=excerpt_chars,
-            )
+        record = learning_support_record(
+            candidate,
+            sample_kind="external_item",
+            sample_id=int(row["external_item_id"]),
+            repo=str(row["repo"] or ""),
+            pr_number=int(row["pr_number"] or 0),
+            run_id=0,
+            path=path,
+            line=as_optional_int(row["line"]),
+            source=str(row["source"] or ""),
+            verdict=str(row["verdict"] or ""),
+            reason=str(row["reason"] or ""),
+            title=str(row["title"] or ""),
+            body=str(row["body"] or ""),
+            show_text=show_text,
+            excerpt_chars=excerpt_chars,
         )
+        record["has_operator_verdict"] = int(row["external_item_id"]) in operator_locked_ids
+        samples.append(record)
         if len(samples) >= sample_limit:
             break
     return samples
@@ -6974,7 +7003,7 @@ def run_review_gap_stamp_flow(args: argparse.Namespace, records: list[dict[str, 
                 print("  skipped: unknown choice")
                 continue
             verdict, reason, note = action
-            insert_external_item_verdict(
+            inserted = insert_external_item_verdict(
                 connection,
                 external_item_id=int(record["external_item_id"]),
                 verdict=verdict,
@@ -6982,8 +7011,11 @@ def run_review_gap_stamp_flow(args: argparse.Namespace, records: list[dict[str, 
                 note=note,
                 scorer=args.scorer,
             )
-            saved += 1
-            print(f"  OK: {verdict}/{reason}")
+            if inserted:
+                saved += 1
+                print(f"  OK: {verdict}/{reason}")
+            else:
+                print(f"  OK: unchanged {verdict}/{reason}")
     return saved
 
 
@@ -10089,37 +10121,6 @@ def external_verdict_target_from_candidate(
     return int(sample["sample_id"]), candidate, sample
 
 
-def insert_external_item_verdict(
-    connection: sqlite3.Connection,
-    *,
-    external_item_id: int,
-    verdict: str,
-    reason: str,
-    note: str,
-    scorer: str,
-) -> None:
-    connection.execute(
-        """
-        INSERT INTO item_verdicts (
-            target_kind,
-            target_id,
-            verdict,
-            reason,
-            note,
-            scorer,
-            scored_at
-        ) VALUES ('external_item', ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        """,
-        (
-            external_item_id,
-            verdict,
-            reason,
-            note,
-            scorer,
-        ),
-    )
-
-
 def command_external_verdict(args: argparse.Namespace) -> None:
     db_path = Path(args.db).expanduser().resolve()
     ensure_db_schema(db_path)
@@ -10149,7 +10150,7 @@ def command_external_verdict(args: argparse.Namespace) -> None:
         ).fetchone()
         if row is None:
             raise SystemExit(f"external_item id={external_item_id} was not found")
-        insert_external_item_verdict(
+        saved = insert_external_item_verdict(
             connection,
             external_item_id=external_item_id,
             verdict=args.verdict,
@@ -10167,7 +10168,7 @@ def command_external_verdict(args: argparse.Namespace) -> None:
             f"sample={selected_sample.get('sample_id')}"
         )
     print(
-        "OK: external_item verdict saved "
+        f"OK: external_item verdict {'saved' if saved else 'unchanged'} "
         f"id={row['id']} verdict={args.verdict} "
         f"source={row['source']} location={location or '(none)'}"
         f"{selected}"
@@ -11653,15 +11654,16 @@ def refresh_import_links(
 ) -> None:
     if not imported_ids:
         return
-    placeholders = ",".join("?" for _ in imported_ids)
-    connection.execute(
-        f"""
-        DELETE FROM item_links
-        WHERE external_item_id IN ({placeholders})
-          AND note LIKE ?
-        """,
-        [*imported_ids, f"{note_prefix}%"],
-    )
+    for batch in sqlite_batched_values(imported_ids):
+        placeholders = sqlite_placeholders(len(batch))
+        connection.execute(
+            f"""
+            DELETE FROM item_links
+            WHERE external_item_id IN ({placeholders})
+              AND note LIKE ?
+            """,
+            [*batch, f"{note_prefix}%"],
+        )
     for match in matches:
         connection.execute(
             """
@@ -11689,23 +11691,93 @@ def latest_external_verdicts(
 ) -> dict[int, sqlite3.Row]:
     if not external_ids:
         return {}
-    placeholders = ",".join("?" for _ in external_ids)
-    rows = connection.execute(
-        f"""
-        SELECT verdicts.*
-        FROM item_verdicts AS verdicts
-        JOIN (
-            SELECT target_id, MAX(id) AS id
+    latest_by_external: dict[int, sqlite3.Row] = {}
+    for batch in sqlite_batched_values(external_ids):
+        placeholders = sqlite_placeholders(len(batch))
+        rows = connection.execute(
+            f"""
+            SELECT verdicts.*
+            FROM item_verdicts AS verdicts
+            JOIN (
+                SELECT target_id, MAX(id) AS id
+                FROM item_verdicts
+                WHERE target_kind = 'external_item'
+                  AND target_id IN ({placeholders})
+                GROUP BY target_id
+            ) AS latest
+            ON latest.id = verdicts.id
+            """,
+            batch,
+        ).fetchall()
+        latest_by_external.update({int(row["target_id"]): row for row in rows})
+    return latest_by_external
+
+
+def external_ids_with_operator_verdicts(
+    connection: sqlite3.Connection,
+    external_ids: list[int],
+) -> set[int]:
+    if not external_ids:
+        return set()
+    reason_codes = sorted(OPERATOR_EXTERNAL_REASON_CODES)
+    reason_placeholders = sqlite_placeholders(len(reason_codes))
+    locked_ids: set[int] = set()
+    for batch in sqlite_batched_values(external_ids):
+        external_placeholders = sqlite_placeholders(len(batch))
+        rows = connection.execute(
+            f"""
+            SELECT DISTINCT target_id
             FROM item_verdicts
             WHERE target_kind = 'external_item'
-              AND target_id IN ({placeholders})
-            GROUP BY target_id
-        ) AS latest
-        ON latest.id = verdicts.id
-        """,
-        external_ids,
-    ).fetchall()
-    return {int(row["target_id"]): row for row in rows}
+              AND target_id IN ({external_placeholders})
+              AND reason IN ({reason_placeholders})
+            """,
+            [*batch, *reason_codes],
+        ).fetchall()
+        locked_ids.update(int(row["target_id"]) for row in rows)
+    return locked_ids
+
+
+def delete_importer_external_verdicts(
+    connection: sqlite3.Connection,
+    external_ids: list[int],
+    *,
+    scorer: str | None = None,
+    note_prefix: str | None = None,
+) -> int:
+    if not external_ids:
+        return 0
+    reason_codes = sorted(IMPORTER_EXTERNAL_REASON_CODES)
+    reason_placeholders = sqlite_placeholders(len(reason_codes))
+    deleted = 0
+    scorer_filter = " AND scorer = ?" if scorer is not None else ""
+    if note_prefix is not None:
+        note_filter = " AND note LIKE ?"
+        note_value = f"{note_prefix}%"
+    else:
+        note_filter = " AND note LIKE ?"
+        note_value = "%human_gate_required%"
+    for batch in sqlite_batched_values(external_ids):
+        external_placeholders = sqlite_placeholders(len(batch))
+        filters = ""
+        params: list[Any] = [*batch, *reason_codes]
+        if scorer is not None:
+            filters += scorer_filter
+            params.append(scorer)
+        filters += note_filter
+        params.append(note_value)
+        cursor = connection.execute(
+            f"""
+            DELETE FROM item_verdicts
+            WHERE target_kind = 'external_item'
+              AND target_id IN ({external_placeholders})
+              AND reason IN ({reason_placeholders})
+              {filters}
+            """,
+            params,
+        )
+        deleted += int(cursor.rowcount or 0)
+    return deleted
 
 
 def write_external_verdicts(
@@ -11720,22 +11792,35 @@ def write_external_verdicts(
     if not imported_ids:
         return 0
     if not candidates_exist:
-        placeholders = ",".join("?" for _ in imported_ids)
-        cursor = connection.execute(
-            f"""
-            DELETE FROM item_verdicts
-            WHERE target_kind = 'external_item'
-              AND target_id IN ({placeholders})
-              AND scorer = ?
-              AND note LIKE ?
-            """,
-            [*imported_ids, scorer, f"{note_prefix}%"],
-        )
-        return int(cursor.rowcount or 0)
+        deleted = 0
+        for batch in sqlite_batched_values(imported_ids):
+            placeholders = sqlite_placeholders(len(batch))
+            cursor = connection.execute(
+                f"""
+                DELETE FROM item_verdicts
+                WHERE target_kind = 'external_item'
+                  AND target_id IN ({placeholders})
+                  AND scorer = ?
+                  AND note LIKE ?
+                """,
+                [*batch, scorer, f"{note_prefix}%"],
+            )
+            deleted += int(cursor.rowcount or 0)
+        return deleted
     match_by_external = {match.external_item_id: match for match in matches}
     existing = latest_external_verdicts(connection, imported_ids)
+    operator_locked_ids = external_ids_with_operator_verdicts(connection, imported_ids)
+    if operator_locked_ids:
+        delete_importer_external_verdicts(
+            connection,
+            sorted(operator_locked_ids),
+            scorer=scorer,
+            note_prefix=note_prefix,
+        )
     saved = 0
     for external_id in imported_ids:
+        if external_id in operator_locked_ids:
+            continue
         if match := match_by_external.get(external_id):
             verdict = "covered_by_local"
             reason = "linked_by_importer"
@@ -11745,6 +11830,11 @@ def write_external_verdicts(
             reason = "no_local_match"
             note = f"{note_prefix} no link above threshold; human_gate_required"
         current = existing.get(external_id)
+        if current:
+            current_scorer = str(current["scorer"] or "")
+            current_note = str(current["note"] or "")
+            if current_scorer != scorer or not current_note.startswith(note_prefix):
+                continue
         if (
             current
             and str(current["verdict"]) == verdict
@@ -15990,19 +16080,40 @@ def command_learn_next(args: argparse.Namespace) -> None:
     print("Next normal review runs will include this active calibration when scope and path class match.")
 
 
-OPERATOR_EXTERNAL_REASON_CODES = {
-    "teacher_model_valid",
-    "external_valid",
-    "teacher_model_false_positive",
-    "external_false_positive",
-    "external_not_actionable",
-    "needs_human_review",
-    "covered_by_local_after_review",
-}
+def normalize_learn_review_language(value: str) -> str:
+    normalized = value.strip().lower().replace("_", "-")
+    if normalized in {"ja", "jp", "japanese", "日本語"}:
+        return "ja"
+    if normalized in {"en", "eng", "english"}:
+        return "en"
+    raise argparse.ArgumentTypeError("language must be one of: en, ja")
+
+
+def learn_review_is_japanese(args: argparse.Namespace) -> bool:
+    return str(getattr(args, "language", "en") or "en") == "ja"
+
+
+def learn_review_text(args: argparse.Namespace, english: str, japanese: str) -> str:
+    return japanese if learn_review_is_japanese(args) else english
+
+
+def default_learn_review_language() -> str:
+    raw_value = env_text("LLREVIEW_LEARN_REVIEW_LANGUAGE", "en")
+    try:
+        return normalize_learn_review_language(raw_value)
+    except argparse.ArgumentTypeError as exc:
+        raise SystemExit(f"Invalid LLREVIEW_LEARN_REVIEW_LANGUAGE={raw_value!r}: {exc}") from exc
+
+
+def ensure_sqlite_write_transaction(connection: sqlite3.Connection) -> None:
+    if not connection.in_transaction:
+        connection.execute("BEGIN IMMEDIATE")
 
 
 def learning_sample_needs_operator_verdict(sample: dict[str, Any]) -> bool:
     if sample.get("sample_kind") != "external_item":
+        return False
+    if bool(sample.get("has_operator_verdict")):
         return False
     reason = str(sample.get("reason") or "")
     return reason not in OPERATOR_EXTERNAL_REASON_CODES
@@ -16022,20 +16133,30 @@ def print_learning_review_sample(
     index: int,
     show_text: bool,
     verbose: bool,
+    args: argparse.Namespace,
 ) -> None:
     body_value = sample.get("body_excerpt") if show_text else sample.get("body_digest")
     print("")
-    print(f"Sample {index} id={sample.get('sample_id')} {learning_sample_location(sample)}")
-    print(f"  {sample.get('title_excerpt')}")
+    if learn_review_is_japanese(args):
+        print(f"サンプル {index} id={sample.get('sample_id')} {learning_sample_location(sample)}")
+        print(f"  タイトル: {sample.get('title_excerpt')}")
+    else:
+        print(f"Sample {index} id={sample.get('sample_id')} {learning_sample_location(sample)}")
+        print(f"  {sample.get('title_excerpt')}")
     if verbose:
-        print(f"  current={sample.get('source')} {sample.get('verdict')}:{sample.get('reason')}")
-        print(f"  body {'excerpt' if show_text else 'digest'}={body_value or '(none)'}")
+        if learn_review_is_japanese(args):
+            print(f"  現在値={sample.get('source')} {sample.get('verdict')}:{sample.get('reason')}")
+            print(f"  本文{'抜粋' if show_text else 'digest'}={body_value or '(none)'}")
+        else:
+            print(f"  current={sample.get('source')} {sample.get('verdict')}:{sample.get('reason')}")
+            print(f"  body {'excerpt' if show_text else 'digest'}={body_value or '(none)'}")
 
 
-def prompt_learning_review_action() -> str:
+def prompt_learning_review_action(args: argparse.Namespace) -> str:
     choices = {
         "y": "valid_missed",
         "yes": "valid_missed",
+        "valid": "valid_missed",
         "c": "covered",
         "covered": "covered",
         "f": "false_positive",
@@ -16047,13 +16168,16 @@ def prompt_learning_review_action() -> str:
         "q": "quit",
     }
     while True:
-        raw = input(
-            "Stamp [y valid missed / c covered / f not actionable / n unsure / s skip / q quit]: "
-        ).strip().lower()
+        prompt = learn_review_text(
+            args,
+            "Stamp [y valid missed / c covered / f not actionable / n unsure / s skip / q quit]: ",
+            "ハンコ [y 妥当な見逃し / c localで検出済み / f 非actionable / n 保留 / s skip / q quit]: ",
+        )
+        raw = input(prompt).strip().lower()
         action = choices.get(raw)
         if action:
             return action
-        print("expected y, c, f, n, s, or q")
+        print(learn_review_text(args, "expected y, c, f, n, s, or q", "y, c, f, n, s, q のどれかを入力してください"))
 
 
 def insert_external_item_verdict(
@@ -16064,8 +16188,50 @@ def insert_external_item_verdict(
     reason: str,
     note: str,
     scorer: str,
-) -> None:
-    connection.execute(
+) -> bool:
+    """Save an external-item verdict.
+
+    Returns true when the DB changed. Re-stamping an identical operator verdict
+    is treated as a change only when importer human-gate rows were removed so
+    the existing operator verdict becomes the latest row again.
+    """
+    ensure_sqlite_write_transaction(connection)
+    current = latest_external_verdicts(connection, [external_item_id]).get(external_item_id)
+    if (
+        current
+        and str(current["verdict"]) == verdict
+        and str(current["reason"]) == reason
+        and str(current["note"]) == note
+        and str(current["scorer"]) == scorer
+    ):
+        return False
+    if reason in OPERATOR_EXTERNAL_REASON_CODES:
+        exact_exists = connection.execute(
+            """
+            SELECT 1
+            FROM item_verdicts
+            WHERE target_kind = 'external_item'
+              AND target_id = ?
+              AND verdict = ?
+              AND reason = ?
+              AND note = ?
+              AND scorer = ?
+            LIMIT 1
+            """,
+            (external_item_id, verdict, reason, note, scorer),
+        ).fetchone()
+        if exact_exists is not None:
+            deleted = delete_importer_external_verdicts(connection, [external_item_id])
+            current = latest_external_verdicts(connection, [external_item_id]).get(external_item_id)
+            if (
+                current
+                and str(current["verdict"]) == verdict
+                and str(current["reason"]) == reason
+                and str(current["note"]) == note
+                and str(current["scorer"]) == scorer
+            ):
+                return deleted > 0
+    cursor = connection.execute(
         """
         INSERT INTO item_verdicts (
             target_kind,
@@ -16077,8 +16243,15 @@ def insert_external_item_verdict(
             scored_at
         ) VALUES ('external_item', ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """,
-        (external_item_id, verdict, reason, note, scorer),
+        (
+            external_item_id,
+            verdict,
+            reason,
+            note,
+            scorer,
+        ),
     )
+    return int(cursor.rowcount or 0) > 0
 
 
 def candidate_unreviewed_external_samples(
@@ -16125,16 +16298,19 @@ def print_learning_candidate_brief(
     index: int,
     total: int,
     verbose: bool,
+    args: argparse.Namespace,
 ) -> None:
     print("")
     print(
-        "## {index}/{total} {candidate_id} {signal} {path_class} evidence={evidence} confidence={confidence}".format(
+        "## {index}/{total} {candidate_id} {signal} {path_class} {evidence_label}={evidence} {confidence_label}={confidence}".format(
             index=index,
             total=total,
             candidate_id=learning_candidate_short_id(candidate),
             signal=candidate.signal_kind,
             path_class=candidate.path_class,
+            evidence_label=learn_review_text(args, "evidence", "根拠数"),
             evidence=candidate.evidence_count,
+            confidence_label=learn_review_text(args, "confidence", "信頼度"),
             confidence=candidate.confidence,
         )
     )
@@ -16142,7 +16318,7 @@ def print_learning_candidate_brief(
     if verbose:
         print(f"  scope={candidate.repo} kind={candidate.candidate_kind}")
         print(f"  verdict/reason/source={candidate.verdict}/{candidate.reason}/{candidate.source}")
-        print(f"  recommended={candidate.recommended_action}")
+        print(f"  {learn_review_text(args, 'recommended', '推奨')}={candidate.recommended_action}")
 
 
 def review_external_learning_candidate(
@@ -16159,7 +16335,13 @@ def review_external_learning_candidate(
         excerpt_chars=args.excerpt_chars,
     )
     if not samples:
-        print("- No unreviewed external samples for this candidate.")
+        print(
+            learn_review_text(
+                args,
+                "- No unreviewed external samples for this candidate.",
+                "- この候補には未確認の external sample はありません。",
+            )
+        )
         return 0, False
     saved = 0
     quit_requested = False
@@ -16169,18 +16351,19 @@ def review_external_learning_candidate(
             index=index,
             show_text=args.show_text,
             verbose=args.verbose,
+            args=args,
         )
         if args.dry_run:
-            print("DRY RUN: would ask for a stamp.")
+            print(learn_review_text(args, "DRY RUN: would ask for a stamp.", "DRY RUN: ここでハンコ入力を求めます。"))
             continue
-        action = prompt_learning_review_action()
+        action = prompt_learning_review_action(args)
         if action == "quit":
             quit_requested = True
             break
         if action == "skip":
             continue
         verdict, reason, note = learning_review_verdict_for_action(candidate, action)
-        insert_external_item_verdict(
+        inserted = insert_external_item_verdict(
             connection,
             external_item_id=int(sample["sample_id"]),
             verdict=verdict,
@@ -16189,12 +16372,21 @@ def review_external_learning_candidate(
             scorer=args.scorer,
         )
         connection.commit()
-        saved += 1
-        print(f"OK: id={sample['sample_id']} -> {verdict}/{reason}")
+        if inserted:
+            saved += 1
+            print(f"OK: id={sample['sample_id']} -> {verdict}/{reason}")
+        else:
+            print(
+                learn_review_text(
+                    args,
+                    f"OK: id={sample['sample_id']} already had the same stamp.",
+                    f"OK: id={sample['sample_id']} は同じハンコ済みです。",
+                )
+            )
     return saved, quit_requested
 
 
-def prompt_learning_activation() -> str:
+def prompt_learning_activation(args: argparse.Namespace) -> str:
     choices = {
         "y": "activate",
         "yes": "activate",
@@ -16206,11 +16398,16 @@ def prompt_learning_activation() -> str:
         "q": "quit",
     }
     while True:
-        raw = input("Activate DB calibration? [y / v / s / q]: ").strip().lower()
+        prompt = learn_review_text(
+            args,
+            "Activate DB calibration? [y / v / s / q]: ",
+            "DB校正を有効化しますか？ [y 有効化 / v 表示 / s skip / q quit]: ",
+        )
+        raw = input(prompt).strip().lower()
         action = choices.get(raw)
         if action:
             return action
-        print("expected y, v, s, or q")
+        print(learn_review_text(args, "expected y, v, s, or q", "y, v, s, q のどれかを入力してください"))
 
 
 def review_activation_learning_candidate(
@@ -16221,7 +16418,13 @@ def review_activation_learning_candidate(
 ) -> tuple[bool, bool]:
     if not learning_candidate_is_activatable(candidate):
         if args.verbose:
-            print(f"- Activation skipped: {learning_candidate_activation_blocker(candidate)}")
+            print(
+                learn_review_text(
+                    args,
+                    f"- Activation skipped: {learning_candidate_activation_blocker(candidate)}",
+                    f"- 有効化をskip: {learning_candidate_activation_blocker(candidate)}",
+                )
+            )
         return False, False
     samples = inspect_learning_candidate_samples(
         connection,
@@ -16237,7 +16440,10 @@ def review_activation_learning_candidate(
         calibration = learning_calibration_from_proposal(proposal, source_path=json_path)
         print("")
         instruction = str(calibration["instruction"])
-        print(f"Calibration: {instruction if args.verbose else truncate_text(instruction, 180)}")
+        print(
+            learn_review_text(args, "Calibration", "校正")
+            + f": {instruction if args.verbose else truncate_text(instruction, 180)}"
+        )
         enforce_calibration_risk_gate(
             connection,
             candidate,
@@ -16246,7 +16452,13 @@ def review_activation_learning_candidate(
         if args.verbose:
             print(f"  markdown={output_dir / f'{candidate.candidate_id}.md'}")
             print(f"  json={json_path}")
-        print("DRY RUN: would ask for active DB calibration approval.")
+        print(
+            learn_review_text(
+                args,
+                "DRY RUN: would ask for active DB calibration approval.",
+                "DRY RUN: ここで active DB 校正の承認を求めます。",
+            )
+        )
         return False, False
     proposal, markdown_path, json_path, created = load_or_write_next_learning_proposal(
         candidate=candidate,
@@ -16258,17 +16470,25 @@ def review_activation_learning_candidate(
     artifact_state = "created" if created else "reused"
     print("")
     instruction = str(calibration["instruction"])
-    print(f"Calibration ({artifact_state}): {instruction if args.verbose else truncate_text(instruction, 180)}")
     print(
-        "Activation step: approving here writes an active DB calibration that will influence future review prompts. "
-        "Use `llreview learn-review --no-activate` for stamp-only review."
+        learn_review_text(args, f"Calibration ({artifact_state})", f"校正 ({artifact_state})")
+        + f": {instruction if args.verbose else truncate_text(instruction, 180)}"
+    )
+    print(
+        learn_review_text(
+            args,
+            "Activation step: approving here writes an active DB calibration that will influence future review prompts. "
+            "Use `llreview learn-review --no-activate` for stamp-only review.",
+            "有効化ステップ: ここで承認すると、今後の review prompt に効く active DB 校正を書き込みます。"
+            "ハンコだけ押す場合は `llreview learn-review --no-activate` を使ってください。",
+        )
     )
     enforce_calibration_risk_gate(connection, candidate, args=args)
     if args.verbose:
         print(f"  markdown={markdown_path}")
         print(f"  json={json_path}")
     while True:
-        action = prompt_learning_activation()
+        action = prompt_learning_activation(args)
         if action == "view":
             print("")
             if args.verbose:
@@ -16278,7 +16498,13 @@ def review_activation_learning_candidate(
                 print(f"ID: {calibration['calibration_id'][:12]}")
                 print(f"Scope: {calibration['scope_repo'] or 'global'} / {calibration['path_class']}")
                 print(f"Instruction: {calibration['instruction']}")
-                print(f"Guardrails: {len(guardrails)} items; use --verbose for full preview.")
+                print(
+                    learn_review_text(
+                        args,
+                        f"Guardrails: {len(guardrails)} items; use --verbose for full preview.",
+                        f"Guardrails: {len(guardrails)} 件。全文previewは --verbose を使ってください。",
+                    )
+                )
             print("")
             continue
         if action == "quit":
@@ -16287,13 +16513,25 @@ def review_activation_learning_candidate(
             return False, False
         upsert_learning_calibration(connection, calibration)
         connection.commit()
-        print(f"OK: activated learning calibration {calibration['calibration_id'][:12]}")
+        print(
+            learn_review_text(
+                args,
+                f"OK: activated learning calibration {calibration['calibration_id'][:12]}",
+                f"OK: learning calibration {calibration['calibration_id'][:12]} を有効化しました",
+            )
+        )
         return True, False
 
 
 def command_learn_review(args: argparse.Namespace) -> None:
     if not args.dry_run and not (sys.stdin.isatty() and sys.stdout.isatty()):
-        raise SystemExit("learn-review is interactive. Re-run in a TTY, or pass --dry-run for a preview.")
+        raise SystemExit(
+            learn_review_text(
+                args,
+                "learn-review is interactive. Re-run in a TTY, or pass --dry-run for a preview.",
+                "learn-review は対話式です。TTYで実行するか、preview には --dry-run を付けてください。",
+            )
+        )
     db_path = Path(args.db).expanduser().resolve()
     ensure_db_schema(db_path)
     repo = learning_repo_scope_from_args(args)
@@ -16333,26 +16571,56 @@ def command_learn_review(args: argparse.Namespace) -> None:
                 review_candidates.append(candidate)
             if len(review_candidates) >= args.limit:
                 break
-        print("# Learning Review")
+        print(learn_review_text(args, "# Learning Review", "# Learning Review / 学習レビュー"))
         print("")
-        print("This command reviews existing learning evidence; it does not run local or teacher reviews.")
         print(
-            "If activation is enabled, activatable prompt/rule candidates may also ask to write active DB calibrations "
-            "after the calibration risk gate."
+            learn_review_text(
+                args,
+                "This command reviews existing learning evidence; it does not run local or teacher reviews.",
+                "このコマンドは既存の学習証拠を確認します。local review や teacher review は実行しません。",
+            )
         )
-        print("Use `llreview learn-review --no-activate` for a stamp-only pass.")
-        print("Run `llreview daily` first, or `llreview daily --force-review` when you want a fresh local review.")
+        print(
+            learn_review_text(
+                args,
+                "If activation is enabled, activatable prompt/rule candidates may also ask to write active DB calibrations "
+                "after the calibration risk gate.",
+                "有効化がONの場合、条件を満たした prompt/rule 候補は Calibration Risk Gate の後に "
+                "active DB 校正の書き込み確認も行います。",
+            )
+        )
+        print(
+            learn_review_text(
+                args,
+                "Use `llreview learn-review --no-activate` for a stamp-only pass.",
+                "ハンコだけ押す場合は `llreview learn-review --no-activate` を使ってください。",
+            )
+        )
+        print(
+            learn_review_text(
+                args,
+                "Run `llreview daily` first, or `llreview daily --force-review` when you want a fresh local review.",
+                "先に `llreview daily` を実行してください。HEADが同じでも再レビューしたい時は `llreview daily --force-review` です。",
+            )
+        )
         print("")
         print(f"- DB: `{db_path}`")
-        print(f"- Repo scope: `{repo or 'global'}`")
-        print(f"- Candidates: `{len(review_candidates)}`")
+        print(f"- {learn_review_text(args, 'Repo scope', 'Repo scope')}: `{repo or 'global'}`")
+        print(f"- {learn_review_text(args, 'Candidates', '候補数')}: `{len(review_candidates)}`")
+        print(f"- {learn_review_text(args, 'Language', '表示言語')}: `{args.language}`")
         if args.dry_run:
-            print("- Mode: `dry-run`")
+            print(f"- {learn_review_text(args, 'Mode', 'モード')}: `dry-run`")
         if args.no_activate:
-            print("- Activation: `disabled`")
+            print(f"- {learn_review_text(args, 'Activation', '有効化')}: `disabled`")
         if not review_candidates:
             print("")
-            print("No learning candidates need review at the current threshold.")
+            print(
+                learn_review_text(
+                    args,
+                    "No learning candidates need review at the current threshold.",
+                    "現在の threshold では確認が必要な learning candidate はありません。",
+                )
+            )
             return
         for index, candidate in enumerate(review_candidates, start=1):
             print_learning_candidate_brief(
@@ -16360,6 +16628,7 @@ def command_learn_review(args: argparse.Namespace) -> None:
                 index=index,
                 total=len(review_candidates),
                 verbose=args.verbose,
+                args=args,
             )
             reviewed_candidates += 1
             quit_requested = False
@@ -16382,15 +16651,21 @@ def command_learn_review(args: argparse.Namespace) -> None:
                 if quit_requested:
                     break
             elif learning_candidate_is_activatable(candidate) and args.no_activate:
-                print("- Activation skipped: --no-activate was passed.")
+                print(
+                    learn_review_text(
+                        args,
+                        "- Activation skipped: --no-activate was passed.",
+                        "- 有効化をskip: --no-activate が指定されています。",
+                    )
+                )
             elif candidate.candidate_kind == "needs_data":
-                print(f"- Needs data: {candidate.recommended_action}")
+                print(f"- {learn_review_text(args, 'Needs data', '追加データが必要')}: {candidate.recommended_action}")
         print("")
-        print("## Summary")
+        print(learn_review_text(args, "## Summary", "## まとめ"))
         print("")
-        print(f"- Reviewed candidates: `{reviewed_candidates}`")
-        print(f"- External item stamps: `{stamped}`")
-        print(f"- Activated calibrations: `{activated}`")
+        print(f"- {learn_review_text(args, 'Reviewed candidates', '確認した候補')}: `{reviewed_candidates}`")
+        print(f"- {learn_review_text(args, 'External item stamps', 'External item ハンコ')}: `{stamped}`")
+        print(f"- {learn_review_text(args, 'Activated calibrations', '有効化した校正')}: `{activated}`")
 
 
 def audit_calibration_counts(
@@ -18291,6 +18566,19 @@ def build_learn_review_parser() -> argparse.ArgumentParser:
     review.add_argument("--limit", type=parse_non_negative, default=5, help="Candidate rows to review")
     review.add_argument("--samples", type=parse_non_negative, default=3, help="External samples to stamp per candidate")
     review.add_argument("--excerpt-chars", type=parse_non_negative, default=180)
+    review.add_argument(
+        "--language",
+        type=normalize_learn_review_language,
+        default=default_learn_review_language(),
+        help="Language for learn-review operator prompts: en or ja (env: LLREVIEW_LEARN_REVIEW_LANGUAGE)",
+    )
+    review.add_argument(
+        "--ja",
+        dest="language",
+        action="store_const",
+        const="ja",
+        help="Use Japanese learn-review prompts",
+    )
     review.add_argument(
         "--show-text",
         action="store_true",
