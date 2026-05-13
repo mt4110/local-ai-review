@@ -1282,18 +1282,14 @@ def latest_calibration_statuses(connection: sqlite3.Connection) -> dict[str, str
         ORDER BY updated_at DESC, id DESC
         """
     ).fetchall()
-    rank = {"active": 0, "paused": 1, "retired": 2}
-    statuses: dict[str, tuple[int, str, str, int]] = {}
+    statuses: dict[str, str] = {}
     for row in rows:
         candidate_id = str(row["candidate_id"] or "")
         status = str(row["status"] or "")
         if not candidate_id or not status:
             continue
-        value = (rank.get(status, 9), status, str(row["updated_at"] or ""), int(row["id"] or 0))
-        current = statuses.get(candidate_id)
-        if current is None or value[0] < current[0] or (value[0] == current[0] and value[2:] > current[2:]):
-            statuses[candidate_id] = value
-    return {candidate_id: status for candidate_id, (_rank, status, _updated_at, _id) in statuses.items()}
+        statuses.setdefault(candidate_id, status)
+    return statuses
 
 
 def register_candidate(

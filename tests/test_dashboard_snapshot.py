@@ -102,6 +102,37 @@ class DashboardSnapshotTests(unittest.TestCase):
         self.assertEqual(dashboard_snapshot.dashboard_path_class(".private_docs/roadmap.md"), "docs")
         self.assertEqual(dashboard_snapshot.dashboard_path_class(".env.example"), "ops_config")
 
+    def test_latest_calibration_status_uses_newest_row_per_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "review.db"
+            with sqlite3.connect(db_path) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.executescript(
+                    """
+                    CREATE TABLE learning_calibrations (
+                        id INTEGER PRIMARY KEY,
+                        candidate_id TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    INSERT INTO learning_calibrations (
+                        id,
+                        candidate_id,
+                        status,
+                        updated_at
+                    ) VALUES
+                        (1, 'candidate-a', 'active', '2026-05-01T00:00:00Z'),
+                        (2, 'candidate-a', 'paused', '2026-05-02T00:00:00Z'),
+                        (3, 'candidate-b', 'retired', '2026-05-02T00:00:00Z'),
+                        (4, 'candidate-b', 'active', '2026-05-02T00:00:00Z');
+                    """
+                )
+
+                statuses = dashboard_snapshot.latest_calibration_statuses(connection)
+
+            self.assertEqual(statuses["candidate-a"], "paused")
+            self.assertEqual(statuses["candidate-b"], "active")
+
     def test_workspace_status_disables_external_diff_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / "repo"
