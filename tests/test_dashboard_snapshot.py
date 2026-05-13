@@ -28,6 +28,31 @@ class DashboardSnapshotTests(unittest.TestCase):
         )
         return completed.stdout.strip()
 
+    def pre_pr_diff_text(self, root: Path, base_ref: str = "main") -> str:
+        base_diff = subprocess.run(
+            ["git", "-C", str(root), "diff", f"{base_ref}...HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        index_path, env, error = dashboard_snapshot.temporary_intent_to_add_env(root)
+        self.assertEqual(error, "")
+        self.assertIsNotNone(index_path)
+        self.assertIsNotNone(env)
+        try:
+            working_diff = subprocess.run(
+                ["git", "-C", str(root), "diff", "HEAD"],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            ).stdout.strip()
+        finally:
+            index_path.unlink(missing_ok=True)
+        if working_diff:
+            return f"{base_diff}\n{working_diff}"
+        return base_diff
+
     def test_run_text_replaces_invalid_utf8_output(self) -> None:
         code, stdout, stderr = dashboard_snapshot.run_text(
             [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'bad:\\xff\\n')"]
@@ -379,22 +404,9 @@ class DashboardSnapshotTests(unittest.TestCase):
             self.assertEqual(current["untracked_count"], 1)
             self.assertGreater(current["diff_bytes"], 0)
             self.assertEqual(len(current["diff_fingerprint"]), 64)
-            index_path, env, error = dashboard_snapshot.temporary_intent_to_add_env(root)
-            self.assertEqual(error, "")
-            self.assertIsNotNone(index_path)
-            self.assertIsNotNone(env)
-            try:
-                expected_diff = subprocess.run(
-                    ["git", "-C", str(root), "diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD"],
-                    check=True,
-                    capture_output=True,
-                    env=env,
-                ).stdout
-            finally:
-                index_path.unlink(missing_ok=True)
-            expected_snapshot_diff = b"\n" + expected_diff
-            self.assertEqual(current["diff_fingerprint"], hashlib.sha256(expected_snapshot_diff).hexdigest())
-            self.assertEqual(current["diff_bytes"], len(expected_snapshot_diff))
+            expected_diff = self.pre_pr_diff_text(root)
+            self.assertEqual(current["diff_fingerprint"], hashlib.sha256(expected_diff.encode("utf-8")).hexdigest())
+            self.assertEqual(current["diff_bytes"], len(expected_diff.encode("utf-8")))
             self.assertTrue(current["diff_changed_since_last_run"])
             self.assertTrue(payload["workspace"]["eligibility"]["review_recommended"])
             self.assertEqual(payload["workspace"]["specbackfill"]["db_items"], 1)
@@ -423,6 +435,67 @@ class DashboardSnapshotTests(unittest.TestCase):
             self.assertEqual(len(current["diff_fingerprint"]), 64)
             self.assertTrue(payload["workspace"]["eligibility"]["review_recommended"])
             self.assertNotIn("UNTRACKED_SECRET_BODY", json.dumps(payload))
+
+    def test_workspace_status_matches_last_run_pipeline_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-b", "main", str(root)], check=True, capture_output=True, text=True)
+            (root / "app.py").write_text("print('base')\n", encoding="utf-8")
+            self.git(root, "add", "app.py")
+            self.git(root, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "initial")
+            self.git(root, "checkout", "-b", "feature/status")
+            head_sha = self.git(root, "rev-parse", "HEAD")
+            (root / "app.py").write_text("print('changed')\n", encoding="utf-8")
+            expected_diff = self.pre_pr_diff_text(root)
+            fingerprint = hashlib.sha256(expected_diff.encode("utf-8")).hexdigest()
+            db_path = Path(tmpdir) / "review.db"
+            with sqlite3.connect(db_path) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE review_run_summary (
+                        id INTEGER PRIMARY KEY,
+                        created_at TEXT,
+                        repo TEXT,
+                        head_ref TEXT,
+                        head_sha TEXT,
+                        diff_fingerprint TEXT,
+                        diff_bytes INTEGER,
+                        changed_files INTEGER,
+                        findings_count INTEGER,
+                        watch_items_count INTEGER,
+                        elapsed_seconds REAL
+                    );
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO review_run_summary (
+                        id,
+                        created_at,
+                        repo,
+                        head_ref,
+                        head_sha,
+                        diff_fingerprint,
+                        diff_bytes,
+                        changed_files,
+                        findings_count,
+                        watch_items_count,
+                        elapsed_seconds
+                    ) VALUES (1, '2026-05-01 00:00:00', 'owner/repo', 'feature/status', ?, ?, ?, 1, 0, 0, 1.0)
+                    """,
+                    (head_sha, fingerprint, len(expected_diff.encode("utf-8"))),
+                )
+
+            payload = dashboard_snapshot.dashboard_snapshot(
+                self.make_args(db_path, repo="owner/repo", workspace=str(root))
+            )
+
+            current = payload["workspace"]["current"]
+            self.assertEqual(current["diff_fingerprint"], fingerprint)
+            self.assertFalse(current["diff_changed_since_last_run"])
+            self.assertFalse(payload["workspace"]["eligibility"]["review_recommended"])
+            self.assertEqual(payload["workspace"]["eligibility"]["status"], "up_to_date")
 
 
 if __name__ == "__main__":

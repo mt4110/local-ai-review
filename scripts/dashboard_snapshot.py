@@ -15,7 +15,6 @@ import hashlib
 import json
 import os
 import re
-import selectors
 import shlex
 import shutil
 import sqlite3
@@ -130,66 +129,6 @@ def git_text(
     return run_text(["git", "-C", str(root), *args], timeout=timeout, env=env or git_environment())
 
 
-def git_update_digest(
-    root: Path,
-    *args: str,
-    hasher: Any,
-    prefix_separator: bool,
-    timeout: float = 12.0,
-    env: dict[str, str] | None = None,
-) -> tuple[int, int, bool, str]:
-    try:
-        process = subprocess.Popen(
-            ["git", "-C", str(root), *args],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env or git_environment(),
-        )
-    except OSError as exc:
-        return 124, 0, False, str(exc)
-    assert process.stdout is not None
-    assert process.stderr is not None
-    total = 0
-    emitted = False
-    deadline = time.monotonic() + timeout
-    selector = selectors.DefaultSelector()
-    stderr_chunks: list[bytes] = []
-    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
-    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
-    try:
-        while selector.get_map():
-            if time.monotonic() > deadline:
-                process.kill()
-                process.communicate()
-                return 124, 0, False, "git diff timed out"
-            events = selector.select(timeout=max(0.1, deadline - time.monotonic()))
-            for key, _mask in events:
-                chunk = os.read(key.fileobj.fileno(), 1024 * 64)
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                if key.data == "stdout":
-                    if not emitted and prefix_separator:
-                        hasher.update(b"\n")
-                        total += 1
-                    hasher.update(chunk)
-                    total += len(chunk)
-                    emitted = True
-                else:
-                    stderr_chunks.append(chunk)
-        process.wait(timeout=max(0.1, deadline - time.monotonic()))
-    except (OSError, subprocess.TimeoutExpired):
-        process.kill()
-        process.communicate()
-        return 124, 0, False, "git diff timed out"
-    finally:
-        selector.close()
-        process.stdout.close()
-        process.stderr.close()
-    stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
-    return process.returncode or 0, total, emitted, stderr
-
-
 def copy_git_index(root: Path, destination: Path) -> str:
     code, stdout, stderr = git_text(root, "rev-parse", "--git-path", "index")
     if code != 0 or not stdout:
@@ -300,47 +239,36 @@ def upstream_ahead_behind(root: Path) -> tuple[str, int, int]:
     return upstream, ahead, behind
 
 
-def diff_command_sets(base_ref: str) -> list[list[str]]:
-    commands: list[list[str]] = []
-    if base_ref:
-        commands.append(["diff", "--no-ext-diff", "--no-textconv", "--binary", f"{base_ref}...HEAD"])
-    commands.append(["diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD"])
-    return commands
-
-
 def current_diff_digest(root: Path, base_ref: str) -> tuple[str, int, str]:
-    hasher = hashlib.sha256()
-    total = 0
     errors: list[str] = []
-    commands = diff_command_sets(base_ref)
+    diff_text = ""
+    if base_ref:
+        code, stdout, stderr = git_text(root, "diff", f"{base_ref}...HEAD", timeout=12.0)
+        if code != 0:
+            errors.append(stderr or "git diff failed")
+        else:
+            diff_text = stdout.strip()
     index_path: Path | None = None
     working_tree_env: dict[str, str] | None = None
-    if commands:
-        index_path, working_tree_env, index_error = temporary_intent_to_add_env(root)
-        if index_error:
-            errors.append(index_error)
+    index_path, working_tree_env, index_error = temporary_intent_to_add_env(root)
+    if index_error:
+        errors.append(index_error)
     try:
-        for index, args in enumerate(commands):
-            env = working_tree_env if args[-1] == "HEAD" and working_tree_env is not None else None
-            code, byte_count, emitted, stderr = git_update_digest(
-                root,
-                *args,
-                hasher=hasher,
-                prefix_separator=index > 0,
-                env=env,
-            )
+        if working_tree_env is not None:
+            code, stdout, stderr = git_text(root, "diff", "HEAD", timeout=12.0, env=working_tree_env)
             if code != 0:
                 errors.append(stderr or "git diff failed")
-                continue
-            if not emitted:
-                continue
-            total += byte_count
+            else:
+                working_tree_text = stdout.strip()
+                if working_tree_text:
+                    diff_text = f"{diff_text}\n{working_tree_text}"
     finally:
         if index_path is not None:
             index_path.unlink(missing_ok=True)
     if errors:
         return "", 0, "; ".join(errors)
-    return (hasher.hexdigest() if total else ""), total, ""
+    diff_bytes = len(diff_text.encode("utf-8"))
+    return (hashlib.sha256(diff_text.encode("utf-8")).hexdigest() if diff_text else ""), diff_bytes, ""
 
 
 def current_changed_files(root: Path, base_ref: str) -> tuple[list[str], str]:
