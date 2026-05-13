@@ -210,6 +210,9 @@ class DashboardSnapshotTests(unittest.TestCase):
                     ],
                 )
                 connection.execute(
+                    "INSERT INTO item_links (review_item_id, external_item_id, relation) VALUES (100, 3, 'covered')"
+                )
+                connection.execute(
                     """
                     INSERT INTO github_backfill_queue (
                         repo,
@@ -256,8 +259,10 @@ class DashboardSnapshotTests(unittest.TestCase):
             self.assertEqual(payload["runs"]["total"], 1)
             self.assertEqual(payload["runs"]["unscored"], 1)
             self.assertEqual(payload["external"]["total"], 3)
-            self.assertEqual(payload["learning_readiness"]["training_ready_external_examples"], 2)
+            self.assertEqual(payload["external"]["linked"], 1)
+            self.assertEqual(payload["learning_readiness"]["training_ready_external_examples"], 1)
             self.assertEqual(payload["learning_readiness"]["human_gate_external_examples"], 1)
+            self.assertEqual(payload["learning_readiness"]["covered_by_local"], 1)
             self.assertEqual(payload["backlog"]["backfill_pending"], 1)
             self.assertEqual(payload["calibrations"]["active"], 1)
             self.assertNotIn("instruction", payload["calibrations"]["recent"][0])

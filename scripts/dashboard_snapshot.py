@@ -223,12 +223,12 @@ def latest_external_verdict_stats(
         linked = int(row["linked"] or 0)
         count = int(row["total"] or 0)
         reason_counts[f"{verdict}/{reason}"] = reason_counts.get(f"{verdict}/{reason}", 0) + count
-        if verdict == "missed_by_local" and reason in VALID_EXTERNAL_REASONS:
+        if verdict == "covered_by_local" or linked:
+            label_counts["covered_by_local"] += count
+        elif verdict == "missed_by_local" and reason in VALID_EXTERNAL_REASONS:
             label_counts["training_ready_external_examples"] += count
         elif verdict == "missed_by_local":
             label_counts["human_gate_external_examples"] += count
-        elif verdict == "covered_by_local" or linked:
-            label_counts["covered_by_local"] += count
         elif verdict == "teacher_false_positive":
             label_counts["teacher_false_positive"] += count
         elif verdict == "needs_human_review":
