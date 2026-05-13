@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -16,6 +19,24 @@ import dashboard_snapshot  # noqa: E402
 
 
 class DashboardSnapshotTests(unittest.TestCase):
+    def git(self, root: Path, *args: str) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return completed.stdout.strip()
+
+    def test_run_text_replaces_invalid_utf8_output(self) -> None:
+        code, stdout, stderr = dashboard_snapshot.run_text(
+            [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'bad:\\xff\\n')"]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout, "bad:\ufffd")
+        self.assertEqual(stderr, "")
+
     def make_args(self, db_path: Path, *, repo: str = "owner/repo", workspace: str = "") -> argparse.Namespace:
         return argparse.Namespace(
             db=str(db_path),
@@ -270,6 +291,106 @@ class DashboardSnapshotTests(unittest.TestCase):
             self.assertIn("scoring-pump", payload["next_commands"][0]["command"])
             self.assertFalse(payload["policy"]["raw_bodies_included"])
             self.assertFalse(payload["policy"]["raw_diffs_included"])
+
+    def test_workspace_status_hashes_diff_without_exposing_body_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-b", "main", str(root)], check=True, capture_output=True, text=True)
+            (root / "app.py").write_text("print('base')\n", encoding="utf-8")
+            self.git(root, "add", "app.py")
+            self.git(root, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "initial")
+            self.git(root, "checkout", "-b", "feature/status")
+            head_sha = self.git(root, "rev-parse", "HEAD")
+            (root / "app.py").write_text("print('SECRET_DIFF_BODY')\n", encoding="utf-8")
+            (root / "notes.txt").write_text("untracked private note\n", encoding="utf-8")
+
+            db_path = Path(tmpdir) / "review.db"
+            with sqlite3.connect(db_path) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE review_run_summary (
+                        id INTEGER PRIMARY KEY,
+                        created_at TEXT,
+                        repo TEXT,
+                        pr_number INTEGER,
+                        head_ref TEXT,
+                        head_sha TEXT,
+                        diff_fingerprint TEXT,
+                        diff_bytes INTEGER,
+                        changed_files INTEGER,
+                        findings_count INTEGER,
+                        watch_items_count INTEGER,
+                        elapsed_seconds REAL,
+                        useful_findings_fixed INTEGER,
+                        false_positives INTEGER,
+                        unclear_findings INTEGER
+                    );
+                    CREATE TABLE review_runs (
+                        id INTEGER PRIMARY KEY,
+                        repo TEXT NOT NULL
+                    );
+                    CREATE TABLE review_items (
+                        id INTEGER PRIMARY KEY,
+                        run_id INTEGER NOT NULL,
+                        source TEXT NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO review_run_summary (
+                        id,
+                        created_at,
+                        repo,
+                        pr_number,
+                        head_ref,
+                        head_sha,
+                        diff_fingerprint,
+                        diff_bytes,
+                        changed_files,
+                        findings_count,
+                        watch_items_count,
+                        elapsed_seconds,
+                        useful_findings_fixed,
+                        false_positives,
+                        unclear_findings
+                    ) VALUES (1, '2026-05-01 00:00:00', 'owner/repo', 0, 'feature/status', ?, 'old-fingerprint', 10, 1, 0, 0, 1.0, 0, 0, 0)
+                    """,
+                    (head_sha,),
+                )
+                connection.execute("INSERT INTO review_runs (id, repo) VALUES (1, 'owner/repo')")
+                connection.execute(
+                    "INSERT INTO review_items (run_id, source, created_at) VALUES (1, 'specbackfill', '2026-05-01 00:00:00')"
+                )
+
+            payload = dashboard_snapshot.dashboard_snapshot(
+                self.make_args(db_path, repo="owner/repo", workspace=str(root))
+            )
+            current = payload["workspace"]["current"]
+
+            self.assertTrue(current["configured"])
+            self.assertTrue(current["is_git_repo"])
+            self.assertTrue(current["dirty"])
+            self.assertEqual(current["repo"], "owner/repo")
+            self.assertEqual(current["branch"], "feature/status")
+            self.assertEqual(current["changed_files"], 1)
+            self.assertEqual(current["untracked_count"], 1)
+            self.assertGreater(current["diff_bytes"], 0)
+            self.assertEqual(len(current["diff_fingerprint"]), 64)
+            expected_diff = subprocess.run(
+                ["git", "-C", str(root), "diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD"],
+                check=True,
+                capture_output=True,
+            ).stdout
+            expected_snapshot_diff = b"\n" + expected_diff
+            self.assertEqual(current["diff_fingerprint"], hashlib.sha256(expected_snapshot_diff).hexdigest())
+            self.assertEqual(current["diff_bytes"], len(expected_snapshot_diff))
+            self.assertTrue(current["diff_changed_since_last_run"])
+            self.assertTrue(payload["workspace"]["eligibility"]["review_recommended"])
+            self.assertEqual(payload["workspace"]["specbackfill"]["db_items"], 1)
+            self.assertNotIn("SECRET_DIFF_BODY", json.dumps(payload))
 
 
 if __name__ == "__main__":
