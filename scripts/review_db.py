@@ -188,6 +188,29 @@ def optional_int(value: Any) -> int | None:
         return None
 
 
+def row_mapping(
+    row: sqlite3.Row | tuple[Any, ...] | None,
+    description: tuple[tuple[Any, ...], ...] | None,
+) -> dict[str, Any]:
+    if row is None:
+        return {}
+    if isinstance(row, sqlite3.Row):
+        return {key: row[key] for key in row.keys()}
+    return {
+        str(column[0]): row[index]
+        for index, column in enumerate(description or ())
+    }
+
+
+def fetchone_mapping(cursor: sqlite3.Cursor) -> dict[str, Any]:
+    return row_mapping(cursor.fetchone(), cursor.description)
+
+
+def fetchall_mappings(cursor: sqlite3.Cursor) -> list[dict[str, Any]]:
+    description = cursor.description
+    return [row_mapping(row, description) for row in cursor.fetchall()]
+
+
 def review_run_counts(
     connection: sqlite3.Connection,
     *,
@@ -199,21 +222,23 @@ def review_run_counts(
     if repo:
         where = f"WHERE repo = {dialect.placeholder()}"
         params.append(repo)
-    row = connection.execute(
-        f"""
-        SELECT
-            COUNT(*) AS total,
-            SUM(CASE WHEN useful_findings_fixed IS NULL THEN 1 ELSE 0 END) AS unscored,
-            SUM(CASE WHEN findings_count = 0 THEN 1 ELSE 0 END) AS zero_finding_runs,
-            SUM(findings_count) AS findings,
-            SUM(watch_items_count) AS watch_items,
-            SUM(diff_bytes) AS diff_bytes,
-            AVG(elapsed_seconds) AS average_elapsed_seconds
-        FROM review_run_summary
-        {where}
-        """,
-        params,
-    ).fetchone()
+    row = fetchone_mapping(
+        connection.execute(
+            f"""
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN useful_findings_fixed IS NULL THEN 1 ELSE 0 END) AS unscored,
+                SUM(CASE WHEN findings_count = 0 THEN 1 ELSE 0 END) AS zero_finding_runs,
+                SUM(findings_count) AS findings,
+                SUM(watch_items_count) AS watch_items,
+                SUM(diff_bytes) AS diff_bytes,
+                AVG(elapsed_seconds) AS average_elapsed_seconds
+            FROM review_run_summary
+            {where}
+            """,
+            params,
+        )
+    )
     return {
         "total": int(row["total"] or 0),
         "unscored": int(row["unscored"] or 0),
@@ -237,40 +262,42 @@ def external_link_health_counts(
     if repo:
         where = f"WHERE external_items.repo = {dialect.placeholder()}"
         params.append(repo)
-    rows = connection.execute(
-        f"""
-        SELECT
-            external_items.source,
-            COALESCE(NULLIF(verdicts.verdict, ''), 'unscored') AS verdict,
-            COALESCE(NULLIF(verdicts.reason, ''), '(none)') AS reason,
-            COUNT(*) AS total,
-            SUM(CASE WHEN linked_external.external_item_id IS NULL THEN 0 ELSE 1 END) AS linked
-        FROM external_items
-        LEFT JOIN (
-            SELECT external_item_id
-            FROM item_links
-            GROUP BY external_item_id
-        ) AS linked_external
-        ON linked_external.external_item_id = external_items.id
-        LEFT JOIN (
-            SELECT item_verdicts.*
-            FROM item_verdicts
-            JOIN (
-                SELECT target_kind, target_id, MAX(id) AS id
+    rows = fetchall_mappings(
+        connection.execute(
+            f"""
+            SELECT
+                external_items.source,
+                COALESCE(NULLIF(verdicts.verdict, ''), 'unscored') AS verdict,
+                COALESCE(NULLIF(verdicts.reason, ''), '(none)') AS reason,
+                COUNT(*) AS total,
+                SUM(CASE WHEN linked_external.external_item_id IS NULL THEN 0 ELSE 1 END) AS linked
+            FROM external_items
+            LEFT JOIN (
+                SELECT external_item_id
+                FROM item_links
+                GROUP BY external_item_id
+            ) AS linked_external
+            ON linked_external.external_item_id = external_items.id
+            LEFT JOIN (
+                SELECT item_verdicts.*
                 FROM item_verdicts
-                GROUP BY target_kind, target_id
-            ) AS latest
-            ON latest.id = item_verdicts.id
-        ) AS verdicts
-        ON verdicts.target_kind = 'external_item'
-        AND verdicts.target_id = external_items.id
-        {where}
-        GROUP BY external_items.source, verdict, reason
-        ORDER BY total DESC, external_items.source, verdict, reason
-        LIMIT {dialect.placeholder()}
-        """,
-        [*params, limit],
-    ).fetchall()
+                JOIN (
+                    SELECT target_kind, target_id, MAX(id) AS id
+                    FROM item_verdicts
+                    GROUP BY target_kind, target_id
+                ) AS latest
+                ON latest.id = item_verdicts.id
+            ) AS verdicts
+            ON verdicts.target_kind = 'external_item'
+            AND verdicts.target_id = external_items.id
+            {where}
+            GROUP BY external_items.source, verdict, reason
+            ORDER BY total DESC, external_items.source, verdict, reason
+            LIMIT {dialect.placeholder()}
+            """,
+            [*params, limit],
+        )
+    )
     return [
         {
             "source": str(row["source"] or ""),
@@ -344,21 +371,23 @@ def backfill_queue_counts(
     if repo:
         where = f"WHERE repo = {dialect.placeholder()}"
         params.append(repo)
-    rows = connection.execute(
-        f"""
-        SELECT
-            source_kind,
-            state,
-            COALESCE(NULLIF(skip_reason, ''), state) AS reason,
-            COUNT(*) AS count,
-            SUM(actionable_external_comments) AS signal
-        FROM github_backfill_queue
-        {where}
-        GROUP BY source_kind, state, reason
-        ORDER BY count DESC, source_kind, state, reason
-        """,
-        params,
-    ).fetchall()
+    rows = fetchall_mappings(
+        connection.execute(
+            f"""
+            SELECT
+                source_kind,
+                state,
+                COALESCE(NULLIF(skip_reason, ''), state) AS reason,
+                COUNT(*) AS count,
+                SUM(actionable_external_comments) AS signal
+            FROM github_backfill_queue
+            {where}
+            GROUP BY source_kind, state, reason
+            ORDER BY count DESC, source_kind, state, reason
+            """,
+            params,
+        )
+    )
     by_state: dict[str, int] = {}
     by_source_state: dict[str, int] = {}
     signal_total = 0
@@ -402,17 +431,19 @@ def active_calibration_counts(
     if repo:
         repo_filter = f"AND (scope_repo = '' OR scope_repo = {dialect.placeholder()})"
         params.append(repo)
-    rows = connection.execute(
-        f"""
-        SELECT *
-        FROM learning_calibrations
-        WHERE status = 'active'
-          {repo_filter}
-        ORDER BY updated_at DESC, id DESC
-        LIMIT {dialect.placeholder()}
-        """,
-        [*params, limit],
-    ).fetchall()
+    rows = fetchall_mappings(
+        connection.execute(
+            f"""
+            SELECT *
+            FROM learning_calibrations
+            WHERE status = 'active'
+              {repo_filter}
+            ORDER BY updated_at DESC, id DESC
+            LIMIT {dialect.placeholder()}
+            """,
+            [*params, limit],
+        )
+    )
     total = int(
         connection.execute(
             f"""
@@ -454,16 +485,18 @@ def recent_review_runs(
     if repo:
         where = f"WHERE repo = {dialect.placeholder()}"
         params.append(repo)
-    rows = connection.execute(
-        f"""
-        SELECT *
-        FROM review_run_summary
-        {where}
-        ORDER BY id DESC
-        LIMIT {dialect.placeholder()}
-        """,
-        [*params, limit],
-    ).fetchall()
+    rows = fetchall_mappings(
+        connection.execute(
+            f"""
+            SELECT *
+            FROM review_run_summary
+            {where}
+            ORDER BY id DESC
+            LIMIT {dialect.placeholder()}
+            """,
+            [*params, limit],
+        )
+    )
     return [
         {
             "run_id": int(row["id"]),
@@ -497,34 +530,36 @@ def recent_item_verdicts(
     if repo:
         repo_filter = f"AND (runs.repo = {dialect.placeholder()} OR external_items.repo = {dialect.placeholder()})"
         params.extend([repo, repo])
-    rows = connection.execute(
-        f"""
-        SELECT
-            verdicts.id,
-            verdicts.target_kind,
-            verdicts.target_id,
-            verdicts.verdict,
-            COALESCE(NULLIF(verdicts.reason, ''), '(none)') AS reason,
-            verdicts.scorer,
-            verdicts.scored_at,
-            COALESCE(runs.repo, external_items.repo, '') AS repo,
-            COALESCE(items.path, external_items.path, '') AS path
-        FROM item_verdicts AS verdicts
-        LEFT JOIN review_items AS items
-        ON items.id = verdicts.target_id
-        AND verdicts.target_kind = 'review_item'
-        LEFT JOIN review_runs AS runs
-        ON runs.id = items.run_id
-        LEFT JOIN external_items
-        ON external_items.id = verdicts.target_id
-        AND verdicts.target_kind = 'external_item'
-        WHERE 1 = 1
-          {repo_filter}
-        ORDER BY verdicts.id DESC
-        LIMIT {dialect.placeholder()}
-        """,
-        [*params, limit],
-    ).fetchall()
+    rows = fetchall_mappings(
+        connection.execute(
+            f"""
+            SELECT
+                verdicts.id,
+                verdicts.target_kind,
+                verdicts.target_id,
+                verdicts.verdict,
+                COALESCE(NULLIF(verdicts.reason, ''), '(none)') AS reason,
+                verdicts.scorer,
+                verdicts.scored_at,
+                COALESCE(runs.repo, external_items.repo, '') AS repo,
+                COALESCE(items.path, external_items.path, '') AS path
+            FROM item_verdicts AS verdicts
+            LEFT JOIN review_items AS items
+            ON items.id = verdicts.target_id
+            AND verdicts.target_kind = 'review_item'
+            LEFT JOIN review_runs AS runs
+            ON runs.id = items.run_id
+            LEFT JOIN external_items
+            ON external_items.id = verdicts.target_id
+            AND verdicts.target_kind = 'external_item'
+            WHERE 1 = 1
+              {repo_filter}
+            ORDER BY verdicts.id DESC
+            LIMIT {dialect.placeholder()}
+            """,
+            [*params, limit],
+        )
+    )
     records: list[dict[str, Any]] = []
     for row in rows:
         path = str(row["path"] or "")

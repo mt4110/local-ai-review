@@ -342,6 +342,9 @@ class StampAssistRuleResult:
     caution: str = ""
 
 
+StampAssistBucketCache = dict[tuple[str, str, str], dict[str, Any]]
+
+
 @dataclass(frozen=True)
 class CalibrationResult:
     calibration_run_id: str
@@ -6422,6 +6425,7 @@ def stamp_assist_payload_for_external_item(
     *,
     candidate: LearningUpdateCandidate | None = None,
     min_link_score: float,
+    bucket_cache: StampAssistBucketCache | None = None,
 ) -> dict[str, Any]:
     row = stamp_assist_external_row(connection, external_item_id)
     diagnostic = best_link_diagnostic(connection, row)
@@ -6438,12 +6442,18 @@ def stamp_assist_payload_for_external_item(
     source = str(row["source"] or "")
     path = str(row["path"] or "")
     path_class = review_path_class(path)
-    bucket = stamp_assist_bucket_counts(
-        connection,
-        repo=repo,
-        source=source,
-        path_class=path_class,
-    )
+    bucket_key = (repo, source, path_class)
+    if bucket_cache is not None and bucket_key in bucket_cache:
+        bucket = bucket_cache[bucket_key]
+    else:
+        bucket = stamp_assist_bucket_counts(
+            connection,
+            repo=repo,
+            source=source,
+            path_class=path_class,
+        )
+        if bucket_cache is not None:
+            bucket_cache[bucket_key] = bucket
     state = {
         "row": row,
         "candidate": candidate,
@@ -6517,6 +6527,7 @@ def stamp_assist_for_learning_sample(
     sample: dict[str, Any],
     *,
     min_link_score: float,
+    bucket_cache: StampAssistBucketCache | None = None,
 ) -> dict[str, Any] | None:
     if sample.get("sample_kind") != "external_item":
         return None
@@ -6525,6 +6536,7 @@ def stamp_assist_for_learning_sample(
         int(sample["sample_id"]),
         candidate=candidate,
         min_link_score=min_link_score,
+        bucket_cache=bucket_cache,
     )
 
 
@@ -6535,6 +6547,7 @@ def add_stamp_assist_to_gap_records(
     min_link_score: float,
 ) -> list[dict[str, Any]]:
     assisted: list[dict[str, Any]] = []
+    bucket_cache: StampAssistBucketCache = {}
     for record in records:
         assist = None
         if record.get("requires_human_gate"):
@@ -6542,6 +6555,7 @@ def add_stamp_assist_to_gap_records(
                 connection,
                 int(record["external_item_id"]),
                 min_link_score=min_link_score,
+                bucket_cache=bucket_cache,
             )
         assisted.append(
             {
@@ -6778,6 +6792,7 @@ def learning_pump_external_inbox(
     min_link_score: float,
 ) -> list[dict[str, Any]]:
     inbox: list[dict[str, Any]] = []
+    bucket_cache: StampAssistBucketCache = {}
     for candidate in candidates:
         if not candidate.signal_kind.startswith("external_"):
             continue
@@ -6794,6 +6809,7 @@ def learning_pump_external_inbox(
                 candidate,
                 sample,
                 min_link_score=min_link_score,
+                bucket_cache=bucket_cache,
             )
             inbox.append(
                 {
@@ -16815,6 +16831,7 @@ def review_external_learning_candidate(
         return 0, False
     saved = 0
     quit_requested = False
+    bucket_cache: StampAssistBucketCache = {}
     for index, sample in enumerate(samples, start=1):
         assist = None
         if not getattr(args, "no_assist", False):
@@ -16823,6 +16840,7 @@ def review_external_learning_candidate(
                 candidate,
                 sample,
                 min_link_score=args.assist_min_link_score,
+                bucket_cache=bucket_cache,
             )
         print_learning_review_sample(
             sample,
@@ -16852,6 +16870,7 @@ def review_external_learning_candidate(
         )
         connection.commit()
         if inserted:
+            bucket_cache.clear()
             saved += 1
             print(f"OK: id={sample['sample_id']} -> {verdict}/{reason}")
         else:
@@ -16935,6 +16954,7 @@ def review_learning_gap_stamps(
     saved = 0
     reviewed = 0
     quit_requested = False
+    bucket_cache: StampAssistBucketCache = {}
     for index, record in enumerate(records, start=1):
         assist = None
         if not getattr(args, "no_assist", False):
@@ -16942,6 +16962,7 @@ def review_learning_gap_stamps(
                 connection,
                 int(record["external_item_id"]),
                 min_link_score=args.assist_min_link_score,
+                bucket_cache=bucket_cache,
             )
         print_learning_review_gap_record(
             record,
@@ -16976,6 +16997,7 @@ def review_learning_gap_stamps(
         )
         connection.commit()
         if inserted:
+            bucket_cache.clear()
             saved += 1
             print(f"OK: id={record['external_item_id']} -> {verdict}/{reason}")
         else:

@@ -86,7 +86,6 @@ class ReviewDbAggregateTests(unittest.TestCase):
 
     def test_review_run_counts_support_repo_filter(self) -> None:
         with sqlite3.connect(":memory:") as connection:
-            connection.row_factory = sqlite3.Row
             connection.execute(
                 """
                 CREATE TABLE review_run_summary (
@@ -133,7 +132,6 @@ class ReviewDbAggregateTests(unittest.TestCase):
 
     def test_external_item_counts_return_link_and_latest_verdict_mix(self) -> None:
         with sqlite3.connect(":memory:") as connection:
-            connection.row_factory = sqlite3.Row
             connection.executescript(
                 """
                 CREATE TABLE external_items (
@@ -207,7 +205,6 @@ class ReviewDbAggregateTests(unittest.TestCase):
 
     def test_backfill_queue_counts_group_records_and_totals(self) -> None:
         with sqlite3.connect(":memory:") as connection:
-            connection.row_factory = sqlite3.Row
             connection.execute(
                 """
                 CREATE TABLE github_backfill_queue (
@@ -266,7 +263,6 @@ class ReviewDbAggregateTests(unittest.TestCase):
 
     def test_active_calibration_counts_include_global_and_repo_scope(self) -> None:
         with sqlite3.connect(":memory:") as connection:
-            connection.row_factory = sqlite3.Row
             connection.execute(
                 """
                 CREATE TABLE learning_calibrations (
@@ -324,7 +320,6 @@ class ReviewDbAggregateTests(unittest.TestCase):
 
     def test_recent_review_runs_return_dashboard_rows(self) -> None:
         with sqlite3.connect(":memory:") as connection:
-            connection.row_factory = sqlite3.Row
             connection.execute(
                 """
                 CREATE TABLE review_run_summary (
@@ -393,7 +388,6 @@ class ReviewDbAggregateTests(unittest.TestCase):
 
     def test_recent_item_verdicts_join_local_and_external_targets(self) -> None:
         with sqlite3.connect(":memory:") as connection:
-            connection.row_factory = sqlite3.Row
             connection.executescript(
                 """
                 CREATE TABLE review_runs (
