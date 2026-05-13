@@ -1,4 +1,4 @@
-.PHONY: install-local llreview update-local precision-review precision-review-static precision-review-self-test pre-pr-review pre-pr-review-static review-db-init review-db-stats review-db-up review-db-web review-db-down review-db-score review-db-import-github-reviews
+.PHONY: install-local llreview update-local precision-review precision-review-static precision-review-self-test pre-pr-review pre-pr-review-static review-db-init review-db-stats review-db-up review-db-web review-db-down review-db-score review-db-import-github-reviews dashboard-dev
 
 REPO ?=
 PR ?=
@@ -8,6 +8,7 @@ REVIEW_DB ?= out/review-history/local-ai-review.db
 REVIEW_REPORT ?= out/reviews/precision-review.md
 INCLUDE_WORKING_TREE ?= 1
 SQLITE_BROWSER_PORT ?= 8003
+DASHBOARD_PORT ?= 3069
 RUN ?=
 USEFUL ?=
 FALSE_POSITIVES ?=
@@ -169,3 +170,6 @@ review-db-import-github-reviews: review-db-init
 	./llreview import-github-reviews "$(PR)" \
 		--repo "$(REPO)" \
 		--db "$(REVIEW_DB)"
+
+dashboard-dev:
+	cd dashboard && LLREVIEW_DASHBOARD_PORT="$(DASHBOARD_PORT)" LLREVIEW_DASHBOARD_DB="$(REVIEW_DB)" npm run dev
