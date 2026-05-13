@@ -80,26 +80,6 @@ def shell_command(parts: list[Any]) -> str:
     return shlex.join(str(part) for part in parts if str(part) != "")
 
 
-def path_class(path: str) -> str:
-    lowered = path.lower()
-    name = Path(lowered).name
-    if lowered.startswith((".github/", "ops/", "infra/", "deploy/")):
-        return "ops"
-    if lowered.startswith(("docs/", ".private_docs/")) or name in {"readme.md", "readme_en.md"}:
-        return "docs"
-    if "/test" in lowered or lowered.startswith("test") or name.startswith("test_") or name.endswith("_test.py"):
-        return "test"
-    if lowered.endswith((".yml", ".yaml", ".toml", ".ini", ".env", ".json")):
-        return "config"
-    if "schema" in lowered or "migration" in lowered or lowered.endswith(".sql"):
-        return "schema"
-    if "auth" in lowered or "token" in lowered or "secret" in lowered:
-        return "auth"
-    if "api" in lowered or "route" in lowered:
-        return "api"
-    return "other"
-
-
 def empty_run_counts() -> dict[str, Any]:
     return {
         "total": 0,
@@ -194,29 +174,37 @@ def latest_external_verdict_stats(
     rows = connection.execute(
         f"""
         SELECT
-            COALESCE(NULLIF(verdicts.verdict, ''), 'unscored') AS verdict,
-            COALESCE(NULLIF(verdicts.reason, ''), '(none)') AS reason,
-            CASE WHEN linked.external_item_id IS NULL THEN 0 ELSE 1 END AS linked
-        FROM external_items
-        LEFT JOIN (
-            SELECT external_item_id
-            FROM item_links
-            GROUP BY external_item_id
-        ) AS linked
-        ON linked.external_item_id = external_items.id
-        LEFT JOIN (
-            SELECT item_verdicts.*
-            FROM item_verdicts
-            JOIN (
-                SELECT target_kind, target_id, MAX(id) AS id
+            verdict,
+            reason,
+            linked,
+            COUNT(*) AS total
+        FROM (
+            SELECT
+                COALESCE(NULLIF(verdicts.verdict, ''), 'unscored') AS verdict,
+                COALESCE(NULLIF(verdicts.reason, ''), '(none)') AS reason,
+                CASE WHEN linked.external_item_id IS NULL THEN 0 ELSE 1 END AS linked
+            FROM external_items
+            LEFT JOIN (
+                SELECT external_item_id
+                FROM item_links
+                GROUP BY external_item_id
+            ) AS linked
+            ON linked.external_item_id = external_items.id
+            LEFT JOIN (
+                SELECT item_verdicts.*
                 FROM item_verdicts
-                GROUP BY target_kind, target_id
-            ) AS latest
-            ON latest.id = item_verdicts.id
-        ) AS verdicts
-        ON verdicts.target_kind = 'external_item'
-        AND verdicts.target_id = external_items.id
-        {where}
+                JOIN (
+                    SELECT target_kind, target_id, MAX(id) AS id
+                    FROM item_verdicts
+                    GROUP BY target_kind, target_id
+                ) AS latest
+                ON latest.id = item_verdicts.id
+            ) AS verdicts
+            ON verdicts.target_kind = 'external_item'
+            AND verdicts.target_id = external_items.id
+            {where}
+        ) AS external_labels
+        GROUP BY verdict, reason, linked
         """,
         params,
     ).fetchall()
@@ -233,21 +221,22 @@ def latest_external_verdict_stats(
         verdict = str(row["verdict"] or "unscored")
         reason = str(row["reason"] or "(none)")
         linked = int(row["linked"] or 0)
-        reason_counts[f"{verdict}/{reason}"] = reason_counts.get(f"{verdict}/{reason}", 0) + 1
+        count = int(row["total"] or 0)
+        reason_counts[f"{verdict}/{reason}"] = reason_counts.get(f"{verdict}/{reason}", 0) + count
         if verdict == "missed_by_local" and reason in VALID_EXTERNAL_REASONS:
-            label_counts["training_ready_external_examples"] += 1
+            label_counts["training_ready_external_examples"] += count
         elif verdict == "missed_by_local":
-            label_counts["human_gate_external_examples"] += 1
+            label_counts["human_gate_external_examples"] += count
         elif verdict == "covered_by_local" or linked:
-            label_counts["covered_by_local"] += 1
+            label_counts["covered_by_local"] += count
         elif verdict == "teacher_false_positive":
-            label_counts["teacher_false_positive"] += 1
+            label_counts["teacher_false_positive"] += count
         elif verdict == "needs_human_review":
-            label_counts["needs_human_review"] += 1
-            label_counts["human_gate_external_examples"] += 1
+            label_counts["needs_human_review"] += count
+            label_counts["human_gate_external_examples"] += count
         elif verdict == "unscored":
-            label_counts["unlabeled_external_items"] += 1
-            label_counts["human_gate_external_examples"] += 1
+            label_counts["unlabeled_external_items"] += count
+            label_counts["human_gate_external_examples"] += count
     return {
         **label_counts,
         "reason_counts": dict(sorted(reason_counts.items(), key=lambda item: (-item[1], item[0]))[:12]),
@@ -518,7 +507,7 @@ def base_payload(args: argparse.Namespace, *, db_target: str) -> dict[str, Any]:
         "scope": {
             "repo": str(args.repo or "") or "global",
             "requested_workspace": str(Path(args.workspace).expanduser().resolve()) if args.workspace else "",
-            "source": "argument" if args.repo else "global",
+            "source": "argument" if args.repo or args.workspace else "global",
         },
     }
     payload.update(empty_snapshot_sections())
@@ -552,7 +541,7 @@ def dashboard_snapshot(args: argparse.Namespace) -> dict[str, Any]:
         }
     )
     saved_target = read_target_config(db_path)
-    if saved_target and not args.repo:
+    if saved_target and not args.repo and not args.workspace:
         payload["scope"] = {
             **payload["scope"],
             "repo": saved_target.get("repo") or "global",

@@ -16,11 +16,11 @@ import dashboard_snapshot  # noqa: E402
 
 
 class DashboardSnapshotTests(unittest.TestCase):
-    def make_args(self, db_path: Path, *, repo: str = "owner/repo") -> argparse.Namespace:
+    def make_args(self, db_path: Path, *, repo: str = "owner/repo", workspace: str = "") -> argparse.Namespace:
         return argparse.Namespace(
             db=str(db_path),
             repo=repo,
-            workspace="",
+            workspace=workspace,
             port=3069,
             limit=5,
             months=6,
@@ -63,6 +63,32 @@ class DashboardSnapshotTests(unittest.TestCase):
             self.assertEqual(payload["backfill_queue"]["total"], 0)
             self.assertEqual(payload["growth"], [])
             self.assertEqual(payload["next_commands"][0]["command"], "llreview status")
+
+    def test_workspace_argument_takes_precedence_over_saved_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "missing.db"
+            target_path = Path(tmpdir) / dashboard_snapshot.DEFAULT_TARGET_NAME
+            target_path.write_text(
+                """
+                {
+                    "project_dir": "/saved/workspace",
+                    "repo": "saved/repo",
+                    "output": "saved.db",
+                    "updated_at": "2026-05-01T00:00:00Z"
+                }
+                """,
+                encoding="utf-8",
+            )
+            explicit_workspace = "/explicit/workspace"
+
+            payload = dashboard_snapshot.dashboard_snapshot(
+                self.make_args(db_path, repo="", workspace=explicit_workspace)
+            )
+
+            self.assertEqual(payload["scope"]["source"], "argument")
+            self.assertEqual(payload["scope"]["repo"], "global")
+            self.assertEqual(payload["scope"]["requested_workspace"], str(Path(explicit_workspace).resolve()))
+            self.assertEqual(payload["workspace"]["saved_target"]["repo"], "saved/repo")
 
     def test_snapshot_uses_aggregate_rows_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -163,9 +189,10 @@ class DashboardSnapshotTests(unittest.TestCase):
                     [
                         (1, "owner/repo", "teacher_model", "src/app.py"),
                         (2, "owner/repo", "github", "docs/readme.md"),
+                        (3, "owner/repo", "teacher_model", "src/worker.py"),
                     ],
                 )
-                connection.execute(
+                connection.executemany(
                     """
                     INSERT INTO item_verdicts (
                         id,
@@ -175,8 +202,12 @@ class DashboardSnapshotTests(unittest.TestCase):
                         reason,
                         scorer,
                         scored_at
-                    ) VALUES (1, 'external_item', 1, 'missed_by_local', 'teacher_model_valid', 'me', '2026-05-02T00:00:00Z')
-                    """
+                    ) VALUES (?, 'external_item', ?, 'missed_by_local', 'teacher_model_valid', 'me', '2026-05-02T00:00:00Z')
+                    """,
+                    [
+                        (1, 1),
+                        (2, 3),
+                    ],
                 )
                 connection.execute(
                     """
@@ -224,7 +255,8 @@ class DashboardSnapshotTests(unittest.TestCase):
             self.assertTrue(payload["db"]["exists"])
             self.assertEqual(payload["runs"]["total"], 1)
             self.assertEqual(payload["runs"]["unscored"], 1)
-            self.assertEqual(payload["learning_readiness"]["training_ready_external_examples"], 1)
+            self.assertEqual(payload["external"]["total"], 3)
+            self.assertEqual(payload["learning_readiness"]["training_ready_external_examples"], 2)
             self.assertEqual(payload["learning_readiness"]["human_gate_external_examples"], 1)
             self.assertEqual(payload["backlog"]["backfill_pending"], 1)
             self.assertEqual(payload["calibrations"]["active"], 1)
