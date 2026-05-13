@@ -12,6 +12,7 @@ falls back to a pre-PR diff when no PR exists yet.
 from __future__ import annotations
 
 import argparse
+import csv
 import difflib
 import functools
 import hashlib
@@ -32,7 +33,24 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from review_db import (
+    SQLITE_DIALECT,
+    UnsupportedReviewDbBackendError,
+    active_calibration_counts,
+    backfill_queue_counts,
+    batched_values,
+    connect_review_db,
+    connect_review_db_readonly,
+    count_rows,
+    external_item_counts,
+    recent_item_verdicts,
+    recent_review_runs,
+    review_run_counts,
+    sqlite_db_path,
+    table_counts,
+)
 
 
 TOOL_ROOT = Path(__file__).resolve().parents[1]
@@ -55,10 +73,12 @@ DEFAULT_MATCHER_EXPLAIN_DIR = TOOL_ROOT / "out" / "review-history" / "matcher-ex
 DEFAULT_TRAINING_EXPORT_DIR = TOOL_ROOT / "out" / "review-history" / "training-export"
 DEFAULT_RULE_CANDIDATE_EXTRACTOR_DIR = TOOL_ROOT / "out" / "review-history" / "rule-candidate-extractor"
 DEFAULT_LEARNING_SCOREBOARD_DIR = TOOL_ROOT / "out" / "review-history" / "learning-scoreboard"
+DEFAULT_DB_PLAN_DIR = TOOL_ROOT / "out" / "review-history" / "db-plan"
 DEFAULT_CALIBRATION_DIR = TOOL_ROOT / "out" / "calibration"
 DEFAULT_ASYNC_REVIEW_DIR = TOOL_ROOT / "out" / "async-review"
 DEFAULT_APP_DEVELOPER_REVIEW_DIR = TOOL_ROOT / "out" / "app-developer-review"
 DEFAULT_TARGET = TOOL_ROOT / "out" / "review-history" / "llreview-target.json"
+DEFAULT_POSTGRES_SCHEMA = TOOL_ROOT / "sql" / "review-history-postgres-schema.sql"
 DEFAULT_BACKUP_DIR = (
     Path.home()
     / "Library"
@@ -99,6 +119,31 @@ SECOND_OPINION_MODEL_MEMORY_GB = 54.0
 SECOND_OPINION_MAX_MEMORY_PERCENT = 90.0
 BACKFILL_DOC_EXTENSIONS = (".md", ".mdx", ".rst")
 SQLITE_BIND_BATCH_SIZE = 800
+REVIEW_HISTORY_TABLES = (
+    "review_runs",
+    "reviewed_files",
+    "findings",
+    "watch_items",
+    "run_feedback",
+    "review_items",
+    "external_items",
+    "item_verdicts",
+    "item_links",
+    "rule_updates",
+    "runtime_metrics",
+    "artifacts",
+    "workspace_state",
+    "github_backfill_queue",
+    "learning_calibrations",
+)
+REVIEW_HISTORY_VIEWS = ("review_run_summary",)
+POSTGRES_OPTIONAL_BACKEND_GATES = (
+    ("review_items", "review_items >= 10,000", 10_000),
+    ("training_ready_external_examples", "training-ready external examples >= 100", 100),
+    ("external_items", "external_items >= 500", 500),
+    ("sqlite_db_bytes", "SQLite DB size >= 50 MB", 50 * 1024 * 1024),
+)
+POSTGRES_COPY_NULL = "__LLREVIEW_POSTGRES_COPY_NULL_2f7b9d9a__"
 BACKFILL_DOC_PREFIXES = ("docs/", "adr/", ".private_docs/")
 BACKFILL_DOC_FILENAMES = ("readme",)
 BACKFILL_GENERATED_FILENAMES = (
@@ -286,6 +331,15 @@ class LearningUpdateCandidate:
     status: str
     summary: str
     recommended_action: str
+
+
+@dataclass(frozen=True)
+class StampAssistRuleResult:
+    rule_id: str
+    action: str
+    confidence: str
+    reason: str
+    caution: str = ""
 
 
 @dataclass(frozen=True)
@@ -840,17 +894,11 @@ def env_text(name: str, default: str) -> str:
 
 
 def sqlite_batched_values(values: list[int], *, batch_size: int = SQLITE_BIND_BATCH_SIZE) -> list[list[int]]:
-    unique_values = list(dict.fromkeys(values))
-    return [
-        unique_values[index : index + batch_size]
-        for index in range(0, len(unique_values), batch_size)
-    ]
+    return batched_values(values, batch_size=batch_size)
 
 
 def sqlite_placeholders(count: int) -> str:
-    if count <= 0:
-        raise ValueError("placeholder count must be positive")
-    return ",".join("?" for _ in range(count))
+    return SQLITE_DIALECT.placeholders(count)
 
 
 def replace_namespace(args: argparse.Namespace, **updates: Any) -> argparse.Namespace:
@@ -1168,7 +1216,7 @@ def notify_daily_result(
                 ),
             )
         try:
-            with sqlite3.connect(db_path) as connection:
+            with connect_review_db(db_path) as connection:
                 connection.row_factory = sqlite3.Row
                 candidates = build_learning_update_candidates(
                     connection,
@@ -1478,7 +1526,7 @@ def update_workspace_state(db_path: Path, workspace: Workspace, run_id: int | No
         return
     pr_number = int(workspace.open_pr["number"]) if workspace.open_pr else 0
     head_ref = str((workspace.open_pr or {}).get("head", {}).get("ref") or workspace.branch)
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(
             """
@@ -3063,7 +3111,7 @@ def write_history_calibration_file(
 ) -> Path | None:
     if not db_path.is_file():
         return None
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         active_calibration = summarize_active_calibrations(
             connection,
@@ -3099,7 +3147,7 @@ def build_review_command(args: argparse.Namespace, workspace: Workspace) -> tupl
     default_output = default_review_output_path(workspace) if target else DEFAULT_REPORT
     report_path = Path(args.output or target_output or default_output).expanduser().resolve()
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     cleanup_paths: list[Path] = []
     cmd = [
@@ -3224,7 +3272,7 @@ def command_review(args: argparse.Namespace) -> int | None:
             tui=tui,
             heartbeat_seconds=heartbeat_seconds,
         )
-        db_path = Path(db_path_text).expanduser().resolve() if db_path_text else Path(args.db).expanduser().resolve()
+        db_path = sqlite_db_path(db_path_text) if db_path_text else sqlite_db_path(args.db)
         update_workspace_state(db_path, workspace, run_id)
         print(progress_summary)
         print(stdout.rstrip())
@@ -3240,7 +3288,7 @@ def fetch_last_run(db_path: Path, workspace: Workspace) -> sqlite3.Row | None:
     if not db_path.is_file():
         return None
     pr_number = int(workspace.open_pr["number"]) if workspace.open_pr else 0
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         if pr_number:
             return connection.execute(
@@ -3267,7 +3315,7 @@ def fetch_last_run(db_path: Path, workspace: Workspace) -> sqlite3.Row | None:
 
 def command_status(args: argparse.Namespace) -> None:
     workspace = detect_workspace_from_args(args)
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     last_run = fetch_last_run(db_path, workspace)
     unscored = 0
@@ -3278,7 +3326,7 @@ def command_status(args: argparse.Namespace) -> None:
     active_calibration_count = 0
     queue_rows: list[sqlite3.Row] = []
     if db_path.is_file():
-        with sqlite3.connect(db_path) as connection:
+        with connect_review_db(db_path) as connection:
             connection.row_factory = sqlite3.Row
             row = connection.execute(
                 "SELECT COUNT(*) FROM review_run_summary WHERE useful_findings_fixed IS NULL"
@@ -3350,7 +3398,7 @@ def command_status(args: argparse.Namespace) -> None:
 
 
 def command_target(args: argparse.Namespace) -> None:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     action = args.action
     path = target_config_path(db_path)
     if action == "clear":
@@ -3607,7 +3655,7 @@ def start_async_second_opinion(args: argparse.Namespace, *, workspace: Workspace
         "--repo",
         workspace.repo.full_name,
         "--db",
-        str(Path(args.db).expanduser().resolve()),
+        str(sqlite_db_path(args.db)),
         "--model",
         args.second_opinion_model,
         "--num-ctx",
@@ -4407,7 +4455,7 @@ def import_app_developer_review_job(
     finding_items = [item for item in normalized_items if item.get("item_kind") == "finding"]
     watch_items = [item for item in normalized_items if item.get("item_kind") == "watch"]
 
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         run_row = fetch_review_run_for_app_developer_manifest(connection, manifest)
@@ -4676,7 +4724,7 @@ def command_app_developer_review_status(args: argparse.Namespace) -> None:
     manifest_paths = app_developer_manifest_paths(output_root, limit=args.limit)
     if args.import_completed:
         results = import_completed_app_developer_reviews(
-            db_path=Path(args.db).expanduser().resolve(),
+            db_path=sqlite_db_path(args.db),
             output_root=output_root,
             calibration_output_dir=Path(args.calibration_output_dir).expanduser().resolve(),
             min_link_score=args.min_link_score,
@@ -5368,11 +5416,11 @@ def matcher_explain_record(
 
 
 def matcher_explain_payload(args: argparse.Namespace) -> dict[str, Any]:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     repo, workspace = learning_pump_scope_repo(args)
     external_id = as_optional_int(args.external_id)
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         rows = matcher_explain_external_rows(
             connection,
@@ -5890,11 +5938,11 @@ def training_export_sanitized_example(
 
 
 def training_export_splitter_payload(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     repo = learning_repo_scope_from_args(args)
     ratios = parse_training_split_ratios(getattr(args, "ratios", "80,10,10"))
     generated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         gap_records = review_gap_records(
             connection,
@@ -6073,7 +6121,7 @@ def training_export_splitter_report(payload: dict[str, Any]) -> str:
 
 
 def command_training_export_splitter(args: argparse.Namespace) -> None:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     payload, examples_by_split = training_export_splitter_payload(args)
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -6131,6 +6179,565 @@ def gap_example_false_positive_reason(record: dict[str, Any]) -> str:
     )
 
 
+def stamp_assist_external_row(
+    connection: sqlite3.Connection,
+    external_item_id: int,
+) -> sqlite3.Row:
+    row = connection.execute(
+        """
+        SELECT
+            external_items.*,
+            COALESCE(NULLIF(verdicts.verdict, ''), 'unscored') AS verdict,
+            COALESCE(NULLIF(verdicts.reason, ''), '(none)') AS reason,
+            verdicts.scorer AS verdict_scorer,
+            verdicts.scored_at AS verdict_scored_at,
+            COUNT(DISTINCT item_links.review_item_id) AS link_count,
+            GROUP_CONCAT(DISTINCT item_links.review_item_id) AS linked_review_item_ids,
+            GROUP_CONCAT(DISTINCT item_links.relation) AS link_relations
+        FROM external_items
+        LEFT JOIN item_links
+        ON item_links.external_item_id = external_items.id
+        LEFT JOIN (
+            SELECT item_verdicts.*
+            FROM item_verdicts
+            JOIN (
+                SELECT target_kind, target_id, MAX(id) AS id
+                FROM item_verdicts
+                GROUP BY target_kind, target_id
+            ) AS latest
+            ON latest.id = item_verdicts.id
+        ) AS verdicts
+        ON verdicts.target_kind = 'external_item'
+        AND verdicts.target_id = external_items.id
+        WHERE external_items.id = ?
+        GROUP BY external_items.id
+        """,
+        (external_item_id,),
+    ).fetchone()
+    if row is None:
+        raise SystemExit(f"external_item id={external_item_id} was not found")
+    return row
+
+
+def stamp_assist_bucket_counts(
+    connection: sqlite3.Connection,
+    *,
+    repo: str,
+    source: str,
+    path_class: str,
+) -> dict[str, Any]:
+    rows = connection.execute(
+        """
+        SELECT
+            external_items.id,
+            external_items.path,
+            COALESCE(NULLIF(verdicts.verdict, ''), 'unscored') AS verdict,
+            COALESCE(NULLIF(verdicts.reason, ''), '(none)') AS reason,
+            COUNT(DISTINCT item_links.review_item_id) AS link_count
+        FROM external_items
+        LEFT JOIN item_links
+        ON item_links.external_item_id = external_items.id
+        LEFT JOIN (
+            SELECT item_verdicts.*
+            FROM item_verdicts
+            JOIN (
+                SELECT target_kind, target_id, MAX(id) AS id
+                FROM item_verdicts
+                GROUP BY target_kind, target_id
+            ) AS latest
+            ON latest.id = item_verdicts.id
+        ) AS verdicts
+        ON verdicts.target_kind = 'external_item'
+        AND verdicts.target_id = external_items.id
+        WHERE external_items.repo = ?
+          AND external_items.source = ?
+        GROUP BY external_items.id
+        ORDER BY external_items.id DESC
+        LIMIT 2000
+        """,
+        (repo, source),
+    ).fetchall()
+    labels: dict[str, int] = {}
+    reasons: dict[str, int] = {}
+    total = 0
+    operator_stamped = 0
+    training_ready = 0
+    for row in rows:
+        if review_path_class(str(row["path"] or "")) != path_class:
+            continue
+        total += 1
+        verdict = str(row["verdict"] or "unscored")
+        reason = str(row["reason"] or "(none)")
+        label, label_quality = review_gap_label(
+            verdict,
+            reason,
+            link_count=int(row["link_count"] or 0),
+        )
+        labels[label] = labels.get(label, 0) + 1
+        reasons[reason] = reasons.get(reason, 0) + 1
+        if reason in OPERATOR_EXTERNAL_REASON_CODES or label_quality == "operator_validated":
+            operator_stamped += 1
+        if label_quality == "operator_validated" and label == "missed_by_local":
+            training_ready += 1
+    return {
+        "repo": repo,
+        "source": source,
+        "path_class": path_class,
+        "total": total,
+        "operator_stamped": operator_stamped,
+        "labels": labels,
+        "reasons": reasons,
+        "training_ready": training_ready,
+        "covered": labels.get("covered_by_local", 0),
+        "uncertain": labels.get("needs_human_review", 0),
+        "not_actionable": labels.get("teacher_false_positive", 0),
+    }
+
+
+def stamp_assist_action_name(action: str, *, japanese: bool = False) -> str:
+    names = {
+        "y": ("valid missed", "妥当な見逃し"),
+        "c": ("covered locally", "localで検出済み"),
+        "f": ("not actionable", "非actionable"),
+        "n": ("unsure", "保留"),
+        "s": ("skip", "skip"),
+    }
+    english, ja = names.get(action, (action, action))
+    return ja if japanese else english
+
+
+def stamp_assist_rule_already_stamped(state: dict[str, Any]) -> StampAssistRuleResult | None:
+    if state["reason"] in OPERATOR_EXTERNAL_REASON_CODES:
+        return StampAssistRuleResult(
+            rule_id="already_operator_stamped",
+            action="s",
+            confidence="high",
+            reason="This item already has an operator verdict, so it is already in the learning loop.",
+            caution="Re-stamp only when the earlier human judgment was wrong.",
+        )
+    return None
+
+
+def stamp_assist_rule_local_covered(state: dict[str, Any]) -> StampAssistRuleResult | None:
+    diagnostic = state["diagnostic"]
+    if state["link_count"] > 0 or diagnostic.best_score >= state["min_link_score"]:
+        return StampAssistRuleResult(
+            rule_id="local_coverage_visible",
+            action="c",
+            confidence="high",
+            reason="A local finding is already linked or matches above the deterministic link threshold.",
+            caution="Use y instead only if the local item did not actually cover the same defect.",
+        )
+    return None
+
+
+def stamp_assist_rule_external_unscored(state: dict[str, Any]) -> StampAssistRuleResult | None:
+    candidate = state.get("candidate")
+    if state["verdict"] == "unscored" or (
+        candidate is not None and candidate.signal_kind == "external_unscored"
+    ):
+        return StampAssistRuleResult(
+            rule_id="external_unscored_needs_comparison",
+            action="n",
+            confidence="medium",
+            reason="This is still an unscored external item, so the local comparison/linking evidence is incomplete.",
+            caution="If you manually verified it is diff-local and actionable, y is still valid; then run scoring/linking to strengthen it.",
+        )
+    return None
+
+
+def stamp_assist_rule_watch_boundary(state: dict[str, Any]) -> StampAssistRuleResult | None:
+    if state["learning_target"] == "watch_to_finding_boundary_gap":
+        return StampAssistRuleResult(
+            rule_id="watch_boundary_gap",
+            action="y",
+            confidence="medium",
+            reason="The best local match is a watch item, not a finding; a valid external item becomes useful watch-to-finding training data.",
+            caution="Use c if the watch item was already specific enough to count as local coverage.",
+        )
+    return None
+
+
+def stamp_assist_rule_importer_missed(state: dict[str, Any]) -> StampAssistRuleResult | None:
+    if state["verdict"] != "missed_by_local":
+        return None
+    candidate = state.get("candidate")
+    confidence = "medium"
+    if candidate is not None and candidate.confidence in {"high", "medium", "low-medium", "low"}:
+        confidence = candidate.confidence
+    if state["source"] in {"copilot", "automated"} and confidence == "high":
+        confidence = "medium"
+    return StampAssistRuleResult(
+        rule_id="importer_no_local_match",
+        action="y",
+        confidence=confidence,
+        reason="The item is already in the missed-by-local human gate and no local finding is linked.",
+        caution="Only confirm y after checking the item is diff-local and actionable; otherwise choose f or n.",
+    )
+
+
+def stamp_assist_rule_needs_human_review(state: dict[str, Any]) -> StampAssistRuleResult | None:
+    if state["verdict"] == "needs_human_review":
+        return StampAssistRuleResult(
+            rule_id="already_uncertain",
+            action="n",
+            confidence="medium",
+            reason="The latest verdict is already uncertain, so keep it out of training until a stronger judgment exists.",
+            caution="Use y only after a fresh manual check makes it clearly diff-local and actionable.",
+        )
+    return None
+
+
+def stamp_assist_rule_default_unsure(state: dict[str, Any]) -> StampAssistRuleResult:
+    return StampAssistRuleResult(
+        rule_id="default_human_gate",
+        action="n",
+        confidence="low",
+        reason="The deterministic evidence is not strong enough to recommend a positive or covered stamp.",
+        caution="Read the item body or source review before turning this into training data.",
+    )
+
+
+STAMP_ASSIST_RULES: tuple[Callable[[dict[str, Any]], StampAssistRuleResult | None], ...] = (
+    stamp_assist_rule_already_stamped,
+    stamp_assist_rule_local_covered,
+    stamp_assist_rule_external_unscored,
+    stamp_assist_rule_watch_boundary,
+    stamp_assist_rule_importer_missed,
+    stamp_assist_rule_needs_human_review,
+)
+
+
+def choose_stamp_assist_rule(state: dict[str, Any]) -> StampAssistRuleResult:
+    for rule in STAMP_ASSIST_RULES:
+        result = rule(state)
+        if result is not None:
+            return result
+    return stamp_assist_rule_default_unsure(state)
+
+
+def stamp_assist_payload_for_external_item(
+    connection: sqlite3.Connection,
+    external_item_id: int,
+    *,
+    candidate: LearningUpdateCandidate | None = None,
+    min_link_score: float,
+) -> dict[str, Any]:
+    row = stamp_assist_external_row(connection, external_item_id)
+    diagnostic = best_link_diagnostic(connection, row)
+    verdict = str(row["verdict"] or "unscored")
+    reason = str(row["reason"] or "(none)")
+    link_count = int(row["link_count"] or 0)
+    label, label_quality = review_gap_label(verdict, reason, link_count=link_count)
+    learning_target = review_gap_learning_target(
+        diagnostic,
+        link_count=link_count,
+        min_link_score=min_link_score,
+    )
+    repo = str(row["repo"] or "")
+    source = str(row["source"] or "")
+    path = str(row["path"] or "")
+    path_class = review_path_class(path)
+    bucket = stamp_assist_bucket_counts(
+        connection,
+        repo=repo,
+        source=source,
+        path_class=path_class,
+    )
+    state = {
+        "row": row,
+        "candidate": candidate,
+        "diagnostic": diagnostic,
+        "verdict": verdict,
+        "reason": reason,
+        "source": source,
+        "link_count": link_count,
+        "label": label,
+        "label_quality": label_quality,
+        "learning_target": learning_target,
+        "min_link_score": min_link_score,
+    }
+    recommendation = choose_stamp_assist_rule(state)
+    return {
+        "schema_name": "llreview.stamp_assist",
+        "schema_version": 1,
+        "external_item_id": external_item_id,
+        "repo": repo,
+        "pr_number": int(row["pr_number"] or 0),
+        "source": source,
+        "path": path,
+        "path_class": path_class,
+        "line": as_optional_int(row["line"]),
+        "title_excerpt": safe_learning_excerpt(str(row["title"] or ""), limit=140),
+        "current": {
+            "verdict": verdict,
+            "reason": reason,
+            "scorer": str(row["verdict_scorer"] or ""),
+            "scored_at": str(row["verdict_scored_at"] or ""),
+            "operator_stamped": reason in OPERATOR_EXTERNAL_REASON_CODES,
+            "label": label,
+            "label_quality": label_quality,
+            "training_ready": label_quality == "operator_validated",
+        },
+        "candidate": learning_candidate_record(candidate) if candidate is not None else None,
+        "bucket": bucket,
+        "linking": {
+            "link_count": link_count,
+            "linked_review_item_ids": parse_grouped_ints(str(row["linked_review_item_ids"] or "")),
+            "link_relations": parse_grouped_text(str(row["link_relations"] or "")),
+            "finding_candidate_count": diagnostic.finding_candidate_count,
+            "best_finding_score": round(diagnostic.best_score, 4),
+            "best_finding_relation": diagnostic.best_relation,
+            "best_finding_item_id": diagnostic.best_review_item_id,
+            "watch_candidate_count": diagnostic.watch_candidate_count,
+            "best_watch_score": round(diagnostic.best_watch_score, 4),
+            "best_watch_relation": diagnostic.best_watch_relation,
+            "best_watch_item_id": diagnostic.best_watch_item_id,
+            "learning_target": learning_target,
+        },
+        "recommendation": {
+            "rule_id": recommendation.rule_id,
+            "action": recommendation.action,
+            "action_label": stamp_assist_action_name(recommendation.action),
+            "confidence": recommendation.confidence,
+            "reason": recommendation.reason,
+            "caution": recommendation.caution,
+        },
+        "human_checks": [
+            "Is the issue visible from the diff or trusted local context?",
+            "Is it actionable rather than a broad style/preference comment?",
+            "Did a local finding already cover the same defect?",
+        ],
+    }
+
+
+def stamp_assist_for_learning_sample(
+    connection: sqlite3.Connection,
+    candidate: LearningUpdateCandidate,
+    sample: dict[str, Any],
+    *,
+    min_link_score: float,
+) -> dict[str, Any] | None:
+    if sample.get("sample_kind") != "external_item":
+        return None
+    return stamp_assist_payload_for_external_item(
+        connection,
+        int(sample["sample_id"]),
+        candidate=candidate,
+        min_link_score=min_link_score,
+    )
+
+
+def add_stamp_assist_to_gap_records(
+    connection: sqlite3.Connection,
+    records: list[dict[str, Any]],
+    *,
+    min_link_score: float,
+) -> list[dict[str, Any]]:
+    assisted: list[dict[str, Any]] = []
+    for record in records:
+        assist = None
+        if record.get("requires_human_gate"):
+            assist = stamp_assist_payload_for_external_item(
+                connection,
+                int(record["external_item_id"]),
+                min_link_score=min_link_score,
+            )
+        assisted.append(
+            {
+                **record,
+                "stamp_assist": assist["recommendation"] if assist else None,
+            }
+        )
+    return assisted
+
+
+def stamp_assist_compact_text(
+    assist: dict[str, Any],
+    *,
+    japanese: bool,
+) -> list[str]:
+    recommendation = assist["recommendation"]
+    current = assist["current"]
+    bucket = assist["bucket"]
+    linking = assist["linking"]
+    action = str(recommendation["action"])
+    action_label = stamp_assist_action_name(action, japanese=japanese)
+    reason_text = stamp_assist_localized_reason(recommendation, japanese=japanese)
+    caution_text = stamp_assist_localized_caution(recommendation, japanese=japanese)
+    if japanese:
+        lines = [
+            "補助: おすすめ={action} ({label}, {confidence}) - {reason}".format(
+                action=action,
+                label=action_label,
+                confidence=recommendation["confidence"],
+                reason=reason_text,
+            ),
+            "学習: item={item_state}; bucket operator={operator}/{total}, valid={valid}, covered={covered}, unsure={unsure}; target={target}".format(
+                item_state="学習済み" if current["operator_stamped"] else "未ハンコ",
+                operator=bucket["operator_stamped"],
+                total=bucket["total"],
+                valid=bucket["training_ready"],
+                covered=bucket["covered"],
+                unsure=bucket["uncertain"],
+                target=linking["learning_target"],
+            ),
+        ]
+        if caution_text:
+            lines.append(f"注意: {caution_text}")
+        return lines
+    lines = [
+        "Assist: recommend={action} ({label}, {confidence}) - {reason}".format(
+            action=action,
+            label=action_label,
+            confidence=recommendation["confidence"],
+            reason=reason_text,
+        ),
+        "Learning: item={item_state}; bucket operator={operator}/{total}, valid={valid}, covered={covered}, unsure={unsure}; target={target}".format(
+            item_state="operator-stamped" if current["operator_stamped"] else "not stamped",
+            operator=bucket["operator_stamped"],
+            total=bucket["total"],
+            valid=bucket["training_ready"],
+            covered=bucket["covered"],
+            unsure=bucket["uncertain"],
+            target=linking["learning_target"],
+        ),
+    ]
+    if caution_text:
+        lines.append(f"Caution: {caution_text}")
+    return lines
+
+
+def stamp_assist_localized_reason(recommendation: dict[str, Any], *, japanese: bool) -> str:
+    if not japanese:
+        return str(recommendation.get("reason") or "")
+    by_rule = {
+        "already_operator_stamped": "この item はすでに operator verdict 済みなので、学習ループに入っています。",
+        "local_coverage_visible": "local finding が link 済み、または deterministic link threshold 以上で一致しています。",
+        "external_unscored_needs_comparison": "まだ unscored external item なので、local review との比較・link 証拠が不足しています。",
+        "watch_boundary_gap": "近い local match は watch item で、finding ではありません。妥当なら watch-to-finding 境界の教材になります。",
+        "importer_no_local_match": "missed-by-local の human gate にあり、local finding link はありません。",
+        "already_uncertain": "最新 verdict がすでに uncertain なので、強い判断が出るまで training から外すのが安全です。",
+        "default_human_gate": "deterministic evidence だけでは positive / covered の推奨には足りません。",
+    }
+    return by_rule.get(str(recommendation.get("rule_id") or ""), str(recommendation.get("reason") or ""))
+
+
+def stamp_assist_localized_caution(recommendation: dict[str, Any], *, japanese: bool) -> str:
+    caution = str(recommendation.get("caution") or "")
+    if not japanese or not caution:
+        return caution
+    by_rule = {
+        "already_operator_stamped": "以前の人間判断が間違っていた時だけ押し直してください。",
+        "local_coverage_visible": "local item が同じ欠陥を実際には覆っていない時だけ y を選んでください。",
+        "external_unscored_needs_comparison": "手で diff-local かつ actionable と確認できたなら y も有効です。その後 score/link で強い証拠にしてください。",
+        "watch_boundary_gap": "watch item が十分具体的に同じ問題を覆っていたなら c を選んでください。",
+        "importer_no_local_match": "diff-local かつ actionable と確認できた時だけ y。違うなら f または n です。",
+        "already_uncertain": "新しく明確に diff-local / actionable と確認できた時だけ y に変えてください。",
+        "default_human_gate": "本文や元レビューを読んでから training data にしてください。",
+    }
+    return by_rule.get(str(recommendation.get("rule_id") or ""), caution)
+
+
+def stamp_assist_human_checks(*, japanese: bool) -> list[str]:
+    if japanese:
+        return [
+            "その指摘は diff または trusted local context から確認できますか？",
+            "広い好みや様式論ではなく、実際に直すべき actionable な問題ですか？",
+            "local finding がすでに同じ欠陥を十分に覆っていませんか？",
+        ]
+    return [
+        "Is the issue visible from the diff or trusted local context?",
+        "Is it actionable rather than a broad style/preference comment?",
+        "Did a local finding already cover the same defect?",
+    ]
+
+
+def stamp_assist_report(payload: dict[str, Any], *, japanese: bool) -> str:
+    location = str(payload.get("path") or "(no path)")
+    if payload.get("line") is not None:
+        location += f":{payload['line']}"
+    recommendation = payload["recommendation"]
+    current = payload["current"]
+    bucket = payload["bucket"]
+    linking = payload["linking"]
+    action = str(recommendation["action"])
+    action_label = stamp_assist_action_name(action, japanese=japanese)
+    reason_text = stamp_assist_localized_reason(recommendation, japanese=japanese)
+    caution_text = stamp_assist_localized_caution(recommendation, japanese=japanese)
+    if japanese:
+        lines = [
+            "# Stamp Assist / ハンコ補助",
+            "",
+            f"- External ID: `{payload['external_item_id']}`",
+            f"- Location: `{markdown_cell(location)}`",
+            f"- Source: `{markdown_cell(payload['source'])}`",
+            f"- Title: {markdown_cell(payload['title_excerpt'])}",
+            "",
+            "## 推奨",
+            "",
+            f"- おすすめ: `{action}` {action_label}",
+            f"- 信頼度: `{recommendation['confidence']}`",
+            f"- 理由: {reason_text}",
+            f"- 注意: {caution_text or '特になし'}",
+            "",
+            "## 学習状態",
+            "",
+            f"- この item: `{'学習済み' if current['operator_stamped'] else '未ハンコ'}`",
+            f"- 現在値: `{current['verdict']}` / `{current['reason']}`",
+            f"- Training-ready: `{str(current['training_ready']).lower()}`",
+            f"- 同 bucket: operator={bucket['operator_stamped']}/{bucket['total']}, valid={bucket['training_ready']}, covered={bucket['covered']}, unsure={bucket['uncertain']}",
+            "",
+            "## Link 診断",
+            "",
+            f"- Links: `{linking['link_count']}`",
+            f"- Finding candidates: `{linking['finding_candidate_count']}`, best=`{linking['best_finding_score']:.2f} {linking['best_finding_relation']}`",
+            f"- Watch candidates: `{linking['watch_candidate_count']}`, best=`{linking['best_watch_score']:.2f} {linking['best_watch_relation']}`",
+            f"- Learning target: `{linking['learning_target']}`",
+            "",
+            "## 人間チェック",
+            "",
+        ]
+        for check in stamp_assist_human_checks(japanese=True):
+            lines.append(f"- {check}")
+        return "\n".join(lines).rstrip() + "\n"
+    lines = [
+        "# Stamp Assist",
+        "",
+        f"- External ID: `{payload['external_item_id']}`",
+        f"- Location: `{markdown_cell(location)}`",
+        f"- Source: `{markdown_cell(payload['source'])}`",
+        f"- Title: {markdown_cell(payload['title_excerpt'])}",
+        "",
+        "## Recommendation",
+        "",
+        f"- Recommended stamp: `{action}` {action_label}",
+        f"- Confidence: `{recommendation['confidence']}`",
+        f"- Why: {reason_text}",
+        f"- Caution: {caution_text or 'none'}",
+        "",
+        "## Learning State",
+        "",
+        f"- This item: `{'operator-stamped' if current['operator_stamped'] else 'not stamped'}`",
+        f"- Current value: `{current['verdict']}` / `{current['reason']}`",
+        f"- Training-ready: `{str(current['training_ready']).lower()}`",
+        f"- Same bucket: operator={bucket['operator_stamped']}/{bucket['total']}, valid={bucket['training_ready']}, covered={bucket['covered']}, unsure={bucket['uncertain']}",
+        "",
+        "## Link Diagnostics",
+        "",
+        f"- Links: `{linking['link_count']}`",
+        f"- Finding candidates: `{linking['finding_candidate_count']}`, best=`{linking['best_finding_score']:.2f} {linking['best_finding_relation']}`",
+        f"- Watch candidates: `{linking['watch_candidate_count']}`, best=`{linking['best_watch_score']:.2f} {linking['best_watch_relation']}`",
+        f"- Learning target: `{linking['learning_target']}`",
+        "",
+        "## Human Checks",
+        "",
+    ]
+    for check in stamp_assist_human_checks(japanese=False):
+        lines.append(f"- {check}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def queue_focus_rows(
     connection: sqlite3.Connection,
     *,
@@ -6168,6 +6775,7 @@ def learning_pump_external_inbox(
     *,
     sample_limit: int,
     excerpt_chars: int,
+    min_link_score: float,
 ) -> list[dict[str, Any]]:
     inbox: list[dict[str, Any]] = []
     for candidate in candidates:
@@ -6181,12 +6789,19 @@ def learning_pump_external_inbox(
             excerpt_chars=excerpt_chars,
         )
         for sample_index, sample in enumerate(samples, start=1):
+            assist = stamp_assist_for_learning_sample(
+                connection,
+                candidate,
+                sample,
+                min_link_score=min_link_score,
+            )
             inbox.append(
                 {
                     **sample,
                     "candidate_short_id": learning_candidate_short_id(candidate),
                     "candidate_id": candidate.candidate_id,
                     "sample_index": sample_index,
+                    "stamp_assist": assist["recommendation"] if assist else None,
                 }
             )
             if len(inbox) >= sample_limit:
@@ -6232,7 +6847,7 @@ def learning_pump_calibration_result(
 
 
 def learning_pump_payload(args: argparse.Namespace) -> dict[str, Any]:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     repo, workspace = learning_pump_scope_repo(args)
     app_developer_root = Path(args.app_developer_review_dir).expanduser().resolve()
@@ -6256,7 +6871,7 @@ def learning_pump_payload(args: argparse.Namespace) -> dict[str, Any]:
             force=args.force_import,
             record_db_artifacts=not args.no_db_artifacts,
         )
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         calibration = learning_pump_calibration_result(
             connection,
@@ -6279,6 +6894,11 @@ def learning_pump_payload(args: argparse.Namespace) -> dict[str, Any]:
             limit=args.gap_limit,
             min_link_score=args.min_link_score,
         )
+        gap_examples = add_stamp_assist_to_gap_records(
+            connection,
+            gap_examples,
+            min_link_score=args.min_link_score,
+        )
         queue_rows = queue_focus_rows(connection, repo=repo, limit=args.queue_limit)
         external_total, external_linked = (
             external_scope_counts(connection, repo=repo, pr_number=None)
@@ -6295,6 +6915,7 @@ def learning_pump_payload(args: argparse.Namespace) -> dict[str, Any]:
             candidates,
             sample_limit=args.sample_limit,
             excerpt_chars=args.excerpt_chars,
+            min_link_score=args.min_link_score,
         )
     candidate_records = [learning_candidate_record(candidate) for candidate in candidates[: args.candidate_limit]]
     activatable = [
@@ -6508,18 +7129,27 @@ def learning_pump_report(payload: dict[str, Any]) -> str:
 
     lines.extend(["", "## External Stamp Inbox", ""])
     if learning["external_inbox"]:
-        lines.append("| Candidate | Sample | External ID | Location | Verdict | Reason | Title |")
-        lines.append("|---|---:|---:|---|---|---|---|")
+        lines.append("| Candidate | Sample | External ID | Location | Verdict | Reason | Assist | Title |")
+        lines.append("|---|---:|---:|---|---|---|---|---|")
         for sample in learning["external_inbox"]:
             location = learning_sample_location(sample)
+            assist = sample.get("stamp_assist") if isinstance(sample.get("stamp_assist"), dict) else {}
+            assist_text = ""
+            if assist:
+                assist_text = "{action} {confidence}: {reason}".format(
+                    action=assist.get("action", ""),
+                    confidence=assist.get("confidence", ""),
+                    reason=truncate_text(str(assist.get("reason") or ""), 90),
+                )
             lines.append(
-                "| `{candidate}` | {sample_index} | {sample_id} | `{location}` | {verdict} | {reason} | {title} |".format(
+                "| `{candidate}` | {sample_index} | {sample_id} | `{location}` | {verdict} | {reason} | {assist} | {title} |".format(
                     candidate=markdown_cell(sample["candidate_short_id"]),
                     sample_index=sample["sample_index"],
                     sample_id=sample["sample_id"],
                     location=markdown_cell(location),
                     verdict=markdown_cell(sample["verdict"]),
                     reason=markdown_cell(sample["reason"]),
+                    assist=markdown_cell(assist_text),
                     title=markdown_cell(sample["title_excerpt"]),
                 )
             )
@@ -6528,10 +7158,18 @@ def learning_pump_report(payload: dict[str, Any]) -> str:
 
     lines.extend(["", "## Review Gap Stamp Inbox", ""])
     if gap_stamp_inbox:
-        lines.append("| External ID | Location | Label | Quality | Title | Mark valid | Mark not actionable |")
-        lines.append("|---:|---|---|---|---|---|---|")
+        lines.append("| External ID | Location | Label | Quality | Assist | Title | Mark valid | Mark not actionable |")
+        lines.append("|---:|---|---|---|---|---|---|---|")
         for row in gap_stamp_inbox[:10]:
             external_id = int(row["external_item_id"])
+            assist = row.get("stamp_assist") if isinstance(row.get("stamp_assist"), dict) else {}
+            assist_text = ""
+            if assist:
+                assist_text = "{action} {confidence}: {reason}".format(
+                    action=assist.get("action", ""),
+                    confidence=assist.get("confidence", ""),
+                    reason=truncate_text(str(assist.get("reason") or ""), 90),
+                )
             valid_command = (
                 f"llreview external-verdict {external_id} "
                 f"--verdict missed_by_local --reason {gap_example_valid_reason(row)} "
@@ -6544,11 +7182,12 @@ def learning_pump_report(payload: dict[str, Any]) -> str:
                 "--note \"not diff-local or not actionable\""
             )
             lines.append(
-                "| {external_id} | `{location}` | {label} | {quality} | {title} | `{valid}` | `{false}` |".format(
+                "| {external_id} | `{location}` | {label} | {quality} | {assist} | {title} | `{valid}` | `{false}` |".format(
                     external_id=external_id,
                     location=markdown_cell(gap_example_location(row)),
                     label=markdown_cell(row["label"]),
                     quality=markdown_cell(row["label_quality"]),
+                    assist=markdown_cell(assist_text),
                     title=markdown_cell(row["title_excerpt"]),
                     valid=markdown_cell(valid_command),
                     false=markdown_cell(false_command),
@@ -6782,7 +7421,7 @@ def review_gap_stamp_records(
     if limit > 0:
         records = records[:limit]
     if show_text and records:
-        placeholders = ",".join("?" for _ in records)
+        placeholders = sqlite_placeholders(len(records))
         ids = [int(record["external_item_id"]) for record in records]
         rows = connection.execute(
             f"""
@@ -6807,10 +7446,10 @@ def review_gap_stamp_records(
 
 
 def review_gap_stamp_payload(args: argparse.Namespace) -> dict[str, Any]:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     repo, workspace = learning_pump_scope_repo(args)
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         records = review_gap_stamp_records(
             connection,
@@ -6820,6 +7459,11 @@ def review_gap_stamp_payload(args: argparse.Namespace) -> dict[str, Any]:
             min_link_score=args.min_link_score,
             show_text=args.show_text,
             excerpt_chars=args.excerpt_chars,
+        )
+        records = add_stamp_assist_to_gap_records(
+            connection,
+            records,
+            min_link_score=args.min_link_score,
         )
     return {
         "schema_name": "llreview.review_gap_stamp_pump",
@@ -6927,16 +7571,25 @@ def review_gap_stamp_report(payload: dict[str, Any]) -> str:
         lines.append("- No human-gate review-gap examples in this scope.")
     lines.extend(["", "## Stamp Inbox", ""])
     if payload["records"]:
-        lines.append("| External ID | Location | Source | Quality | Rationale | Title | Mark valid | Mark not actionable |")
-        lines.append("|---:|---|---|---|---|---|---|---|")
+        lines.append("| External ID | Location | Source | Quality | Assist | Rationale | Title | Mark valid | Mark not actionable |")
+        lines.append("|---:|---|---|---|---|---|---|---|---|")
         for record in payload["records"]:
             location = gap_example_location(record)
+            assist = record.get("stamp_assist") if isinstance(record.get("stamp_assist"), dict) else {}
+            assist_text = ""
+            if assist:
+                assist_text = "{action} {confidence}: {reason}".format(
+                    action=assist.get("action", ""),
+                    confidence=assist.get("confidence", ""),
+                    reason=truncate_text(str(assist.get("reason") or ""), 90),
+                )
             lines.append(
-                "| {external_id} | `{location}` | {source} | {quality} | {rationale} | {title} | `{valid}` | `{false}` |".format(
+                "| {external_id} | `{location}` | {source} | {quality} | {assist} | {rationale} | {title} | `{valid}` | `{false}` |".format(
                     external_id=record["external_item_id"],
                     location=markdown_cell(location),
                     source=markdown_cell(record["external_source"]),
                     quality=markdown_cell(record["label_quality"]),
+                    assist=markdown_cell(assist_text),
                     rationale=markdown_cell(review_gap_stamp_rationale(record)),
                     title=markdown_cell(record["title_excerpt"]),
                     valid=markdown_cell(review_gap_stamp_command(record, "valid")),
@@ -6981,9 +7634,9 @@ def review_gap_stamp_action(record: dict[str, Any], choice: str) -> tuple[str, s
 def run_review_gap_stamp_flow(args: argparse.Namespace, records: list[dict[str, Any]]) -> int:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise SystemExit("--stamp requires an interactive TTY")
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     saved = 0
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         for index, record in enumerate(records, start=1):
             print("")
@@ -6991,6 +7644,15 @@ def run_review_gap_stamp_flow(args: argparse.Namespace, records: list[dict[str, 
             print(f"  source: {record['external_source']} quality={record['label_quality']}")
             print(f"  title: {record['title_excerpt']}")
             print(f"  rationale: {review_gap_stamp_rationale(record)}")
+            assist = record.get("stamp_assist") if isinstance(record.get("stamp_assist"), dict) else {}
+            if assist:
+                print(
+                    "  assist: recommend={action} ({confidence}) - {reason}".format(
+                        action=assist.get("action", ""),
+                        confidence=assist.get("confidence", ""),
+                        reason=assist.get("reason", ""),
+                    )
+                )
             if record.get("body_excerpt"):
                 print(f"  excerpt: {record['body_excerpt']}")
             choice = input("Stamp [y valid / f not actionable / c covered / n unsure / s skip / q quit]: ").strip().lower()
@@ -7206,10 +7868,10 @@ def recall_pattern_clusters(
 
 
 def recall_pattern_miner_payload(args: argparse.Namespace) -> dict[str, Any]:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     repo, workspace = learning_pump_scope_repo(args)
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         records = [
             record
@@ -7647,10 +8309,10 @@ def build_rule_candidate_groups(
 
 
 def rule_candidate_extractor_payload(args: argparse.Namespace) -> dict[str, Any]:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     repo, workspace = learning_pump_scope_repo(args)
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         records = [
             record
@@ -7837,35 +8499,7 @@ def learning_scoreboard_run_counts(
     *,
     repo: str,
 ) -> dict[str, Any]:
-    repo_filter = ""
-    params: list[Any] = []
-    if repo:
-        repo_filter = "WHERE repo = ?"
-        params.append(repo)
-    row = connection.execute(
-        f"""
-        SELECT
-            COUNT(*) AS total,
-            SUM(CASE WHEN useful_findings_fixed IS NULL THEN 1 ELSE 0 END) AS unscored,
-            SUM(CASE WHEN findings_count = 0 THEN 1 ELSE 0 END) AS zero_finding_runs,
-            SUM(findings_count) AS findings,
-            SUM(watch_items_count) AS watch_items,
-            SUM(diff_bytes) AS diff_bytes,
-            AVG(elapsed_seconds) AS average_elapsed_seconds
-        FROM review_run_summary
-        {repo_filter}
-        """,
-        params,
-    ).fetchone()
-    return {
-        "total": int(row["total"] or 0),
-        "unscored": int(row["unscored"] or 0),
-        "zero_finding_runs": int(row["zero_finding_runs"] or 0),
-        "findings": int(row["findings"] or 0),
-        "watch_items": int(row["watch_items"] or 0),
-        "diff_bytes": int(row["diff_bytes"] or 0),
-        "average_elapsed_seconds": round(float(row["average_elapsed_seconds"] or 0.0), 1),
-    }
+    return review_run_counts(connection, repo=repo)
 
 
 def learning_scoreboard_external_counts(
@@ -7873,51 +8507,7 @@ def learning_scoreboard_external_counts(
     *,
     repo: str,
 ) -> dict[str, Any]:
-    repo_filter = ""
-    params: list[Any] = []
-    if repo:
-        repo_filter = "WHERE repo = ?"
-        params.append(repo)
-    total = int(
-        connection.execute(
-            f"SELECT COUNT(*) FROM external_items {repo_filter}",
-            params,
-        ).fetchone()[0]
-    )
-    linked_filter = ""
-    linked_params: list[Any] = []
-    if repo:
-        linked_filter = "WHERE external_items.repo = ?"
-        linked_params.append(repo)
-    linked = int(
-        connection.execute(
-            f"""
-            SELECT COUNT(DISTINCT item_links.external_item_id)
-            FROM item_links
-            JOIN external_items
-            ON external_items.id = item_links.external_item_id
-            {linked_filter}
-            """,
-            linked_params,
-        ).fetchone()[0]
-    )
-    verdict_rows = external_link_health_rows(connection, repo=repo, limit=12)
-    return {
-        "total": total,
-        "linked": linked,
-        "unlinked": max(0, total - linked),
-        "link_rate": percent(linked, total),
-        "verdict_rows": [
-            {
-                "source": str(row["source"] or ""),
-                "verdict": str(row["verdict"] or ""),
-                "reason": str(row["reason"] or ""),
-                "total": int(row["total"] or 0),
-                "linked": int(row["linked"] or 0),
-            }
-            for row in verdict_rows
-        ],
-    }
+    return external_item_counts(connection, repo=repo, verdict_limit=12)
 
 
 def learning_scoreboard_queue_counts(
@@ -7925,54 +8515,7 @@ def learning_scoreboard_queue_counts(
     *,
     repo: str,
 ) -> dict[str, Any]:
-    repo_filter = ""
-    params: list[Any] = []
-    if repo:
-        repo_filter = "WHERE repo = ?"
-        params.append(repo)
-    rows = connection.execute(
-        f"""
-        SELECT
-            source_kind,
-            state,
-            COALESCE(NULLIF(skip_reason, ''), state) AS reason,
-            COUNT(*) AS count,
-            SUM(actionable_external_comments) AS signal
-        FROM github_backfill_queue
-        {repo_filter}
-        GROUP BY source_kind, state, reason
-        ORDER BY count DESC, source_kind, state, reason
-        """,
-        params,
-    ).fetchall()
-    by_state: dict[str, int] = {}
-    by_source_state: dict[str, int] = {}
-    signal_total = 0
-    records: list[dict[str, Any]] = []
-    for row in rows:
-        state = str(row["state"] or "")
-        source_kind = str(row["source_kind"] or "")
-        count = int(row["count"] or 0)
-        signal = int(row["signal"] or 0)
-        by_state[state] = by_state.get(state, 0) + count
-        by_source_state[f"{source_kind}/{state}"] = by_source_state.get(f"{source_kind}/{state}", 0) + count
-        signal_total += signal
-        records.append(
-            {
-                "source_kind": source_kind,
-                "state": state,
-                "reason": str(row["reason"] or ""),
-                "count": count,
-                "signal": signal,
-            }
-        )
-    return {
-        "total": sum(by_state.values()),
-        "signal": signal_total,
-        "by_state": by_state,
-        "by_source_state": by_source_state,
-        "records": records[:12],
-    }
+    return backfill_queue_counts(connection, repo=repo, record_limit=12)
 
 
 def learning_scoreboard_calibration_counts(
@@ -7981,49 +8524,7 @@ def learning_scoreboard_calibration_counts(
     repo: str,
     limit: int,
 ) -> dict[str, Any]:
-    repo_filter = ""
-    params: list[Any] = []
-    if repo:
-        repo_filter = "AND (scope_repo = '' OR scope_repo = ?)"
-        params.append(repo)
-    rows = connection.execute(
-        f"""
-        SELECT *
-        FROM learning_calibrations
-        WHERE status = 'active'
-          {repo_filter}
-        ORDER BY updated_at DESC, id DESC
-        LIMIT ?
-        """,
-        [*params, limit],
-    ).fetchall()
-    total = int(
-        connection.execute(
-            f"""
-            SELECT COUNT(*)
-            FROM learning_calibrations
-            WHERE status = 'active'
-              {repo_filter}
-            """,
-            params,
-        ).fetchone()[0]
-    )
-    return {
-        "active": total,
-        "recent": [
-            {
-                "calibration_id": str(row["calibration_id"] or ""),
-                "scope_repo": str(row["scope_repo"] or "global"),
-                "path_class": str(row["path_class"] or ""),
-                "signal_kind": str(row["signal_kind"] or ""),
-                "evidence_count": int(row["evidence_count"] or 0),
-                "confidence": str(row["confidence"] or ""),
-                "updated_at": str(row["updated_at"] or ""),
-                "instruction": truncate_text(str(row["instruction"] or ""), 140),
-            }
-            for row in rows
-        ],
-    }
+    return active_calibration_counts(connection, repo=repo, limit=limit, instruction_limit=140)
 
 
 def learning_scoreboard_recent_runs(
@@ -8032,39 +8533,7 @@ def learning_scoreboard_recent_runs(
     repo: str,
     limit: int,
 ) -> list[dict[str, Any]]:
-    repo_filter = ""
-    params: list[Any] = []
-    if repo:
-        repo_filter = "WHERE repo = ?"
-        params.append(repo)
-    rows = connection.execute(
-        f"""
-        SELECT *
-        FROM review_run_summary
-        {repo_filter}
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        [*params, limit],
-    ).fetchall()
-    return [
-        {
-            "run_id": int(row["id"]),
-            "created_at": str(row["created_at"] or ""),
-            "repo": str(row["repo"] or ""),
-            "pr_number": as_optional_int(row["pr_number"]) or 0,
-            "head_ref": str(row["head_ref"] or ""),
-            "head_sha": str(row["head_sha"] or "")[:12],
-            "findings": int(row["findings_count"] or 0),
-            "watch_items": int(row["watch_items_count"] or 0),
-            "unscored": row["useful_findings_fixed"] is None,
-            "useful_findings_fixed": as_optional_int(row["useful_findings_fixed"]),
-            "false_positives": as_optional_int(row["false_positives"]),
-            "unclear_findings": as_optional_int(row["unclear_findings"]),
-            "elapsed_seconds": round(float(row["elapsed_seconds"] or 0.0), 1),
-        }
-        for row in rows
-    ]
+    return recent_review_runs(connection, repo=repo, limit=limit)
 
 
 def learning_scoreboard_recent_verdicts(
@@ -8073,53 +8542,12 @@ def learning_scoreboard_recent_verdicts(
     repo: str,
     limit: int,
 ) -> list[dict[str, Any]]:
-    repo_filter = ""
-    params: list[Any] = []
-    if repo:
-        repo_filter = "AND (runs.repo = ? OR external_items.repo = ?)"
-        params.extend([repo, repo])
-    rows = connection.execute(
-        f"""
-        SELECT
-            verdicts.id,
-            verdicts.target_kind,
-            verdicts.target_id,
-            verdicts.verdict,
-            COALESCE(NULLIF(verdicts.reason, ''), '(none)') AS reason,
-            verdicts.scorer,
-            verdicts.scored_at,
-            COALESCE(runs.repo, external_items.repo, '') AS repo,
-            COALESCE(items.path, external_items.path, '') AS path
-        FROM item_verdicts AS verdicts
-        LEFT JOIN review_items AS items
-        ON items.id = verdicts.target_id
-        AND verdicts.target_kind = 'review_item'
-        LEFT JOIN review_runs AS runs
-        ON runs.id = items.run_id
-        LEFT JOIN external_items
-        ON external_items.id = verdicts.target_id
-        AND verdicts.target_kind = 'external_item'
-        WHERE 1 = 1
-          {repo_filter}
-        ORDER BY verdicts.id DESC
-        LIMIT ?
-        """,
-        [*params, limit],
-    ).fetchall()
-    return [
-        {
-            "verdict_id": int(row["id"]),
-            "target_kind": str(row["target_kind"] or ""),
-            "target_id": int(row["target_id"] or 0),
-            "verdict": str(row["verdict"] or ""),
-            "reason": str(row["reason"] or ""),
-            "scorer": str(row["scorer"] or ""),
-            "scored_at": str(row["scored_at"] or ""),
-            "repo": str(row["repo"] or ""),
-            "path_class": review_path_class(str(row["path"] or "")),
-        }
-        for row in rows
-    ]
+    return recent_item_verdicts(
+        connection,
+        repo=repo,
+        limit=limit,
+        path_classifier=review_path_class,
+    )
 
 
 def learning_scoreboard_compact_value(value: Any) -> str:
@@ -8457,11 +8885,11 @@ def learning_scoreboard_focus_notes(payload: dict[str, Any]) -> list[str]:
 
 
 def learning_scoreboard_payload(args: argparse.Namespace) -> dict[str, Any]:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     repo, workspace = learning_pump_scope_repo(args)
     generated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         run_counts = learning_scoreboard_run_counts(connection, repo=repo)
         external_counts = learning_scoreboard_external_counts(connection, repo=repo)
@@ -8802,11 +9230,11 @@ def watch_sharpener_condition(record: dict[str, Any]) -> str:
 
 
 def watch_sharpener_payload(args: argparse.Namespace) -> dict[str, Any]:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     repo, workspace = learning_pump_scope_repo(args)
     records: list[dict[str, Any]] = []
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         for record in review_gap_records(
             connection,
@@ -9343,10 +9771,10 @@ def calibration_risk_gate_summary(profiles: list[dict[str, Any]]) -> dict[str, A
 
 
 def calibration_risk_gate_payload(args: argparse.Namespace) -> dict[str, Any]:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     repo = learning_repo_scope_from_args(args)
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         candidates = build_learning_update_candidates(
             connection,
@@ -9595,7 +10023,7 @@ def prompt_regression_local_verdict_counts(
     }
     if not run_ids:
         return counts
-    placeholders = ",".join("?" for _ in run_ids)
+    placeholders = sqlite_placeholders(len(run_ids))
     rows = connection.execute(
         f"""
         SELECT
@@ -9882,7 +10310,7 @@ def prompt_regression_profile(
 
 
 def prompt_regression_payload(args: argparse.Namespace) -> dict[str, Any]:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     repo = learning_repo_scope_from_args(args)
     params: list[Any] = []
@@ -9890,7 +10318,7 @@ def prompt_regression_payload(args: argparse.Namespace) -> dict[str, Any]:
     if repo:
         repo_filter = "AND (scope_repo = '' OR scope_repo = ?)"
         params.append(repo)
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             f"""
@@ -10122,13 +10550,13 @@ def external_verdict_target_from_candidate(
 
 
 def command_external_verdict(args: argparse.Namespace) -> None:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     if args.external_item_id is not None and args.candidate:
         raise SystemExit("Use either external_item_id or --candidate/--sample, not both.")
     selected_candidate: LearningUpdateCandidate | None = None
     selected_sample: dict[str, Any] | None = None
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         external_item_id = args.external_item_id
         if external_item_id is None:
@@ -10172,6 +10600,41 @@ def command_external_verdict(args: argparse.Namespace) -> None:
         f"id={row['id']} verdict={args.verdict} "
         f"source={row['source']} location={location or '(none)'}"
         f"{selected}"
+    )
+
+
+def command_stamp_assist(args: argparse.Namespace) -> None:
+    db_path = sqlite_db_path(args.db)
+    ensure_db_schema(db_path)
+    if args.external_item_id is not None and args.candidate:
+        raise SystemExit("Use either external_item_id or --candidate/--sample, not both.")
+    selected_candidate: LearningUpdateCandidate | None = None
+    with connect_review_db(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        external_item_id = args.external_item_id
+        if external_item_id is None:
+            if not args.candidate:
+                raise SystemExit(
+                    "external_item_id is required, or pass --candidate <candidate-id> --sample <n>"
+                )
+            external_item_id, selected_candidate, _selected_sample = external_verdict_target_from_candidate(
+                connection,
+                args,
+            )
+        payload = stamp_assist_payload_for_external_item(
+            connection,
+            int(external_item_id),
+            candidate=selected_candidate,
+            min_link_score=args.min_link_score,
+        )
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return
+    print(
+        stamp_assist_report(
+            payload,
+            japanese=learn_review_is_japanese(args),
+        ).rstrip()
     )
 
 
@@ -10270,7 +10733,7 @@ def run_daily_learning_activation(args: argparse.Namespace) -> None:
 def command_daily(args: argparse.Namespace) -> None:
     started_at = time.time()
     workspace = detect_workspace_from_args(args)
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     try:
         run_daily_loop(args, workspace=workspace, db_path=db_path)
     except BaseException as exc:
@@ -11341,7 +11804,7 @@ def stale_github_external_item_ids(
     ]
     keep_sql = ""
     if current_github_comment_ids:
-        placeholders = ",".join("?" for _ in current_github_comment_ids)
+        placeholders = sqlite_placeholders(len(current_github_comment_ids))
         keep_sql = f"AND github_comment_id NOT IN ({placeholders})"
         params.extend(sorted(current_github_comment_ids))
     rows = connection.execute(
@@ -11361,7 +11824,7 @@ def stale_github_external_item_ids(
 def delete_external_items(connection: sqlite3.Connection, external_ids: list[int]) -> int:
     if not external_ids:
         return 0
-    placeholders = ",".join("?" for _ in external_ids)
+    placeholders = sqlite_placeholders(len(external_ids))
     connection.execute(
         f"DELETE FROM item_links WHERE external_item_id IN ({placeholders})",
         external_ids,
@@ -11427,7 +11890,7 @@ def load_link_candidates_for_item_types(
     clean_item_types = sorted(item_type for item_type in item_types if item_type)
     if not clean_item_types:
         return []
-    item_type_placeholders = ",".join("?" for _ in clean_item_types)
+    item_type_placeholders = sqlite_placeholders(len(clean_item_types))
     rows = connection.execute(
         f"""
         SELECT
@@ -11485,7 +11948,7 @@ def link_candidate_run_scope(
     clean_head_shas = sorted(sha for sha in head_shas if sha)
     if pr_number > 0:
         if clean_head_shas:
-            placeholders = ",".join("?" for _ in clean_head_shas)
+            placeholders = sqlite_placeholders(len(clean_head_shas))
             clauses.append(
                 f"(runs.pr_number = ? AND (runs.head_sha IN ({placeholders}) OR runs.head_sha = ''))"
             )
@@ -11495,7 +11958,7 @@ def link_candidate_run_scope(
             clauses.append("runs.pr_number = ?")
             params.append(pr_number)
     if clean_head_shas:
-        placeholders = ",".join("?" for _ in clean_head_shas)
+        placeholders = sqlite_placeholders(len(clean_head_shas))
         clauses.append(f"(runs.pr_number = 0 AND runs.head_sha IN ({placeholders}))")
         params.extend(clean_head_shas)
     if head_ref and not clean_head_shas:
@@ -12818,7 +13281,7 @@ def mark_backfill_row_failed(
 def import_github_history_one(args: argparse.Namespace, *, db_path: Path) -> None:
     if args.local_only:
         raise SystemExit("--one imports remote_github queue rows; local-only rows are preview/queue only")
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         if not args.dry_run:
             gate = remote_backfill_rate_gate(
@@ -12868,7 +13331,7 @@ def import_github_history_one(args: argparse.Namespace, *, db_path: Path) -> Non
         if args.dry_run:
             raise
         message = str(exc) or f"import failed with exit code {exc.code}"
-        with sqlite3.connect(db_path) as connection:
+        with connect_review_db(db_path) as connection:
             mark_backfill_row_failed(
                 connection,
                 row_id,
@@ -12879,7 +13342,7 @@ def import_github_history_one(args: argparse.Namespace, *, db_path: Path) -> Non
         raise
 
     if not args.dry_run:
-        with sqlite3.connect(db_path) as connection:
+        with connect_review_db(db_path) as connection:
             mark_backfill_row_imported(connection, row_id)
         print(f"OK: marked github_backfill_queue id={row_id} imported")
 
@@ -12931,7 +13394,7 @@ def print_backfill_preview(candidates: list[BackfillCandidate], *, limit: int) -
 def command_import_github_history(args: argparse.Namespace) -> None:
     if not args.dry_run and not (args.one or args.refresh_queue):
         raise SystemExit("import-github-history writes only with --one or --refresh-queue; use --dry-run to preview")
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     owner = str(args.owner or BACKFILL_DEFAULT_OWNER)
     if owner != BACKFILL_DEFAULT_OWNER:
@@ -12943,7 +13406,7 @@ def command_import_github_history(args: argparse.Namespace) -> None:
             raise SystemExit(f"GitHub auth unavailable: {token_source}")
 
     candidates: list[BackfillCandidate] = []
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         saved = 0
@@ -13133,9 +13596,9 @@ def backfill_pump_import_args(args: argparse.Namespace, *, dry_run: bool) -> arg
 
 
 def backfill_pump_snapshot(args: argparse.Namespace) -> dict[str, Any]:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         summary = backfill_queue_summary(connection)
         gate = remote_backfill_rate_gate(
@@ -13169,7 +13632,7 @@ def backfill_pump_payload(
     import_dry_run: bool,
     import_error: str,
 ) -> dict[str, Any]:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     after_snapshot = backfill_pump_snapshot(args)
     return {
         "schema_name": "llreview.backfill_pump",
@@ -13314,7 +13777,7 @@ def command_backfill_pump(args: argparse.Namespace) -> None:
         raise SystemExit("backfill-pump currently supports --owner mt4110 only")
     if args.import_one and args.local_only:
         raise SystemExit("--import-one imports remote_github queue rows; do not combine it with --local-only")
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     refresh_result: dict[str, Any] | None = None
     import_attempted = False
@@ -13325,7 +13788,7 @@ def command_backfill_pump(args: argparse.Namespace) -> None:
             token, token_source = github_token()
             if not token:
                 raise SystemExit(f"GitHub auth unavailable: {token_source}")
-        with sqlite3.connect(db_path) as connection:
+        with connect_review_db(db_path) as connection:
             connection.row_factory = sqlite3.Row
             refresh_result = backfill_pump_refresh_queue(
                 connection=connection,
@@ -14334,7 +14797,7 @@ def write_calibration_run(
 def latest_item_verdicts(connection: sqlite3.Connection, target_ids: list[int]) -> dict[int, sqlite3.Row]:
     if not target_ids:
         return {}
-    placeholders = ",".join("?" for _ in target_ids)
+    placeholders = sqlite_placeholders(len(target_ids))
     rows = connection.execute(
         f"""
         SELECT verdicts.*
@@ -14518,9 +14981,9 @@ def normalized_auto_item_verdict(value: str) -> str:
 
 
 def command_score(args: argparse.Namespace) -> None:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         if args.run:
             row = connection.execute("SELECT * FROM review_run_summary WHERE id = ?", (args.run,)).fetchone()
@@ -14796,10 +15259,10 @@ def scoring_pump_record(connection: sqlite3.Connection, row: sqlite3.Row) -> dic
 
 
 def scoring_pump_payload(args: argparse.Namespace) -> dict[str, Any]:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     repo, workspace = scoring_pump_scope_repo(args)
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         rows = scoring_pump_candidate_rows(
             connection,
@@ -14951,7 +15414,7 @@ def apply_zero_finding_scores(
         zero_records = zero_records[:max_apply]
     if not zero_records:
         return 0
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         for record in zero_records:
             save_run_feedback(
@@ -15015,7 +15478,7 @@ def command_scoring_pump(args: argparse.Namespace) -> None:
 
 
 def command_import_github_reviews(args: argparse.Namespace) -> None:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
 
     comments: list[Any] = []
@@ -15102,7 +15565,7 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
         item.github_comment_id for item in imported_items if item.github_comment_id
     }
 
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         stale_external_ids = stale_github_external_item_ids(
@@ -15206,9 +15669,9 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
 
 
 def command_report(args: argparse.Namespace) -> None:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             """
@@ -15282,7 +15745,7 @@ def command_report(args: argparse.Namespace) -> None:
             limit=12,
         )
         if run_ids:
-            placeholders = ",".join("?" for _ in run_ids)
+            placeholders = sqlite_placeholders(len(run_ids))
             normalized_finding_items = int(
                 connection.execute(
                     f"""
@@ -15496,12 +15959,12 @@ def print_calibration_result(result: CalibrationResult, *, json_output: bool = F
 
 
 def command_calibration(args: argparse.Namespace) -> None:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     workspace = getattr(args, "_workspace", None)
     if workspace is None and not args.run:
         workspace = detect_workspace_from_args(args)
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         run_row = (
             fetch_review_run_by_id(connection, int(args.run))
@@ -15541,7 +16004,7 @@ def learning_repo_scope_from_args(args: argparse.Namespace) -> str:
 
 
 def command_learn_preview(args: argparse.Namespace) -> None:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     repo = str(args.repo or "")
     if args.all_repos:
@@ -15553,7 +16016,7 @@ def command_learn_preview(args: argparse.Namespace) -> None:
             repo = ""
         else:
             repo = workspace.repo.full_name
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         active_calibration = (
             summarize_active_calibrations(connection, repo=repo, max_items=6)
@@ -15654,7 +16117,7 @@ def command_learn_preview(args: argparse.Namespace) -> None:
 
 
 def command_learn_candidates(args: argparse.Namespace) -> None:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     repo = str(args.repo or "")
     if args.all_repos:
@@ -15666,7 +16129,7 @@ def command_learn_candidates(args: argparse.Namespace) -> None:
             repo = ""
         else:
             repo = workspace.repo.full_name
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         candidates = build_learning_update_candidates(
             connection,
@@ -15755,7 +16218,7 @@ def command_learn_candidates(args: argparse.Namespace) -> None:
 
 
 def command_learn_propose(args: argparse.Namespace) -> None:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     repo = str(args.repo or "")
     if args.all_repos:
@@ -15767,7 +16230,7 @@ def command_learn_propose(args: argparse.Namespace) -> None:
             repo = ""
         else:
             repo = workspace.repo.full_name
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         candidates = build_learning_update_candidates(
             connection,
@@ -15812,7 +16275,7 @@ def command_learn_propose(args: argparse.Namespace) -> None:
 
 
 def command_learn_apply(args: argparse.Namespace) -> None:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     output_dir = Path(args.output_dir).expanduser().resolve()
     proposal, proposal_path = load_learning_proposal(output_dir, args.proposal)
@@ -15825,7 +16288,7 @@ def command_learn_apply(args: argparse.Namespace) -> None:
     if args.dry_run and activate:
         raise SystemExit("Choose either --dry-run or --activate, not both")
     print(learning_calibration_markdown(calibration, activate=activate).rstrip())
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         risk_args = args if activate else replace_namespace(args, force_risk=True)
         profile = enforce_calibration_risk_gate(
@@ -15930,10 +16393,10 @@ def load_or_write_next_learning_proposal(
 
 
 def command_learn_next(args: argparse.Namespace) -> None:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     repo = learning_repo_scope_from_args(args)
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         candidates = build_learning_update_candidates(
             connection,
@@ -16054,7 +16517,7 @@ def command_learn_next(args: argparse.Namespace) -> None:
         return
     calibration = learning_calibration_from_proposal(proposal, source_path=json_path)
     print(learning_calibration_markdown(calibration, activate=activate).rstrip())
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         risk_args = args if activate else replace_namespace(args, force_risk=True)
         profile = enforce_calibration_risk_gate(
@@ -16073,7 +16536,7 @@ def command_learn_next(args: argparse.Namespace) -> None:
         or (profile["risk_level"] == "warn" and getattr(args, "block_on_risk_warn", False))
     ):
         return
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         upsert_learning_calibration(connection, calibration)
     print(f"\nOK: activated learning calibration {calibration['calibration_id'][:12]}")
@@ -16134,6 +16597,7 @@ def print_learning_review_sample(
     show_text: bool,
     verbose: bool,
     args: argparse.Namespace,
+    assist: dict[str, Any] | None = None,
 ) -> None:
     body_value = sample.get("body_excerpt") if show_text else sample.get("body_digest")
     print("")
@@ -16150,6 +16614,12 @@ def print_learning_review_sample(
         else:
             print(f"  current={sample.get('source')} {sample.get('verdict')}:{sample.get('reason')}")
             print(f"  body {'excerpt' if show_text else 'digest'}={body_value or '(none)'}")
+    if assist is not None:
+        for line in stamp_assist_compact_text(
+            assist,
+            japanese=learn_review_is_japanese(args),
+        ):
+            print(f"  {line}")
 
 
 def prompt_learning_review_action(args: argparse.Namespace) -> str:
@@ -16346,12 +16816,21 @@ def review_external_learning_candidate(
     saved = 0
     quit_requested = False
     for index, sample in enumerate(samples, start=1):
+        assist = None
+        if not getattr(args, "no_assist", False):
+            assist = stamp_assist_for_learning_sample(
+                connection,
+                candidate,
+                sample,
+                min_link_score=args.assist_min_link_score,
+            )
         print_learning_review_sample(
             sample,
             index=index,
             show_text=args.show_text,
             verbose=args.verbose,
             args=args,
+            assist=assist,
         )
         if args.dry_run:
             print(learn_review_text(args, "DRY RUN: would ask for a stamp.", "DRY RUN: ここでハンコ入力を求めます。"))
@@ -16384,6 +16863,130 @@ def review_external_learning_candidate(
                 )
             )
     return saved, quit_requested
+
+
+def print_learning_review_gap_record(
+    record: dict[str, Any],
+    *,
+    index: int,
+    total: int,
+    show_text: bool,
+    verbose: bool,
+    args: argparse.Namespace,
+    assist: dict[str, Any] | None = None,
+) -> None:
+    print("")
+    if learn_review_is_japanese(args):
+        print(f"Review Gap {index}/{total} id={record.get('external_item_id')} {gap_example_location(record)}")
+        print(f"  タイトル: {record.get('title_excerpt')}")
+        print(f"  状態: {record.get('label')} / {record.get('label_quality')}")
+        print(f"  根拠: {review_gap_stamp_rationale(record)}")
+    else:
+        print(f"Review Gap {index}/{total} id={record.get('external_item_id')} {gap_example_location(record)}")
+        print(f"  title: {record.get('title_excerpt')}")
+        print(f"  state: {record.get('label')} / {record.get('label_quality')}")
+        print(f"  rationale: {review_gap_stamp_rationale(record)}")
+    if assist is not None:
+        for line in stamp_assist_compact_text(
+            assist,
+            japanese=learn_review_is_japanese(args),
+        ):
+            print(f"  {line}")
+    if show_text and record.get("body_excerpt"):
+        label = "本文抜粋" if learn_review_is_japanese(args) else "body excerpt"
+        print(f"  {label}: {record['body_excerpt']}")
+    elif verbose:
+        label = "本文digest" if learn_review_is_japanese(args) else "body digest"
+        print(f"  {label}: {record.get('body_digest') or '(none)'}")
+
+
+def review_gap_stamp_action_for_learning_action(
+    record: dict[str, Any],
+    action: str,
+) -> tuple[str, str, str] | None:
+    choice_by_action = {
+        "valid_missed": "y",
+        "covered": "c",
+        "false_positive": "f",
+        "needs_human_review": "n",
+    }
+    choice = choice_by_action.get(action)
+    if not choice:
+        return None
+    return review_gap_stamp_action(record, choice)
+
+
+def review_learning_gap_stamps(
+    connection: sqlite3.Connection,
+    records: list[dict[str, Any]],
+    *,
+    args: argparse.Namespace,
+) -> tuple[int, int, bool]:
+    if not records:
+        return 0, 0, False
+    print("")
+    print(
+        learn_review_text(
+            args,
+            "## Review Gap Stamps",
+            "## Review Gap ハンコ",
+        )
+    )
+    saved = 0
+    reviewed = 0
+    quit_requested = False
+    for index, record in enumerate(records, start=1):
+        assist = None
+        if not getattr(args, "no_assist", False):
+            assist = stamp_assist_payload_for_external_item(
+                connection,
+                int(record["external_item_id"]),
+                min_link_score=args.assist_min_link_score,
+            )
+        print_learning_review_gap_record(
+            record,
+            index=index,
+            total=len(records),
+            show_text=args.show_text,
+            verbose=args.verbose,
+            args=args,
+            assist=assist,
+        )
+        reviewed += 1
+        if args.dry_run:
+            print(learn_review_text(args, "DRY RUN: would ask for a stamp.", "DRY RUN: ここでハンコ入力を求めます。"))
+            continue
+        action = prompt_learning_review_action(args)
+        if action == "quit":
+            quit_requested = True
+            break
+        if action == "skip":
+            continue
+        stamp_action = review_gap_stamp_action_for_learning_action(record, action)
+        if stamp_action is None:
+            continue
+        verdict, reason, note = stamp_action
+        inserted = insert_external_item_verdict(
+            connection,
+            external_item_id=int(record["external_item_id"]),
+            verdict=verdict,
+            reason=reason,
+            note=f"learn-review: {note}",
+            scorer=args.scorer,
+        )
+        connection.commit()
+        if inserted:
+            saved += 1
+            print(f"OK: id={record['external_item_id']} -> {verdict}/{reason}")
+        else:
+            print(
+                learn_review_text(
+                    args,
+                    f"OK: id={record['external_item_id']} already had the same stamp.",
+                    f"OK: id={record['external_item_id']} は同じハンコ済みです。",
+                )
+            )
+    return saved, reviewed, quit_requested
 
 
 def prompt_learning_activation(args: argparse.Namespace) -> str:
@@ -16532,13 +17135,15 @@ def command_learn_review(args: argparse.Namespace) -> None:
                 "learn-review は対話式です。TTYで実行するか、preview には --dry-run を付けてください。",
             )
         )
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     repo = learning_repo_scope_from_args(args)
     stamped = 0
+    gap_stamped = 0
+    reviewed_gap_stamps = 0
     activated = 0
     reviewed_candidates = 0
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         candidates = build_learning_update_candidates(
             connection,
@@ -16571,6 +17176,35 @@ def command_learn_review(args: argparse.Namespace) -> None:
                 review_candidates.append(candidate)
             if len(review_candidates) >= args.limit:
                 break
+        gap_stamp_records: list[dict[str, Any]] = []
+        if not getattr(args, "no_review_gap_stamps", False):
+            raw_gap_stamp_records = review_gap_stamp_records(
+                connection,
+                repo=repo,
+                scan_limit=args.review_gap_scan_limit,
+                limit=args.review_gap_limit,
+                min_link_score=args.assist_min_link_score,
+                show_text=args.show_text,
+                excerpt_chars=args.excerpt_chars,
+            )
+            candidate_external_ids: set[int] = set()
+            for candidate in review_candidates:
+                if not candidate.signal_kind.startswith("external_"):
+                    continue
+                for sample in candidate_unreviewed_external_samples(
+                    connection,
+                    candidate,
+                    sample_limit=args.samples,
+                    show_text=False,
+                    excerpt_chars=args.excerpt_chars,
+                ):
+                    if sample.get("sample_kind") == "external_item":
+                        candidate_external_ids.add(int(sample["sample_id"]))
+            gap_stamp_records = [
+                record
+                for record in raw_gap_stamp_records
+                if int(record["external_item_id"]) not in candidate_external_ids
+            ]
         print(learn_review_text(args, "# Learning Review", "# Learning Review / 学習レビュー"))
         print("")
         print(
@@ -16607,21 +17241,23 @@ def command_learn_review(args: argparse.Namespace) -> None:
         print(f"- DB: `{db_path}`")
         print(f"- {learn_review_text(args, 'Repo scope', 'Repo scope')}: `{repo or 'global'}`")
         print(f"- {learn_review_text(args, 'Candidates', '候補数')}: `{len(review_candidates)}`")
+        print(f"- {learn_review_text(args, 'Review gap stamps', 'Review Gap ハンコ')}: `{len(gap_stamp_records)}`")
         print(f"- {learn_review_text(args, 'Language', '表示言語')}: `{args.language}`")
         if args.dry_run:
             print(f"- {learn_review_text(args, 'Mode', 'モード')}: `dry-run`")
         if args.no_activate:
             print(f"- {learn_review_text(args, 'Activation', '有効化')}: `disabled`")
-        if not review_candidates:
+        if not review_candidates and not gap_stamp_records:
             print("")
             print(
                 learn_review_text(
                     args,
-                    "No learning candidates need review at the current threshold.",
-                    "現在の threshold では確認が必要な learning candidate はありません。",
+                    "No learning candidates or review-gap stamps need review at the current threshold.",
+                    "現在の threshold では確認が必要な learning candidate / review-gap ハンコはありません。",
                 )
             )
             return
+        quit_requested = False
         for index, candidate in enumerate(review_candidates, start=1):
             print_learning_candidate_brief(
                 candidate,
@@ -16631,7 +17267,6 @@ def command_learn_review(args: argparse.Namespace) -> None:
                 args=args,
             )
             reviewed_candidates += 1
-            quit_requested = False
             if candidate.signal_kind.startswith("external_"):
                 saved, quit_requested = review_external_learning_candidate(
                     connection,
@@ -16660,11 +17295,21 @@ def command_learn_review(args: argparse.Namespace) -> None:
                 )
             elif candidate.candidate_kind == "needs_data":
                 print(f"- {learn_review_text(args, 'Needs data', '追加データが必要')}: {candidate.recommended_action}")
+        if not quit_requested:
+            saved, reviewed, quit_requested = review_learning_gap_stamps(
+                connection,
+                gap_stamp_records,
+                args=args,
+            )
+            gap_stamped += saved
+            reviewed_gap_stamps += reviewed
         print("")
         print(learn_review_text(args, "## Summary", "## まとめ"))
         print("")
         print(f"- {learn_review_text(args, 'Reviewed candidates', '確認した候補')}: `{reviewed_candidates}`")
         print(f"- {learn_review_text(args, 'External item stamps', 'External item ハンコ')}: `{stamped}`")
+        print(f"- {learn_review_text(args, 'Review gap stamps reviewed', 'Review Gap ハンコ確認')}: `{reviewed_gap_stamps}`")
+        print(f"- {learn_review_text(args, 'Review gap stamps saved', 'Review Gap ハンコ保存')}: `{gap_stamped}`")
         print(f"- {learn_review_text(args, 'Activated calibrations', '有効化した校正')}: `{activated}`")
 
 
@@ -16774,7 +17419,7 @@ def audit_calibration_counts(
 
 
 def command_learn_audit(args: argparse.Namespace) -> None:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     repo = str(args.repo or "")
     if args.all_repos:
@@ -16791,7 +17436,7 @@ def command_learn_audit(args: argparse.Namespace) -> None:
     if repo:
         repo_filter = "AND (scope_repo = '' OR scope_repo = ?)"
         params.append(repo)
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             f"""
@@ -16849,11 +17494,11 @@ def command_learn_audit(args: argparse.Namespace) -> None:
 
 
 def command_export_jsonl(args: argparse.Namespace) -> None:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     output = Path(args.output).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(db_path) as connection, output.open("w", encoding="utf-8") as file:
+    with connect_review_db(db_path) as connection, output.open("w", encoding="utf-8") as file:
         connection.row_factory = sqlite3.Row
         context_digest_rows = connection.execute(
             """
@@ -17201,6 +17846,489 @@ def command_export_jsonl(args: argparse.Namespace) -> None:
     )
 
 
+def sqlite_identifier(value: str) -> str:
+    return SQLITE_DIALECT.quote_identifier(value)
+
+
+def sqlite_readonly_connection(db_path: Path) -> sqlite3.Connection:
+    return connect_review_db_readonly(db_path, row_factory=True)
+
+
+def db_plan_columns(connection: sqlite3.Connection, table: str) -> list[dict[str, Any]]:
+    try:
+        rows = connection.execute(f"PRAGMA table_info({sqlite_identifier(table)})").fetchall()
+    except sqlite3.Error:
+        return []
+    return [
+        {
+            "name": str(row["name"]),
+            "type": str(row["type"]),
+            "not_null": bool(row["notnull"]),
+            "default": row["dflt_value"],
+            "primary_key": bool(row["pk"]),
+        }
+        for row in rows
+    ]
+
+
+def db_plan_existing_objects(connection: sqlite3.Connection) -> dict[str, list[str]]:
+    rows = connection.execute(
+        """
+        SELECT type, name
+        FROM sqlite_master
+        WHERE type IN ('table', 'view', 'index')
+          AND name NOT LIKE 'sqlite_%'
+        ORDER BY type, name
+        """
+    ).fetchall()
+    objects: dict[str, list[str]] = {"table": [], "view": [], "index": []}
+    for row in rows:
+        objects.setdefault(str(row["type"]), []).append(str(row["name"]))
+    return objects
+
+
+def db_plan_training_ready_external_examples(connection: sqlite3.Connection) -> int:
+    try:
+        rows = connection.execute(
+            """
+            SELECT
+                verdicts.verdict,
+                COALESCE(NULLIF(verdicts.reason, ''), '(none)') AS reason,
+                COUNT(*) AS count
+            FROM item_verdicts AS verdicts
+            JOIN (
+                SELECT target_kind, target_id, MAX(id) AS id
+                FROM item_verdicts
+                GROUP BY target_kind, target_id
+            ) AS latest
+            ON latest.id = verdicts.id
+            WHERE verdicts.target_kind = 'external_item'
+            GROUP BY verdicts.verdict, reason
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return 0
+    total = 0
+    for row in rows:
+        verdict = str(row["verdict"] or "")
+        reason = str(row["reason"] or "")
+        if verdict == "missed_by_local" and reason in {"teacher_model_valid", "external_valid"}:
+            total += int(row["count"] or 0)
+    return total
+
+
+def postgres_copy_columns(columns: list[str]) -> str:
+    return ", ".join(sqlite_identifier(column) for column in columns)
+
+
+def postgres_copy_value(value: Any) -> Any:
+    if value is None:
+        return POSTGRES_COPY_NULL
+    if value == POSTGRES_COPY_NULL:
+        raise SystemExit(
+            "Cannot run Docker parity because a SQLite value collides with the internal COPY NULL marker."
+        )
+    return value
+
+
+def db_plan_write_postgres_copy_inputs(
+    connection: sqlite3.Connection,
+    export_dir: Path,
+) -> list[dict[str, Any]]:
+    export_dir.mkdir(parents=True, exist_ok=True)
+    copy_lines = ["\\set ON_ERROR_STOP on", "BEGIN;"]
+    rows: list[dict[str, Any]] = []
+    for table in REVIEW_HISTORY_TABLES:
+        columns = [str(row["name"]) for row in connection.execute(f"PRAGMA table_info({sqlite_identifier(table)})")]
+        csv_path = export_dir / f"{table}.csv"
+        with csv_path.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(columns)
+            column_sql = postgres_copy_columns(columns)
+            for row in connection.execute(
+                f"SELECT {column_sql} FROM {sqlite_identifier(table)} ORDER BY 1"
+            ):
+                writer.writerow([postgres_copy_value(value) for value in row])
+        expected_count = int(
+            count_rows(connection, table, dialect=SQLITE_DIALECT)
+        )
+        copy_lines.append(
+            f"\\copy {sqlite_identifier(table)} ({postgres_copy_columns(columns)}) "
+            f"FROM '/parity/{table}.csv' WITH (FORMAT csv, HEADER true, NULL '{POSTGRES_COPY_NULL}')"
+        )
+        rows.append(
+            {
+                "table": table,
+                "expected_count": expected_count,
+                "csv_path": str(csv_path),
+            }
+        )
+    copy_lines.append("COMMIT;")
+    (export_dir / "copy.sql").write_text("\n".join(copy_lines) + "\n", encoding="utf-8")
+    return rows
+
+
+def docker_run(cmd: list[str], *, check: bool = True) -> str:
+    return run(["docker", *cmd], check=check)
+
+
+def db_plan_postgres_docker_parity(
+    args: argparse.Namespace,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    if not payload["source"]["exists"]:
+        raise SystemExit("Cannot run Docker parity because the SQLite DB does not exist.")
+    if payload["required_missing"]:
+        missing = ", ".join(payload["required_missing"])
+        raise SystemExit(f"Cannot run Docker parity because required SQLite objects are missing: {missing}")
+    if not payload["target"]["schema_exists"]:
+        raise SystemExit(f"Cannot run Docker parity because schema is missing: {payload['target']['schema_path']}")
+    if shutil.which("docker") is None:
+        raise SystemExit("Cannot run Docker parity because docker was not found in PATH.")
+
+    db_path = sqlite_db_path(args.db)
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    stamp = timestamp_slug()
+    work_dir = output_dir / f"postgres-parity-{stamp}-work"
+    container_name = f"llreview-pg-parity-{stamp}-{os.getpid()}"
+    schema_path = Path(args.schema).expanduser().resolve()
+    rows: list[dict[str, Any]] = []
+    view_count = 0
+    started = False
+    try:
+        with sqlite_readonly_connection(db_path) as connection:
+            rows = db_plan_write_postgres_copy_inputs(connection, work_dir)
+        docker_run(
+            [
+                "run",
+                "--rm",
+                "--name",
+                container_name,
+                "-e",
+                "POSTGRES_PASSWORD=llreview",
+                "-v",
+                f"{schema_path.parent}:/schema:ro",
+                "-v",
+                f"{work_dir}:/parity:ro",
+                "-d",
+                args.postgres_image,
+            ]
+        )
+        started = True
+        ready = False
+        wait_seconds = max(1, int(args.postgres_wait_seconds))
+        for _ in range(wait_seconds):
+            completed = subprocess.run(
+                ["docker", "exec", container_name, "pg_isready", "-U", "postgres"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if completed.returncode == 0:
+                ready = True
+                break
+            time.sleep(1)
+        if not ready:
+            raise SystemExit(f"PostgreSQL container did not become ready within {wait_seconds}s")
+        docker_run(
+            [
+                "exec",
+                container_name,
+                "psql",
+                "-U",
+                "postgres",
+                "-d",
+                "postgres",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-f",
+                f"/schema/{schema_path.name}",
+            ]
+        )
+        docker_run(
+            [
+                "exec",
+                container_name,
+                "psql",
+                "-U",
+                "postgres",
+                "-d",
+                "postgres",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-f",
+                "/parity/copy.sql",
+            ]
+        )
+        for row in rows:
+            actual = docker_run(
+                [
+                    "exec",
+                    container_name,
+                    "psql",
+                    "-U",
+                    "postgres",
+                    "-d",
+                    "postgres",
+                    "-Atc",
+                    f"SELECT COUNT(*) FROM {sqlite_identifier(str(row['table']))}",
+                ]
+            )
+            row["actual_count"] = int(actual.strip())
+            row["matches"] = row["actual_count"] == row["expected_count"]
+            row.pop("csv_path", None)
+        view_count = int(
+            docker_run(
+                [
+                    "exec",
+                    container_name,
+                    "psql",
+                    "-U",
+                    "postgres",
+                    "-d",
+                    "postgres",
+                    "-Atc",
+                    (
+                        "SELECT COUNT(*) FROM information_schema.views "
+                        "WHERE table_schema='public' AND table_name='review_run_summary'"
+                    ),
+                ]
+            )
+        )
+    finally:
+        if started:
+            docker_run(["rm", "-f", container_name], check=False)
+        if not args.keep_parity_workdir:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    return {
+        "status": "ok" if all(row["matches"] for row in rows) and view_count == 1 else "mismatch",
+        "postgres_image": args.postgres_image,
+        "schema_applied": True,
+        "review_run_summary_view_count": view_count,
+        "tables": rows,
+        "raw_workdir_kept": bool(args.keep_parity_workdir),
+        "raw_workdir": str(work_dir) if args.keep_parity_workdir else "",
+    }
+
+
+def db_plan_payload(args: argparse.Namespace) -> dict[str, Any]:
+    db_path = sqlite_db_path(args.db)
+    schema_path = Path(args.schema).expanduser().resolve()
+    payload: dict[str, Any] = {
+        "schema_version": "local-ai-review.db_plan.v1",
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+        "source": {
+            "backend": "sqlite",
+            "path": str(db_path),
+            "exists": db_path.is_file(),
+            "size_bytes": db_path.stat().st_size if db_path.is_file() else 0,
+            "opened_read_only": False,
+            "sqlite_version": sqlite3.sqlite_version,
+        },
+        "target": {
+            "backend": "postgresql",
+            "optional_only": True,
+            "schema_path": str(schema_path),
+            "schema_exists": schema_path.is_file(),
+            "schema_sha256": sha256_file(schema_path) if schema_path.is_file() else "",
+        },
+        "tables": {},
+        "views": {},
+        "indexes": [],
+        "required_missing": [],
+        "gate_results": [],
+        "recommendation": "sqlite_db_missing",
+        "notes": [
+            "Default db-plan is a read-only migration dry-run and does not copy rows.",
+            "--docker-parity copies rows only into a temporary local PostgreSQL container, then removes raw CSV by default.",
+            "The source SQLite DB is never mutated.",
+            "SQLite remains the default backend; PostgreSQL is an operator-selected future backend.",
+            "Lock contention and slow-query pressure are operational signals and are not inferred here.",
+        ],
+    }
+    if not db_path.is_file():
+        payload["required_missing"] = list(REVIEW_HISTORY_TABLES)
+        return payload
+
+    with sqlite_readonly_connection(db_path) as connection:
+        payload["source"]["opened_read_only"] = True
+        objects = db_plan_existing_objects(connection)
+        existing_tables = set(objects.get("table", []))
+        existing_views = set(objects.get("view", []))
+        payload["indexes"] = objects.get("index", [])
+        row_counts = table_counts(
+            connection,
+            [table for table in REVIEW_HISTORY_TABLES if table in existing_tables],
+            dialect=SQLITE_DIALECT,
+        )
+        for table in REVIEW_HISTORY_TABLES:
+            payload["tables"][table] = {
+                "exists": table in existing_tables,
+                "row_count": row_counts.get(table) if table in existing_tables else None,
+                "columns": db_plan_columns(connection, table) if table in existing_tables else [],
+            }
+        for view in REVIEW_HISTORY_VIEWS:
+            payload["views"][view] = {"exists": view in existing_views}
+        payload["required_missing"] = [
+            table for table in REVIEW_HISTORY_TABLES if table not in existing_tables
+        ] + [view for view in REVIEW_HISTORY_VIEWS if view not in existing_views]
+        training_ready = db_plan_training_ready_external_examples(connection)
+
+    counts = {
+        table: int(details["row_count"] or 0)
+        for table, details in payload["tables"].items()
+        if isinstance(details, dict)
+    }
+    counts["training_ready_external_examples"] = training_ready
+    counts["sqlite_db_bytes"] = int(payload["source"]["size_bytes"])
+    gate_results = []
+    for key, label, threshold in POSTGRES_OPTIONAL_BACKEND_GATES:
+        current = counts.get(key, 0)
+        gate_results.append(
+            {
+                "key": key,
+                "label": label,
+                "current": current,
+                "threshold": threshold,
+                "met": current >= threshold,
+            }
+        )
+    payload["gate_results"] = gate_results
+    if payload["required_missing"]:
+        payload["recommendation"] = "initialize_or_migrate_sqlite_schema_first"
+    elif any(result["met"] for result in gate_results):
+        payload["recommendation"] = "optional_postgresql_backend_gate_met"
+    else:
+        payload["recommendation"] = "design_scaffold_only"
+    return payload
+
+
+def db_plan_status(value: bool) -> str:
+    return "ok" if value else "missing"
+
+
+def db_plan_report(payload: dict[str, Any]) -> str:
+    source = payload["source"]
+    target = payload["target"]
+    lines = [
+        "# llreview db-plan",
+        "",
+        "Read-only PostgreSQL backend migration dry-run.",
+        "",
+        "## Source",
+        "",
+        f"- SQLite DB: `{source['path']}`",
+        f"- Exists: `{source['exists']}`",
+        f"- Size: `{human_bytes(int(source['size_bytes']))}`",
+        f"- Opened read-only: `{source['opened_read_only']}`",
+        "",
+        "## Target",
+        "",
+        f"- PostgreSQL schema draft: `{target['schema_path']}`",
+        f"- Schema exists: `{target['schema_exists']}`",
+        f"- Schema sha256: `{target['schema_sha256'] or '(missing)'}`",
+        "- Default backend remains: `sqlite`",
+        "",
+    ]
+    if not source["exists"]:
+        lines.extend(
+            [
+                "## Result",
+                "",
+                "No SQLite review-history DB was found, so no migration readiness checks ran.",
+                "",
+            ]
+        )
+        return "\n".join(lines).rstrip() + "\n"
+
+    lines.extend(["## Required Objects", "", "| Object | Status | Rows / Details |", "| --- | --- | --- |"])
+    for table in REVIEW_HISTORY_TABLES:
+        details = payload["tables"][table]
+        row_count = details["row_count"]
+        row_text = "" if row_count is None else str(row_count)
+        lines.append(f"| `{table}` | {db_plan_status(details['exists'])} | {row_text} |")
+    for view in REVIEW_HISTORY_VIEWS:
+        details = payload["views"][view]
+        lines.append(f"| `{view}` | {db_plan_status(details['exists'])} | view |")
+    lines.extend(["", "## Optional Backend Gates", "", "| Gate | Current | Threshold | Status |", "| --- | ---: | ---: | --- |"])
+    for result in payload["gate_results"]:
+        current = int(result["current"])
+        threshold = int(result["threshold"])
+        if result["key"] == "sqlite_db_bytes":
+            current_text = human_bytes(current)
+            threshold_text = human_bytes(threshold)
+        else:
+            current_text = str(current)
+            threshold_text = str(threshold)
+        status = "met" if result["met"] else "not yet"
+        lines.append(f"| {result['label']} | {current_text} | {threshold_text} | {status} |")
+    parity = payload.get("postgres_docker_parity")
+    if isinstance(parity, dict):
+        lines.extend(
+            [
+                "",
+                "## PostgreSQL Docker Parity",
+                "",
+                f"- Status: `{parity.get('status', 'unknown')}`",
+                f"- Image: `{parity.get('postgres_image', '')}`",
+                f"- Schema applied: `{parity.get('schema_applied', False)}`",
+                f"- `review_run_summary` views: `{parity.get('review_run_summary_view_count', 0)}`",
+                f"- Raw workdir kept: `{parity.get('raw_workdir_kept', False)}`",
+                "",
+                "| Table | SQLite rows | PostgreSQL rows | Status |",
+                "| --- | ---: | ---: | --- |",
+            ]
+        )
+        for row in parity.get("tables", []):
+            status = "ok" if row.get("matches") else "mismatch"
+            lines.append(
+                f"| `{row['table']}` | {row['expected_count']} | {row['actual_count']} | {status} |"
+            )
+        if parity.get("raw_workdir"):
+            lines.extend(["", f"- Raw parity workdir: `{parity['raw_workdir']}`"])
+    lines.extend(
+        [
+            "",
+            "## Recommendation",
+            "",
+            f"`{payload['recommendation']}`",
+            "",
+            "## Notes",
+            "",
+        ]
+    )
+    for note in payload["notes"]:
+        lines.append(f"- {note}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def command_db_plan(args: argparse.Namespace) -> None:
+    payload = db_plan_payload(args)
+    if args.docker_parity:
+        payload["postgres_docker_parity"] = db_plan_postgres_docker_parity(args, payload)
+    report = db_plan_report(payload)
+    written: list[Path] = []
+    if not args.no_write:
+        output_dir = Path(args.output_dir).expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stamp = timestamp_slug()
+        json_path = output_dir / f"db-plan-{stamp}.json"
+        markdown_path = output_dir / f"db-plan-{stamp}.md"
+        write_json(json_path, payload)
+        markdown_path.write_text(report, encoding="utf-8")
+        written.extend([json_path, markdown_path])
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(report, end="")
+        if written:
+            print("")
+            print("Artifacts:")
+            for path in written:
+                print(f"- {path}")
+
+
 def timestamp_slug() -> str:
     return time.strftime("%Y%m%d-%H%M%S", time.localtime())
 
@@ -17228,19 +18356,22 @@ def backup_learning_snapshot_counts(db_path: Path, *, threshold: int = 2) -> dic
     }
     if not db_path.is_file():
         return counts
-    with sqlite3.connect(db_path) as connection:
+    with connect_review_db(db_path) as connection:
         connection.row_factory = sqlite3.Row
-        for table, key in [
+        table_keys = [
             ("review_runs", "review_runs"),
             ("review_items", "review_items"),
             ("external_items", "external_items"),
             ("github_backfill_queue", "backfill_queue"),
             ("learning_calibrations", "learning_calibrations"),
-        ]:
-            try:
-                counts[key] = int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-            except sqlite3.Error:
-                counts[key] = 0
+        ]
+        raw_counts = table_counts(
+            connection,
+            [table for table, _key in table_keys],
+            dialect=SQLITE_DIALECT,
+        )
+        for table, key in table_keys:
+            counts[key] = int(raw_counts.get(table) or 0)
         try:
             counts["learning_candidates"] = len(
                 build_learning_update_candidates(
@@ -17273,8 +18404,8 @@ def format_learning_delta(before: dict[str, int], after: dict[str, int]) -> str:
 
 def sqlite_backup(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(source) as source_connection:
-        with sqlite3.connect(destination) as destination_connection:
+    with connect_review_db(source) as source_connection:
+        with connect_review_db(destination) as destination_connection:
             source_connection.backup(destination_connection)
 
 
@@ -17289,7 +18420,7 @@ def copy_if_exists(source: Path, destination: Path, *, dry_run: bool) -> Path | 
 
 
 def command_backup(args: argparse.Namespace) -> None:
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     destination_dir = Path(args.dest or DEFAULT_BACKUP_DIR).expanduser().resolve()
     stamp = timestamp_slug()
@@ -17451,7 +18582,7 @@ def build_review_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Auto-detect and run local PR review",
         epilog=(
-            "Subcommands: status, target, daily, backup, second-opinion, async-status, app-developer-review-status, external-verdict, notify-test, calibration, score, scoring-pump, review-gap-stamp-pump, recall-pattern-miner, watch-sharpener, calibration-risk-gate, prompt-regression-audit, backfill-pump, matcher-explain, training-export-splitter, rule-candidate-extractor, report, learn-preview, learn-candidates, learn-pump, learn-review, learn-propose, learn-next, learn-apply, learn-audit, export-jsonl, "
+            "Subcommands: status, target, daily, backup, db-plan, second-opinion, async-status, app-developer-review-status, external-verdict, stamp-assist, notify-test, calibration, score, scoring-pump, review-gap-stamp-pump, recall-pattern-miner, watch-sharpener, calibration-risk-gate, prompt-regression-audit, backfill-pump, matcher-explain, training-export-splitter, rule-candidate-extractor, report, learn-preview, learn-candidates, learn-pump, learn-review, learn-propose, learn-next, learn-apply, learn-audit, export-jsonl, "
             "import-github-reviews, import-github-history, install, update"
         ),
     )
@@ -17616,6 +18747,43 @@ def build_external_verdict_parser() -> argparse.ArgumentParser:
     verdict.add_argument("--note", default="")
     verdict.add_argument("--scorer", default="manual")
     return verdict
+
+
+def build_stamp_assist_parser() -> argparse.ArgumentParser:
+    assist = argparse.ArgumentParser(
+        description="Explain deterministic stamp-assist guidance for one external review item"
+    )
+    assist.set_defaults(func=command_stamp_assist)
+    add_workspace_options(assist)
+    assist.add_argument("external_item_id", nargs="?", type=parse_non_negative)
+    assist.add_argument(
+        "--candidate",
+        help="Learning candidate id, row number, or unique prefix; pair with --sample instead of copying an external_item id",
+    )
+    assist.add_argument(
+        "--sample",
+        type=parse_non_negative,
+        default=1,
+        help="1-based supporting sample number when --candidate is used",
+    )
+    assist.add_argument("--all-repos", action="store_true", help="Use global DB scope for --candidate lookup")
+    assist.add_argument("--threshold", type=parse_non_negative, default=2)
+    assist.add_argument("--min-link-score", type=float, default=0.55)
+    assist.add_argument(
+        "--language",
+        type=normalize_learn_review_language,
+        default=default_learn_review_language(),
+        help="Language for stamp-assist output: en or ja (env: LLREVIEW_LEARN_REVIEW_LANGUAGE)",
+    )
+    assist.add_argument(
+        "--ja",
+        dest="language",
+        action="store_const",
+        const="ja",
+        help="Use Japanese stamp-assist output",
+    )
+    assist.add_argument("--json", action="store_true", help="Print JSON payload instead of markdown")
+    return assist
 
 
 def build_notify_test_parser() -> argparse.ArgumentParser:
@@ -18059,6 +19227,31 @@ def build_backup_parser() -> argparse.ArgumentParser:
     backup.add_argument("--no-jsonl", action="store_true", help="Do not refresh/copy review-items.jsonl")
     backup.add_argument("--no-report", action="store_true", help="Do not copy benchmark-report.md")
     return backup
+
+
+def build_db_plan_parser() -> argparse.ArgumentParser:
+    plan = argparse.ArgumentParser(
+        description="Write a read-only SQLite-to-PostgreSQL backend migration dry-run"
+    )
+    plan.set_defaults(func=command_db_plan)
+    plan.add_argument("--db", default=str(DEFAULT_DB), help="SQLite review history DB")
+    plan.add_argument("--schema", default=str(DEFAULT_POSTGRES_SCHEMA), help="PostgreSQL schema draft")
+    plan.add_argument("--output-dir", default=str(DEFAULT_DB_PLAN_DIR), help="Artifact output directory")
+    plan.add_argument("--no-write", action="store_true", help="Print only; do not write plan artifacts")
+    plan.add_argument("--json", action="store_true", help="Print JSON payload instead of markdown")
+    plan.add_argument(
+        "--docker-parity",
+        action="store_true",
+        help="Use a temporary PostgreSQL Docker container to apply the schema, import SQLite rows, and verify counts",
+    )
+    plan.add_argument("--postgres-image", default="postgres:16", help="PostgreSQL Docker image for --docker-parity")
+    plan.add_argument("--postgres-wait-seconds", type=parse_non_negative, default=60)
+    plan.add_argument(
+        "--keep-parity-workdir",
+        action="store_true",
+        help="Keep temporary raw CSV copy files under --output-dir; they may contain private review text",
+    )
+    return plan
 
 
 def build_score_parser() -> argparse.ArgumentParser:
@@ -18590,6 +19783,34 @@ def build_learn_review_parser() -> argparse.ArgumentParser:
         help="Show full candidate metadata, proposal paths, and full activation previews",
     )
     review.add_argument(
+        "--no-assist",
+        action="store_true",
+        help="Hide deterministic stamp-assist recommendations in the sample prompt",
+    )
+    review.add_argument(
+        "--assist-min-link-score",
+        type=float,
+        default=0.55,
+        help="Minimum deterministic link score used by stamp-assist coverage checks",
+    )
+    review.add_argument(
+        "--no-review-gap-stamps",
+        action="store_true",
+        help="Do not include human-gate review-gap examples in learn-review",
+    )
+    review.add_argument(
+        "--review-gap-limit",
+        type=parse_non_negative,
+        default=3,
+        help="Human-gate review-gap examples to stamp after candidate samples",
+    )
+    review.add_argument(
+        "--review-gap-scan-limit",
+        type=parse_non_negative,
+        default=200,
+        help="Review-gap examples to scan before filtering human-gate rows; 0 means all",
+    )
+    review.add_argument(
         "--include-needs-data",
         action="store_true",
         help="Also show needs_data candidates; they remain preview-only",
@@ -18993,10 +20214,12 @@ COMMAND_PARSERS = {
     "target": build_target_parser,
     "daily": build_daily_parser,
     "backup": build_backup_parser,
+    "db-plan": build_db_plan_parser,
     "second-opinion": build_second_opinion_parser,
     "async-status": build_async_status_parser,
     "app-developer-review-status": build_app_developer_review_status_parser,
     "external-verdict": build_external_verdict_parser,
+    "stamp-assist": build_stamp_assist_parser,
     "notify-test": build_notify_test_parser,
     "calibration": build_calibration_parser,
     "score": build_score_parser,
@@ -19035,7 +20258,10 @@ def main() -> None:
     else:
         parser = build_review_parser()
         args = parser.parse_args(sys.argv[1:])
-    args.func(args)
+    try:
+        args.func(args)
+    except UnsupportedReviewDbBackendError as exc:
+        raise SystemExit(f"ERROR: {exc}") from exc
 
 
 if __name__ == "__main__":

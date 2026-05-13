@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from review_db import UnsupportedReviewDbBackendError, connect_review_db, sqlite_db_path
+
 
 DEFAULT_MODEL = "qwen3-coder:30b-a3b-q4_K_M"
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
@@ -708,9 +710,9 @@ def migrate_db_schema(connection: sqlite3.Connection) -> None:
 
 
 def init_db(db_path: str) -> Path:
-    resolved = resolve_path(db_path)
+    resolved = sqlite_db_path(db_path)
     resolved.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(resolved) as connection:
+    with connect_review_db(resolved) as connection:
         connection.executescript(DB_SCHEMA)
         migrate_db_schema(connection)
     return resolved
@@ -1987,7 +1989,7 @@ def persist_review_run(
     static_watch_items_count = sum(1 for item in watch_items if item.source == "static")
     model_watch_items_count = sum(1 for item in watch_items if item.source == "model")
 
-    with sqlite3.connect(resolved) as connection:
+    with connect_review_db(resolved) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
         cursor = connection.execute(
             """
@@ -2893,7 +2895,7 @@ diff --git a/.github/workflows/fenced-llm-review.yml b/.github/workflows/fenced-
             history_calibration=self_test_calibration,
             history_calibration_path=str(self_test_calibration_path.resolve()),
         )
-        with sqlite3.connect(db_path) as connection:
+        with connect_review_db(db_path) as connection:
             row = connection.execute(
                 """
                 SELECT
@@ -3175,7 +3177,7 @@ def main() -> None:
         output_path = None
 
     if not args.skip_db:
-        emit_progress(args, "persist_start", db_path=str(resolve_path(args.db)))
+        emit_progress(args, "persist_start", db_path=str(sqlite_db_path(args.db)))
         saved_db_path, run_id = persist_review_run(
             args.db,
             repo=repo,
@@ -3225,6 +3227,8 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+    except UnsupportedReviewDbBackendError as error:
+        raise SystemExit(f"ERROR: {error}") from error
     except urllib.error.HTTPError as error:
         message = error.read().decode("utf-8", errors="replace")
         print(f"HTTP error {error.code}: {message}", file=sys.stderr)

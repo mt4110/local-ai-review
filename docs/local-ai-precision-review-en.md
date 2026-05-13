@@ -176,6 +176,7 @@ Daily entrypoints:
 llreview status
 llreview target set --project-dir /absolute/path/to/repo --repo owner/name
 llreview daily
+llreview db-plan
 llreview
 llreview second-opinion
 llreview async-status
@@ -384,8 +385,8 @@ for zero-finding runs; runs with findings should still be reviewed with
 
 `llreview review-gap-stamp-pump` turns human-gate review gaps into a focused
 stamp inbox under `out/review-history/review-gap-stamp-pump/`. It shows short
-rationale, local finding/watch distance, and ready-to-run `external-verdict`
-commands. The default mode is read-only. Use
+rationale, deterministic stamp assistance, local finding/watch distance, and
+ready-to-run `external-verdict` commands. The default mode is read-only. Use
 `llreview review-gap-stamp-pump --stamp` in a TTY for a continuous `y` valid,
 `f` not actionable, `c` covered, `n` unsure, `s` skip, `q` quit flow.
 
@@ -434,6 +435,16 @@ gate, regression audit, backfill pump, matcher explain, training export, and
 rule extractor. It reads DB aggregates and latest artifacts only; it does not
 run reviews, import teacher artifacts, activate calibrations, or export raw
 private text.
+
+`llreview db-plan` opens the SQLite review-history DB read-only and dry-runs
+PostgreSQL optional backend readiness. It records required table/view presence,
+row counts, training-ready external examples, the PostgreSQL schema draft
+digest, and optional backend gates under `out/review-history/db-plan/` as
+Markdown/JSON artifacts. The default run does not copy rows, mutate the DB, or
+change the default backend. `llreview db-plan --docker-parity` applies the schema to a
+temporary PostgreSQL container, imports SQLite rows through temporary CSV files,
+and verifies table-count parity. Raw CSV files are deleted by default; keeping
+them requires explicit `--keep-parity-workdir`.
 
 `llreview calibration-risk-gate` checks proposed prompt/rule candidates before
 they become active DB calibrations. It writes Markdown/JSON artifacts under
@@ -526,22 +537,28 @@ and `llreview export-jsonl` include the same candidate preview.
 `llreview learn-review` is the stamp-and-approve flow. It does not run the local
 reviewer or app-developer teacher review; run `llreview daily` first, or
 `llreview daily --force-review` when you want a fresh local review. By default it
-shows only candidates still waiting for a stamp and keeps the output compact. For
-teacher/external samples, press `y` for a valid missed item, `c` when it was
-covered locally, `f` when it is not actionable, `n` when unsure, `s` to skip, or
-`q` to quit. Use `llreview learn-review --language ja` or `--ja` for Japanese
-operator prompts, or set `LLREVIEW_LEARN_REVIEW_LANGUAGE=ja` to make that the
-default. This changes the interactive display only; DB verdicts, reasons, and
-export schemas remain stable English-coded values. Once an operator stamps an
-external verdict, later importer `no_local_match` / `linked_by_importer`
-verdicts do not override it, so the same teacher gap does not return to the
-stamp inbox after re-import. For prompt/rule candidates, pressing `y` after the
-instruction preview and Calibration Risk Gate writes an active DB calibration
-that affects future review prompts; press `v` to view the preview, or `s` to
-skip. Use `llreview learn-review --no-activate` for a stamp-only pass. It hides full body
-text and body digests by default; use `--verbose` or `--include-active` only
-when you want the longer audit view. Use `llreview learn-review --dry-run` to
-preview the queue.
+shows candidates still waiting for a stamp plus human-gate review gaps, while
+keeping the output compact. For teacher/external samples, press `y` for a valid
+missed item, `c` when it was covered locally, `f` when it is not actionable, `n`
+when unsure, `s` to skip, or `q` to quit. The prompt shows deterministic stamp
+assistance by default: current operator-verdict state, learned counts for the
+same repo/source/path-class bucket, local finding/watch link diagnostics, and a
+recommended stamp with a reason. This is guidance, not truth. Hide it with
+`--no-assist`, keep review-gap stamping in its separate inbox with
+`--no-review-gap-stamps`, or inspect one item with
+`llreview stamp-assist <external_item_id>`. Use `llreview learn-review --language
+ja` or `--ja` for Japanese operator prompts, or set
+`LLREVIEW_LEARN_REVIEW_LANGUAGE=ja` to make that the default. This changes the
+interactive display only; DB verdicts, reasons, and export schemas remain stable
+English-coded values. Once an operator stamps an external verdict, later importer
+`no_local_match` / `linked_by_importer` verdicts do not override it, so the same
+teacher gap does not return to the stamp inbox after re-import. For prompt/rule
+candidates, pressing `y` after the instruction preview and Calibration Risk Gate
+writes an active DB calibration that affects future review prompts; press `v` to
+view the preview, or `s` to skip. Use `llreview learn-review --no-activate` for
+a stamp-only pass. It hides full body text and body digests by default; use
+`--verbose` or `--include-active` only when you want the longer audit view. Use
+`llreview learn-review --dry-run` to preview the queue.
 
 `llreview learn-propose --candidate <candidate-id>` writes deterministic
 proposal markdown/json under `out/review-history/learning-proposals/`. A
