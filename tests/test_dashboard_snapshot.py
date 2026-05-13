@@ -375,15 +375,23 @@ class DashboardSnapshotTests(unittest.TestCase):
             self.assertTrue(current["dirty"])
             self.assertEqual(current["repo"], "owner/repo")
             self.assertEqual(current["branch"], "feature/status")
-            self.assertEqual(current["changed_files"], 1)
+            self.assertEqual(current["changed_files"], 2)
             self.assertEqual(current["untracked_count"], 1)
             self.assertGreater(current["diff_bytes"], 0)
             self.assertEqual(len(current["diff_fingerprint"]), 64)
-            expected_diff = subprocess.run(
-                ["git", "-C", str(root), "diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD"],
-                check=True,
-                capture_output=True,
-            ).stdout
+            index_path, env, error = dashboard_snapshot.temporary_intent_to_add_env(root)
+            self.assertEqual(error, "")
+            self.assertIsNotNone(index_path)
+            self.assertIsNotNone(env)
+            try:
+                expected_diff = subprocess.run(
+                    ["git", "-C", str(root), "diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD"],
+                    check=True,
+                    capture_output=True,
+                    env=env,
+                ).stdout
+            finally:
+                index_path.unlink(missing_ok=True)
             expected_snapshot_diff = b"\n" + expected_diff
             self.assertEqual(current["diff_fingerprint"], hashlib.sha256(expected_snapshot_diff).hexdigest())
             self.assertEqual(current["diff_bytes"], len(expected_snapshot_diff))
@@ -391,6 +399,30 @@ class DashboardSnapshotTests(unittest.TestCase):
             self.assertTrue(payload["workspace"]["eligibility"]["review_recommended"])
             self.assertEqual(payload["workspace"]["specbackfill"]["db_items"], 1)
             self.assertNotIn("SECRET_DIFF_BODY", json.dumps(payload))
+            self.assertNotIn("untracked private note", json.dumps(payload))
+
+    def test_workspace_status_includes_untracked_only_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-b", "main", str(root)], check=True, capture_output=True, text=True)
+            (root / "app.py").write_text("print('base')\n", encoding="utf-8")
+            self.git(root, "add", "app.py")
+            self.git(root, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "initial")
+            (root / "new_file.py").write_text("print('UNTRACKED_SECRET_BODY')\n", encoding="utf-8")
+
+            payload = dashboard_snapshot.dashboard_snapshot(
+                self.make_args(Path(tmpdir) / "missing.db", repo="owner/repo", workspace=str(root))
+            )
+            current = payload["workspace"]["current"]
+
+            self.assertEqual(current["changed_files"], 1)
+            self.assertEqual(current["changed_file_examples"], ["new_file.py"])
+            self.assertEqual(current["untracked_count"], 1)
+            self.assertGreater(current["diff_bytes"], 0)
+            self.assertEqual(len(current["diff_fingerprint"]), 64)
+            self.assertTrue(payload["workspace"]["eligibility"]["review_recommended"])
+            self.assertNotIn("UNTRACKED_SECRET_BODY", json.dumps(payload))
 
 
 if __name__ == "__main__":

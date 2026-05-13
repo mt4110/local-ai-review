@@ -21,6 +21,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -91,8 +92,11 @@ def shell_command(parts: list[Any]) -> str:
     return shlex.join(str(part) for part in parts if str(part) != "")
 
 
-def git_environment() -> dict[str, str]:
-    return {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+def git_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    if extra:
+        env.update(extra)
+    return env
 
 
 def run_text(
@@ -117,8 +121,13 @@ def run_text(
     return completed.returncode, completed.stdout.rstrip("\n"), completed.stderr.strip()
 
 
-def git_text(root: Path, *args: str, timeout: float = 6.0) -> tuple[int, str, str]:
-    return run_text(["git", "-C", str(root), *args], timeout=timeout, env=git_environment())
+def git_text(
+    root: Path,
+    *args: str,
+    timeout: float = 6.0,
+    env: dict[str, str] | None = None,
+) -> tuple[int, str, str]:
+    return run_text(["git", "-C", str(root), *args], timeout=timeout, env=env or git_environment())
 
 
 def git_update_digest(
@@ -127,13 +136,14 @@ def git_update_digest(
     hasher: Any,
     prefix_separator: bool,
     timeout: float = 12.0,
+    env: dict[str, str] | None = None,
 ) -> tuple[int, int, bool, str]:
     try:
         process = subprocess.Popen(
             ["git", "-C", str(root), *args],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=git_environment(),
+            env=env or git_environment(),
         )
     except OSError as exc:
         return 124, 0, False, str(exc)
@@ -178,6 +188,35 @@ def git_update_digest(
         process.stderr.close()
     stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
     return process.returncode or 0, total, emitted, stderr
+
+
+def copy_git_index(root: Path, destination: Path) -> str:
+    code, stdout, stderr = git_text(root, "rev-parse", "--git-path", "index")
+    if code != 0 or not stdout:
+        return stderr or "git index path could not be resolved"
+    index_path = Path(stdout)
+    if not index_path.is_absolute():
+        index_path = root / index_path
+    if index_path.is_file():
+        shutil.copyfile(index_path, destination)
+        return ""
+    code, _stdout, stderr = git_text(root, "read-tree", f"--index-output={destination}", "HEAD")
+    return "" if code == 0 else stderr or "temporary git index could not be created"
+
+
+def temporary_intent_to_add_env(root: Path) -> tuple[Path | None, dict[str, str] | None, str]:
+    with tempfile.NamedTemporaryFile(prefix="llreview-dashboard-index.", delete=False) as index_file:
+        index_path = Path(index_file.name)
+    error = copy_git_index(root, index_path)
+    if error:
+        index_path.unlink(missing_ok=True)
+        return None, None, error
+    env = git_environment({"GIT_INDEX_FILE": str(index_path)})
+    code, _stdout, stderr = git_text(root, "add", "-N", "--", ".", env=env)
+    if code != 0:
+        index_path.unlink(missing_ok=True)
+        return None, None, stderr or "untracked files could not be added to the temporary git index"
+    return index_path, env, ""
 
 
 def discover_git_root(path: Path) -> tuple[Path | None, str]:
@@ -273,19 +312,32 @@ def current_diff_digest(root: Path, base_ref: str) -> tuple[str, int, str]:
     hasher = hashlib.sha256()
     total = 0
     errors: list[str] = []
-    for index, args in enumerate(diff_command_sets(base_ref)):
-        code, byte_count, emitted, stderr = git_update_digest(
-            root,
-            *args,
-            hasher=hasher,
-            prefix_separator=index > 0,
-        )
-        if code != 0:
-            errors.append(stderr or "git diff failed")
-            continue
-        if not emitted:
-            continue
-        total += byte_count
+    commands = diff_command_sets(base_ref)
+    index_path: Path | None = None
+    working_tree_env: dict[str, str] | None = None
+    if commands:
+        index_path, working_tree_env, index_error = temporary_intent_to_add_env(root)
+        if index_error:
+            errors.append(index_error)
+    try:
+        for index, args in enumerate(commands):
+            env = working_tree_env if args[-1] == "HEAD" and working_tree_env is not None else None
+            code, byte_count, emitted, stderr = git_update_digest(
+                root,
+                *args,
+                hasher=hasher,
+                prefix_separator=index > 0,
+                env=env,
+            )
+            if code != 0:
+                errors.append(stderr or "git diff failed")
+                continue
+            if not emitted:
+                continue
+            total += byte_count
+    finally:
+        if index_path is not None:
+            index_path.unlink(missing_ok=True)
     if errors:
         return "", 0, "; ".join(errors)
     return (hasher.hexdigest() if total else ""), total, ""
@@ -298,12 +350,23 @@ def current_changed_files(root: Path, base_ref: str) -> tuple[list[str], str]:
     if base_ref:
         commands.append(["diff", "--no-ext-diff", "--no-textconv", "--name-only", f"{base_ref}...HEAD"])
     commands.append(["diff", "--no-ext-diff", "--no-textconv", "--name-only", "HEAD"])
-    for args in commands:
-        code, stdout, stderr = git_text(root, *args)
-        if code != 0:
-            errors.append(stderr or "git diff --name-only failed")
-            continue
-        files.update(line.strip() for line in stdout.splitlines() if line.strip())
+    index_path: Path | None = None
+    working_tree_env: dict[str, str] | None = None
+    if commands:
+        index_path, working_tree_env, index_error = temporary_intent_to_add_env(root)
+        if index_error:
+            errors.append(index_error)
+    try:
+        for args in commands:
+            env = working_tree_env if args[-1] == "HEAD" and working_tree_env is not None else None
+            code, stdout, stderr = git_text(root, *args, env=env)
+            if code != 0:
+                errors.append(stderr or "git diff --name-only failed")
+                continue
+            files.update(line.strip() for line in stdout.splitlines() if line.strip())
+    finally:
+        if index_path is not None:
+            index_path.unlink(missing_ok=True)
     return sorted(files), "; ".join(errors)
 
 
