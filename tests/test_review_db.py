@@ -29,7 +29,7 @@ from review_db import (  # noqa: E402
     sqlite_db_path,
     table_counts,
 )
-from llreview import POSTGRES_COPY_NULL, postgres_copy_value  # noqa: E402
+from llreview import POSTGRES_COPY_NULL, postgres_copy_value, review_path_class  # noqa: E402
 
 
 class ReviewDbDialectTests(unittest.TestCase):
@@ -46,6 +46,15 @@ class ReviewDbDialectTests(unittest.TestCase):
 
     def test_batched_values_deduplicates_in_order(self) -> None:
         self.assertEqual(batched_values([1, 2, 1, 3], batch_size=2), [[1, 2], [3]])
+
+    def test_review_path_class_preserves_dot_prefixed_paths(self) -> None:
+        self.assertEqual(review_path_class(".github/workflows/ci.yml"), "ops_config")
+        self.assertEqual(
+            review_path_class("./.github/workflows/ci.yml"),
+            "ops_config",
+        )
+        self.assertEqual(review_path_class(".private_docs/roadmap.md"), "docs")
+        self.assertEqual(review_path_class(".env.example"), "ops_config")
 
 
 class ReviewDbConfigTests(unittest.TestCase):

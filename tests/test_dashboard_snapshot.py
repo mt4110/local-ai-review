@@ -90,6 +90,18 @@ class DashboardSnapshotTests(unittest.TestCase):
             else:
                 os.environ["OLLAMA_HOST"] = previous_host
 
+    def test_dashboard_path_class_preserves_dot_prefixed_paths(self) -> None:
+        self.assertEqual(
+            dashboard_snapshot.dashboard_path_class(".github/workflows/ci.yml"),
+            "ops_config",
+        )
+        self.assertEqual(
+            dashboard_snapshot.dashboard_path_class("./.github/workflows/ci.yml"),
+            "ops_config",
+        )
+        self.assertEqual(dashboard_snapshot.dashboard_path_class(".private_docs/roadmap.md"), "docs")
+        self.assertEqual(dashboard_snapshot.dashboard_path_class(".env.example"), "ops_config")
+
     def test_workspace_status_disables_external_diff_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / "repo"

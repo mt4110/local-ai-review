@@ -197,7 +197,10 @@ def stable_fingerprint(*parts: Any) -> str:
 
 
 def normalized_repo_path(path: str) -> str:
-    return path.replace("\\", "/").lstrip("./").lower()
+    normalized = path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.lower()
 
 
 def dashboard_doc_path(path: str) -> bool:

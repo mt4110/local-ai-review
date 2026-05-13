@@ -12361,7 +12361,10 @@ def github_paginated_request_limited(path: str, token: str, *, limit: int) -> li
 
 
 def normalized_repo_path(path: str) -> str:
-    return path.replace("\\", "/").lstrip("./").lower()
+    normalized = path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.lower()
 
 
 def is_backfill_doc_path(path: str) -> bool:
