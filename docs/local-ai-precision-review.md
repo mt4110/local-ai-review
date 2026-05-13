@@ -128,6 +128,7 @@ llreview status
 llreview target set --project-dir /absolute/path/to/repo --repo owner/name
 llreview daily
 llreview backup
+llreview db-plan
 llreview
 llreview second-opinion
 llreview async-status
@@ -144,6 +145,7 @@ llreview learning-scoreboard
 llreview learn-preview
 llreview learn-candidates
 llreview learn-review
+llreview stamp-assist <external_item_id>
 llreview learn-propose --candidate <candidate-id>
 llreview learn-next
 llreview learn-apply --proposal <proposal-id> --dry-run
@@ -230,7 +232,7 @@ TTY では `llreview` が phase、elapsed、model-reviewed file count、finding/
 
 `llreview scoring-pump` は、未採点 run を `quick_drain_zero_findings` と `manual_finding_score` に分け、すぐ使える `llreview score` command を `out/review-history/scoring-pump/` に書きます。既定では read-only です。finding 0 の run だけを明示的に排水する場合は `llreview scoring-pump --apply-zero-findings` を使います。finding がある run は item verdict を確認してから `llreview score --run <id> --items` または `--demote-findings` を使います。
 
-`llreview review-gap-stamp-pump` は、human-gate 待ちの review gap を、短い根拠、local finding/watch との距離、`external-verdict` command 付きで `out/review-history/review-gap-stamp-pump/` に書きます。既定では read-only です。TTY で連続ハンコを押す場合は `llreview review-gap-stamp-pump --stamp` を使い、`y` valid、`f` not actionable、`c` covered、`n` unsure、`s` skip、`q` quit を入力します。
+`llreview review-gap-stamp-pump` は、human-gate 待ちの review gap を、短い根拠、ハンコ補助、local finding/watch との距離、`external-verdict` command 付きで `out/review-history/review-gap-stamp-pump/` に書きます。既定では read-only です。TTY で連続ハンコを押す場合は `llreview review-gap-stamp-pump --stamp` を使い、`y` valid、`f` not actionable、`c` covered、`n` unsure、`s` skip、`q` quit を入力します。
 
 `llreview recall-pattern-miner` は、`missed_by_local` の review gap を path class、learning target、path bucket、title token の近さでクラスタ化し、`out/review-history/recall-pattern-miner/` に弱点パターン report を書きます。これは優先順位付けの evidence であり、そのまま prompt/rule update にはしません。
 
@@ -243,6 +245,8 @@ TTY では `llreview` が phase、elapsed、model-reviewed file count、finding/
 `llreview rule-candidate-extractor` は、training-ready の `missed_by_local` を path class、title token、known mechanical family で束ね、deterministic rule にできそうな候補を `out/review-history/rule-candidate-extractor/` に書き出します。既定では human-gate 待ちを除外し、raw body/diff は出しません。`path_containment`、`shell_quoting`、`state_normalization`、`reserved_config` などの機械的 trigger へ落とせる時だけ `proposed_rule_candidate` とし、それ以外は prompt/watch evidence として残します。rule code や prompt source は変更しません。
 
 `llreview learning-scoreboard` は、learning pump、scoring pump、review-gap stamp pump、recall miner、watch sharpener、risk gate、regression audit、backfill pump、matcher explain、training export、rule extractor の latest artifact と DB 集計を 1 画面にまとめます。read-only で、review 実行、teacher import、calibration activation、raw private text export は行いません。
+
+`llreview db-plan` は、SQLite review-history DB を read-only で開き、PostgreSQL optional backend への移行準備を dry-run します。必須 table/view の存在、row count、training-ready 外部例、PostgreSQL schema draft の digest、optional backend gate を `out/review-history/db-plan/` に Markdown/JSON artifact として保存します。通常実行では row copy、DB 変更、default backend 変更は行いません。`llreview db-plan --docker-parity` は一時 PostgreSQL container に schema を適用し、SQLite row を一時 CSV 経由で取り込んで table count parity を確認します。raw CSV は既定で削除され、残す場合だけ `--keep-parity-workdir` を明示します。
 
 `llreview calibration-risk-gate` は、proposed prompt/rule candidate を active DB calibration にする前に、training-ready support、human-gate 残、false-positive counter-evidence、missed counter-evidence を `out/review-history/calibration-risk-gate/` にまとめます。`learn-next --activate`、`learn-apply --activate`、`learn-review` の activation 直前にも同じ gate を表示し、block 判定は `--force-risk` がない限り active 化しません。daily auto activation は block された候補を skip します。
 
@@ -260,7 +264,7 @@ TTY では `llreview` が phase、elapsed、model-reviewed file count、finding/
 
 `llreview learn-candidates` は、aggregate evidence から `prompt_candidate` / `rule_candidate` / `needs_data` を導出します。candidate は evidence count、path class、reason/source、confidence、status、recommended action を持ちます。`proposed` は提案だけで、`active` は既に operator-approved DB calibration として次回 prompt に入る状態です。prompt や rule の source file は変更しません。一覧には短い ID と行番号が出ます。`llreview learn-candidates --inspect` は先頭候補、`--inspect 2` は2行目、`--inspect <candidate-id>` は candidate を支える sample を表示します。既定では本文全文を出さず body digest だけを表示し、短いローカル確認用 excerpt が必要な場合だけ `--show-text` を付けます。外部 item の sample は inspection 出力内の shortcut から `external-verdict --candidate <candidate-id> --sample <n>` で採点できます。削除済み repository や他 repository の queue も含めて見る場合は `--all-repos` を付けます。`llreview report` と `llreview export-jsonl` にも同じ candidate preview を含めます。
 
-`llreview learn-review` は、まだハンコ待ちの候補だけを短く出す採点・承認用 command です。local review や app-developer teacher review は実行しません。先に `llreview daily`、新しい local review を必ず作る場合は `llreview daily --force-review` を実行します。teacher/external sample には `y` valid missed、`c` covered、`f` not actionable、`n` unsure、`s` skip、`q` quit で operator verdict を保存します。日本語でハンコを押したい場合は `llreview learn-review --language ja` または短縮形の `--ja` を使い、毎回固定する場合は `LLREVIEW_LEARN_REVIEW_LANGUAGE=ja` を設定します。この設定は対話表示を日本語化するだけで、DB の verdict / reason / export schema は安定した英語コードのままです。prompt/rule candidate は instruction preview と Calibration Risk Gate を見たうえで `y` を押すと active DB calibration として保存され、次回以降の review prompt に効きます。ハンコだけ押したい場合は `llreview learn-review --no-activate` を使います。既定では本文全文を出さず body digest も隠し、詳細を戻す場合だけ `--verbose` や `--include-active` を使います。実行前に流れだけ見る場合は `llreview learn-review --dry-run` を使います。一度 operator が押した external verdict は importer の `no_local_match` / `linked_by_importer` verdict で上書きされないため、同じ teacher gap が再 import でハンコ待ちに戻るのを防ぎます。
+`llreview learn-review` は、まだハンコ待ちの候補と human-gate の review gap を短く出す採点・承認用 command です。local review や app-developer teacher review は実行しません。先に `llreview daily`、新しい local review を必ず作る場合は `llreview daily --force-review` を実行します。teacher/external sample には `y` valid missed、`c` covered、`f` not actionable、`n` unsure、`s` skip、`q` quit で operator verdict を保存します。対話中は既定でハンコ補助を表示し、現在の operator verdict、同じ repo/source/path-class bucket の学習量、local finding/watch との link 診断、推奨ハンコと理由を出します。これは補助であり、teacher/external output を真実扱いしません。非表示にする場合は `--no-assist`、review gap を別 inbox に分けたい場合は `--no-review-gap-stamps`、単体確認は `llreview stamp-assist <external_item_id> --ja` を使います。日本語でハンコを押したい場合は `llreview learn-review --language ja` または短縮形の `--ja` を使い、毎回固定する場合は `LLREVIEW_LEARN_REVIEW_LANGUAGE=ja` を設定します。この設定は対話表示を日本語化するだけで、DB の verdict / reason / export schema は安定した英語コードのままです。prompt/rule candidate は instruction preview と Calibration Risk Gate を見たうえで `y` を押すと active DB calibration として保存され、次回以降の review prompt に効きます。ハンコだけ押したい場合は `llreview learn-review --no-activate` を使います。既定では本文全文を出さず body digest も隠し、詳細を戻す場合だけ `--verbose` や `--include-active` を使います。実行前に流れだけ見る場合は `llreview learn-review --dry-run` を使います。一度 operator が押した external verdict は importer の `no_local_match` / `linked_by_importer` verdict で上書きされないため、同じ teacher gap が再 import でハンコ待ちに戻るのを防ぎます。
 
 `llreview learn-propose --candidate <candidate-id>` は、candidate と supporting sample から deterministic な proposal markdown/json を `out/review-history/learning-proposals/` に書き出します。proposal は `applied=false` で、prompt や rule は変更しません。raw body は保存せず、sample id / body digest / title excerpt / guardrails / validation command だけを残します。既存 proposal を上書きする場合は `--force` を付けます。
 

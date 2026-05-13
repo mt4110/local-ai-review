@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import argparse
-import sqlite3
-from pathlib import Path
+
+from review_db import UnsupportedReviewDbBackendError, connect_review_db, sqlite_db_path
 
 
 def parse_bool_flag(value: str) -> int:
@@ -39,12 +39,14 @@ def main() -> None:
     parser.add_argument("--note", default="", help="Short manual note about the run")
     args = parser.parse_args()
 
-    db_path = Path(args.db).expanduser().resolve()
+    try:
+        db_path = sqlite_db_path(args.db)
+    except UnsupportedReviewDbBackendError as exc:
+        raise SystemExit(f"ERROR: {exc}") from exc
     if not db_path.is_file():
         raise SystemExit(f"DB file does not exist: {db_path}")
 
-    with sqlite3.connect(db_path) as connection:
-        connection.execute("PRAGMA foreign_keys = ON")
+    with connect_review_db(db_path, foreign_keys=True) as connection:
         row = connection.execute(
             "select id, repo from review_runs where id = ?",
             (args.run_id,),

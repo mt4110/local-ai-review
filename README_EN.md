@@ -351,8 +351,9 @@ findings should still be scored with `llreview score --run <id> --items` or
 reviewed before using `--demote-findings`.
 
 Use `llreview review-gap-stamp-pump` to turn human-gate review-gap examples
-into a focused stamping inbox. It shows short rationale, local finding/watch
-distance, and ready-to-run `external-verdict` commands under
+into a focused stamping inbox. It shows short rationale, deterministic stamp
+assistance, local finding/watch distance, and ready-to-run `external-verdict`
+commands under
 `out/review-history/review-gap-stamp-pump/`. The default mode is read-only. Use
 `llreview review-gap-stamp-pump --stamp` in a TTY for a continuous
 `y` valid, `f` not actionable, `c` covered, `n` unsure, `s` skip, `q` quit flow.
@@ -403,6 +404,16 @@ sharpener, risk gate, regression audit, backfill pump, matcher explain,
 training export, and rule extractor. It reads DB aggregates and latest
 artifacts only; it does not run reviews, import teacher artifacts, activate
 calibrations, or export raw private text.
+
+Use `llreview db-plan` to open the SQLite review-history DB read-only and
+dry-run PostgreSQL optional backend readiness. It records required table/view
+presence, row counts, training-ready external examples, the PostgreSQL schema
+draft digest, and optional backend gates under `out/review-history/db-plan/` as
+Markdown/JSON artifacts. The default run does not copy rows, mutate the DB, or
+change the default backend. `llreview db-plan --docker-parity` applies the schema to a
+temporary PostgreSQL container, imports SQLite rows through temporary CSV files,
+and verifies table-count parity. Raw CSV files are deleted by default; keeping
+them requires explicit `--keep-parity-workdir`.
 
 Use `llreview calibration-risk-gate` before activating prompt/rule candidates.
 It writes Markdown/JSON artifacts under
@@ -532,16 +543,23 @@ for `external-verdict --candidate <candidate-id> --sample <n>`. Add
 Use `llreview learn-review` for the stamp-and-approve flow. It does not run the
 local reviewer or app-developer teacher review; run `llreview daily` first, or
 `llreview daily --force-review` when you want a fresh local review. By default it
-shows only candidates still waiting for a stamp and keeps the output compact. For
-teacher/external samples, press `y` for a valid missed item,
+shows candidates still waiting for a stamp plus human-gate review gaps, while
+keeping the output compact. For teacher/external samples, press `y` for a valid missed item,
 `c` when it was covered locally, `f` when it is not actionable, `n` when unsure,
-`s` to skip, or `q` to quit. For prompt/rule candidates, pressing `y` after the
-instruction preview and Calibration Risk Gate writes an active DB calibration
-that affects future review prompts; press `v` to view the preview, or `s` to
-skip. Use `llreview learn-review --no-activate` for a stamp-only pass. It hides
-full body text and body digests by default; use `--verbose` or
-`--include-active` only when you want the longer audit view. Use
-`llreview learn-review --dry-run` to preview the queue.
+`s` to skip, or `q` to quit. The interactive prompt shows deterministic stamp
+assistance by default: whether the item is already operator-stamped, how much
+the same repo/source/path-class bucket has learned, the local finding/watch link
+diagnostics, and a recommended stamp with a reason. This is guidance, not
+truth; teacher/external output still requires human judgment. Use
+`--no-assist` to hide it, `--no-review-gap-stamps` to keep review-gap stamping
+in its separate inbox, or `llreview stamp-assist <external_item_id>` for a standalone
+check. For prompt/rule candidates, pressing `y` after the instruction preview
+and Calibration Risk Gate writes an active DB calibration that affects future
+review prompts; press `v` to view the preview, or `s` to skip. Use
+`llreview learn-review --no-activate` for a stamp-only pass. It hides full body
+text and body digests by default; use `--verbose` or `--include-active` only
+when you want the longer audit view. Use `llreview learn-review --dry-run` to
+preview the queue.
 
 Use `llreview learn-propose --candidate <candidate-id>` to write deterministic
 proposal markdown/json under `out/review-history/learning-proposals/`. A
