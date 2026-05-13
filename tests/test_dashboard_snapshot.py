@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -30,7 +31,7 @@ class DashboardSnapshotTests(unittest.TestCase):
 
     def pre_pr_diff_text(self, root: Path, base_ref: str = "main") -> str:
         base_diff = subprocess.run(
-            ["git", "-C", str(root), "diff", f"{base_ref}...HEAD"],
+            ["git", "-C", str(root), "diff", "--no-ext-diff", "--no-textconv", f"{base_ref}...HEAD"],
             check=True,
             capture_output=True,
             text=True,
@@ -41,7 +42,7 @@ class DashboardSnapshotTests(unittest.TestCase):
         self.assertIsNotNone(env)
         try:
             working_diff = subprocess.run(
-                ["git", "-C", str(root), "diff", "HEAD"],
+                ["git", "-C", str(root), "diff", "--no-ext-diff", "--no-textconv", "HEAD"],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -61,6 +62,61 @@ class DashboardSnapshotTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(stdout, "bad:\ufffd")
         self.assertEqual(stderr, "")
+
+    def test_ollama_loopback_uses_parsed_host(self) -> None:
+        previous_base = os.environ.get("OLLAMA_BASE_URL")
+        previous_host = os.environ.get("OLLAMA_HOST")
+        try:
+            os.environ["OLLAMA_BASE_URL"] = "https://localhost.example.com"
+            os.environ.pop("OLLAMA_HOST", None)
+            self.assertFalse(dashboard_snapshot.local_ollama_endpoint_status()["loopback"])
+
+            os.environ["OLLAMA_BASE_URL"] = "http://127.0.0.1:11434"
+            self.assertTrue(dashboard_snapshot.local_ollama_endpoint_status()["loopback"])
+
+            os.environ["OLLAMA_BASE_URL"] = "http://[::1]:11434"
+            self.assertTrue(dashboard_snapshot.local_ollama_endpoint_status()["loopback"])
+
+            os.environ.pop("OLLAMA_BASE_URL", None)
+            os.environ["OLLAMA_HOST"] = "127.0.0.1:11434"
+            self.assertTrue(dashboard_snapshot.local_ollama_endpoint_status()["loopback"])
+        finally:
+            if previous_base is None:
+                os.environ.pop("OLLAMA_BASE_URL", None)
+            else:
+                os.environ["OLLAMA_BASE_URL"] = previous_base
+            if previous_host is None:
+                os.environ.pop("OLLAMA_HOST", None)
+            else:
+                os.environ["OLLAMA_HOST"] = previous_host
+
+    def test_workspace_status_disables_external_diff_helpers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-b", "main", str(root)], check=True, capture_output=True, text=True)
+            (root / "app.py").write_text("print('base')\n", encoding="utf-8")
+            self.git(root, "add", "app.py")
+            self.git(root, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "initial")
+            (root / "app.py").write_text("print('changed')\n", encoding="utf-8")
+            marker = Path(tmpdir) / "external-diff-called"
+            helper = Path(tmpdir) / "external-diff.sh"
+            helper.write_text(f"#!/bin/sh\necho called > {marker}\nexit 0\n", encoding="utf-8")
+            helper.chmod(0o755)
+            previous_external = os.environ.get("GIT_EXTERNAL_DIFF")
+            try:
+                os.environ["GIT_EXTERNAL_DIFF"] = str(helper)
+                payload = dashboard_snapshot.dashboard_snapshot(
+                    self.make_args(Path(tmpdir) / "missing.db", repo="owner/repo", workspace=str(root))
+                )
+            finally:
+                if previous_external is None:
+                    os.environ.pop("GIT_EXTERNAL_DIFF", None)
+                else:
+                    os.environ["GIT_EXTERNAL_DIFF"] = previous_external
+
+            self.assertGreater(payload["workspace"]["current"]["diff_bytes"], 0)
+            self.assertFalse(marker.exists())
 
     def make_args(self, db_path: Path, *, repo: str = "owner/repo", workspace: str = "") -> argparse.Namespace:
         return argparse.Namespace(

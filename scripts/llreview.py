@@ -803,7 +803,7 @@ def copy_git_index(root: Path, destination: Path) -> None:
 
 
 def build_pre_pr_diff(root: Path, base_ref: str, include_working_tree: bool) -> tuple[Path, bool]:
-    diff_text = git(root, "diff", f"{base_ref}...HEAD", check=True)
+    diff_text = git(root, "diff", "--no-ext-diff", "--no-textconv", f"{base_ref}...HEAD", check=True)
     working_tree_text = ""
     working_tree_included = False
     with tempfile.NamedTemporaryFile(prefix="llreview-index.", delete=False) as index_file:
@@ -814,7 +814,7 @@ def build_pre_pr_diff(root: Path, base_ref: str, include_working_tree: bool) -> 
             env = os.environ.copy()
             env["GIT_INDEX_FILE"] = str(index_path)
             git(root, "add", "-N", "--", ".", env=env, check=False)
-            working_tree_text = git(root, "diff", "HEAD", env=env, check=False)
+            working_tree_text = git(root, "diff", "--no-ext-diff", "--no-textconv", "HEAD", env=env, check=False)
             working_tree_included = bool(working_tree_text.strip())
     finally:
         index_path.unlink(missing_ok=True)

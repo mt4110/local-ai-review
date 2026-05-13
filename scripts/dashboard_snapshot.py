@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -24,6 +25,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from review_db import (
     SQLITE_BACKEND,
@@ -243,7 +245,14 @@ def current_diff_digest(root: Path, base_ref: str) -> tuple[str, int, str]:
     errors: list[str] = []
     diff_text = ""
     if base_ref:
-        code, stdout, stderr = git_text(root, "diff", f"{base_ref}...HEAD", timeout=12.0)
+        code, stdout, stderr = git_text(
+            root,
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            f"{base_ref}...HEAD",
+            timeout=12.0,
+        )
         if code != 0:
             errors.append(stderr or "git diff failed")
         else:
@@ -255,7 +264,15 @@ def current_diff_digest(root: Path, base_ref: str) -> tuple[str, int, str]:
         errors.append(index_error)
     try:
         if working_tree_env is not None:
-            code, stdout, stderr = git_text(root, "diff", "HEAD", timeout=12.0, env=working_tree_env)
+            code, stdout, stderr = git_text(
+                root,
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "HEAD",
+                timeout=12.0,
+                env=working_tree_env,
+            )
             if code != 0:
                 errors.append(stderr or "git diff failed")
             else:
@@ -325,14 +342,14 @@ def parse_utc_epoch(value: str) -> float | None:
 def local_ollama_endpoint_status() -> dict[str, Any]:
     raw = os.environ.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_HOST") or ""
     endpoint = raw or "http://127.0.0.1:11434"
-    lowered = endpoint.lower()
-    local = (
-        not raw
-        or "127.0.0.1" in lowered
-        or "localhost" in lowered
-        or "[::1]" in lowered
-        or lowered.startswith("::1")
-    )
+    parsed = urlparse(endpoint if "://" in endpoint else f"//{endpoint}")
+    host = (parsed.hostname or "").lower()
+    local = not raw or host == "localhost"
+    if host and not local:
+        try:
+            local = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            local = False
     return {
         "endpoint": endpoint,
         "loopback": local,
