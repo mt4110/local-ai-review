@@ -25,3 +25,8 @@ LLREVIEW_DASHBOARD_WORKSPACE=/absolute/path/to/workspace npm run dev
 The dashboard reads aggregate JSON from `scripts/dashboard_snapshot.py`. It does
 not run reviews, post PR comments, write verdicts, activate calibration, or show
 raw review bodies/diffs.
+
+When a workspace target is configured, the snapshot also shows read-only git
+status: repo, branch, dirty/ahead-behind state, changed file count, diff byte
+count, and a diff fingerprint. The diff text itself is not returned to the
+browser.

@@ -50,9 +50,70 @@ function fallbackSnapshot(error: unknown): DashboardSnapshot {
     scope: {
       repo: process.env.LLREVIEW_DASHBOARD_REPO || 'global',
       requested_workspace: process.env.LLREVIEW_DASHBOARD_WORKSPACE || '',
-      source: process.env.LLREVIEW_DASHBOARD_REPO ? 'environment' : 'global'
+      source:
+        process.env.LLREVIEW_DASHBOARD_REPO || process.env.LLREVIEW_DASHBOARD_WORKSPACE
+          ? 'environment'
+          : 'global'
     },
-    workspace: { saved_target: null, recent: [] },
+    workspace: {
+      saved_target: null,
+      recent: [],
+      current: {
+        configured: false,
+        requested_path: '',
+        path: '',
+        exists: false,
+        is_git_repo: false,
+        repo: '',
+        branch: '',
+        head_sha: '',
+        base_ref: '',
+        upstream: '',
+        ahead: 0,
+        behind: 0,
+        dirty: false,
+        tracked_dirty: false,
+        untracked_count: 0,
+        untracked_examples: [],
+        changed_files: 0,
+        changed_file_examples: [],
+        diff_bytes: 0,
+        diff_size_label: '0 B',
+        diff_fingerprint: '',
+        diff_fingerprint_short: '',
+        diff_error: '',
+        last_run: null,
+        diff_changed_since_last_run: false,
+        ollama_endpoint: {
+          endpoint: 'http://127.0.0.1:11434',
+          loopback: true
+        },
+        error: ''
+      },
+      eligibility: {
+        status: 'not_configured',
+        summary: 'Dashboard snapshot failed before reading workspace state.',
+        review_recommended: false,
+        suggested_command: 'llreview status',
+        limits: {
+          cooldown_seconds: 1800,
+          diff_bytes: 153600,
+          changed_files: 50,
+          model_files: 50
+        },
+        gates: []
+      },
+      specbackfill: {
+        available: false,
+        path: '',
+        db_items: 0,
+        db_runs: 0,
+        last_seen_at: '',
+        last_run_id: 0,
+        status: 'unknown',
+        summary: 'Dashboard snapshot failed before checking specbackfill.'
+      }
+    },
     tables: {},
     runs: {
       total: 0,

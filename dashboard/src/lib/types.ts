@@ -52,6 +52,67 @@ export type DashboardWorkspaceRow = {
   updated_at: string;
 };
 
+export type DashboardWorkspaceGate = {
+  key: string;
+  label: string;
+  status: 'pass' | 'warn' | 'block' | 'info' | string;
+  ok: boolean;
+  detail: string;
+};
+
+export type DashboardCurrentWorkspace = {
+  configured: boolean;
+  requested_path: string;
+  path: string;
+  exists: boolean;
+  is_git_repo: boolean;
+  repo: string;
+  branch: string;
+  head_sha: string;
+  base_ref: string;
+  upstream: string;
+  ahead: number;
+  behind: number;
+  dirty: boolean;
+  tracked_dirty: boolean;
+  untracked_count: number;
+  untracked_examples: string[];
+  changed_files: number;
+  changed_file_examples: string[];
+  diff_bytes: number;
+  diff_size_label: string;
+  diff_fingerprint: string;
+  diff_fingerprint_short: string;
+  diff_error: string;
+  last_run: Record<string, string | number> | null;
+  diff_changed_since_last_run: boolean;
+  ollama_endpoint: {
+    endpoint: string;
+    loopback: boolean;
+  };
+  error: string;
+};
+
+export type DashboardWorkspaceEligibility = {
+  status: string;
+  summary: string;
+  review_recommended: boolean;
+  suggested_command: string;
+  limits: Record<string, number>;
+  gates: DashboardWorkspaceGate[];
+};
+
+export type DashboardSpecbackfillStatus = {
+  available: boolean;
+  path: string;
+  db_items: number;
+  db_runs: number;
+  last_seen_at: string;
+  last_run_id: number;
+  status: string;
+  summary: string;
+};
+
 export type DashboardReadinessGate = {
   key: string;
   label: string;
@@ -88,6 +149,9 @@ export type DashboardSnapshot = {
   workspace?: {
     saved_target: Record<string, string> | null;
     recent: DashboardWorkspaceRow[];
+    current: DashboardCurrentWorkspace;
+    eligibility: DashboardWorkspaceEligibility;
+    specbackfill: DashboardSpecbackfillStatus;
   };
   tables?: CountMap;
   runs: DashboardRunCounts;

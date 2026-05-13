@@ -6,6 +6,9 @@
   let snapshot: DashboardSnapshot = data.snapshot;
   let refreshing = false;
   let refreshError = '';
+  $: currentWorkspace = snapshot.workspace?.current;
+  $: workspaceEligibility = snapshot.workspace?.eligibility;
+  $: specbackfill = snapshot.workspace?.specbackfill;
 
   const numberFormatter = new Intl.NumberFormat('en-US');
 
@@ -47,6 +50,22 @@
       ['Covered by local', snapshot.learning_readiness.covered_by_local ?? 0],
       ['Active calibration', snapshot.learning_readiness.active_calibrations ?? 0]
     ];
+  }
+
+  function gateText(status: string): string {
+    if (status === 'pass') return 'OK';
+    if (status === 'warn') return 'Watch';
+    if (status === 'block') return 'Block';
+    return 'Info';
+  }
+
+  function workspaceStatusText(status: string | undefined): string {
+    if (status === 'ready') return 'Ready';
+    if (status === 'manual_review_recommended') return 'Manual';
+    if (status === 'blocked') return 'Blocked';
+    if (status === 'idle') return 'Idle';
+    if (status === 'up_to_date') return 'Current';
+    return 'Unset';
   }
 
   async function refresh() {
@@ -138,9 +157,55 @@
     </div>
 
     <div>
-      <h2>Workspace</h2>
+      <div class="section-heading compact">
+        <h2>Workspace</h2>
+        <span class="inline-state" class:warn={workspaceEligibility?.status === 'manual_review_recommended'} class:block={workspaceEligibility?.status === 'blocked'}>
+          {workspaceStatusText(workspaceEligibility?.status)}
+        </span>
+      </div>
+      {#if currentWorkspace?.configured}
+        <div class="workspace-card">
+          <div>
+            <strong>{currentWorkspace.repo || snapshot.scope.repo}</strong>
+            <span>{currentWorkspace.branch || 'detached'} / {currentWorkspace.head_sha || 'no head'}</span>
+            <small>{currentWorkspace.path || currentWorkspace.requested_path}</small>
+          </div>
+          <dl>
+            <div>
+              <dt>Dirty</dt>
+              <dd>{currentWorkspace.dirty ? 'yes' : 'no'}{currentWorkspace.untracked_count ? ` / ${fmt(currentWorkspace.untracked_count)} untracked` : ''}</dd>
+            </div>
+            <div>
+              <dt>Ahead / behind</dt>
+              <dd>{fmt(currentWorkspace.ahead)} / {fmt(currentWorkspace.behind)}{currentWorkspace.upstream ? ` vs ${currentWorkspace.upstream}` : ''}</dd>
+            </div>
+            <div>
+              <dt>Diff</dt>
+              <dd>{fmt(currentWorkspace.changed_files)} files / {currentWorkspace.diff_size_label}</dd>
+            </div>
+            <div>
+              <dt>Fingerprint</dt>
+              <dd>{currentWorkspace.diff_fingerprint_short || 'none'}</dd>
+            </div>
+          </dl>
+        </div>
+        <p class="workspace-summary">{workspaceEligibility?.summary}</p>
+        <div class="gate-list workspace-gates">
+          {#each workspaceEligibility?.gates ?? [] as gate}
+            <article class:ready={gate.status === 'pass'} class:warn={gate.status === 'warn'} class:block={gate.status === 'block'}>
+              <div>
+                <span>{gate.label}</span>
+                <small>{gate.detail}</small>
+              </div>
+              <strong>{gateText(gate.status)}</strong>
+            </article>
+          {/each}
+        </div>
+      {:else}
+        <p class="empty">No workspace target is configured.</p>
+      {/if}
       {#if snapshot.workspace?.recent?.length}
-        <div class="workspace-list">
+        <div class="workspace-list subdued">
           {#each snapshot.workspace.recent as row}
             <article>
               <strong>{row.repo}</strong>
@@ -149,8 +214,6 @@
             </article>
           {/each}
         </div>
-      {:else}
-        <p class="empty">No saved workspace state.</p>
       {/if}
     </div>
   </section>
@@ -189,6 +252,16 @@
             <strong>{fmt(row[1])}</strong>
           </article>
         {/each}
+      </div>
+      <div class="specbackfill-line" class:ready={specbackfill?.available}>
+        <div>
+          <span>Specbackfill</span>
+          <strong>{specbackfill?.available ? 'Available' : 'Missing'}</strong>
+        </div>
+        <p>{specbackfill?.summary}</p>
+        {#if specbackfill?.db_items}
+          <small>{fmt(specbackfill.db_items)} items / {fmt(specbackfill.db_runs)} runs / latest run {fmt(specbackfill.last_run_id)}</small>
+        {/if}
       </div>
       <div class="gate-list">
         {#each snapshot.postgres_readiness as gate}
