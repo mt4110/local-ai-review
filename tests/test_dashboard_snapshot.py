@@ -365,13 +365,126 @@ class DashboardSnapshotTests(unittest.TestCase):
             self.assertEqual(payload["learning_readiness"]["training_ready_external_examples"], 1)
             self.assertEqual(payload["learning_readiness"]["human_gate_external_examples"], 1)
             self.assertEqual(payload["learning_readiness"]["covered_by_local"], 1)
+            self.assertEqual(payload["review_health"]["status"], "needs_scoring")
+            self.assertEqual(payload["review_health"]["missed"], 1)
+            self.assertEqual(payload["review_health"]["covered"], 1)
+            self.assertEqual(payload["stamp_stock"]["external_stamp_inbox"], 1)
+            self.assertEqual(payload["stamp_stock"]["unscored_runs"], 1)
+            self.assertEqual(payload["stamp_stock"]["candidate_activation_inbox"], 1)
             self.assertEqual(payload["backlog"]["backfill_pending"], 1)
             self.assertEqual(payload["calibrations"]["active"], 1)
+            self.assertEqual(payload["calibration_health"]["status"], "warming_up")
             self.assertNotIn("instruction", payload["calibrations"]["recent"][0])
             self.assertEqual(payload["growth"][0]["month"], "2026-05")
             self.assertIn("scoring-pump", payload["next_commands"][0]["command"])
             self.assertFalse(payload["policy"]["raw_bodies_included"])
             self.assertFalse(payload["policy"]["raw_diffs_included"])
+
+    def test_calibration_health_uses_activation_time_not_last_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "review.db"
+            with sqlite3.connect(db_path) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.executescript(
+                    """
+                    CREATE TABLE review_runs (
+                        id INTEGER PRIMARY KEY,
+                        created_at TEXT NOT NULL,
+                        repo TEXT NOT NULL
+                    );
+                    CREATE TABLE learning_calibrations (
+                        id INTEGER PRIMARY KEY,
+                        calibration_id TEXT NOT NULL,
+                        scope_repo TEXT NOT NULL DEFAULT '',
+                        path_class TEXT NOT NULL DEFAULT '',
+                        signal_kind TEXT NOT NULL DEFAULT '',
+                        evidence_count INTEGER NOT NULL DEFAULT 0,
+                        confidence TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL DEFAULT 'active',
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO review_runs (
+                        id,
+                        created_at,
+                        repo
+                    ) VALUES (1, '2026-05-03T00:00:00Z', 'owner/repo');
+                    INSERT INTO learning_calibrations (
+                        id,
+                        calibration_id,
+                        scope_repo,
+                        path_class,
+                        signal_kind,
+                        evidence_count,
+                        confidence,
+                        status,
+                        created_at,
+                        updated_at
+                    ) VALUES (
+                        1,
+                        'cal-created-at',
+                        'owner/repo',
+                        'code',
+                        'external_missed',
+                        3,
+                        'medium',
+                        'active',
+                        '2026-05-01T00:00:00Z',
+                        '2026-05-10T00:00:00Z'
+                    );
+                    """
+                )
+                objects = dashboard_snapshot.sqlite_objects(connection)
+
+                health = dashboard_snapshot.calibration_health_counts(
+                    connection,
+                    objects=objects,
+                    repo="owner/repo",
+                    limit=5,
+                )
+
+            self.assertEqual(health["status"], "supported")
+            self.assertEqual(health["with_recent_runs"], 1)
+            self.assertEqual(health["recent"][0]["runs_after"], 1)
+
+    def test_review_health_rates_use_scored_local_findings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "review.db"
+            with sqlite3.connect(db_path) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.executescript(
+                    """
+                    CREATE TABLE review_run_summary (
+                        id INTEGER PRIMARY KEY,
+                        repo TEXT NOT NULL,
+                        findings_count INTEGER,
+                        useful_findings_fixed INTEGER,
+                        false_positives INTEGER,
+                        unclear_findings INTEGER
+                    );
+                    INSERT INTO review_run_summary (
+                        id,
+                        repo,
+                        findings_count,
+                        useful_findings_fixed,
+                        false_positives,
+                        unclear_findings
+                    ) VALUES (1, 'owner/repo', 4, 1, 1, 0);
+                    """
+                )
+                objects = dashboard_snapshot.sqlite_objects(connection)
+
+                health = dashboard_snapshot.review_health_counts(
+                    connection,
+                    objects=objects,
+                    repo="owner/repo",
+                    external_stats={},
+                )
+
+            self.assertEqual(health["scored_local_findings"], 4)
+            self.assertEqual(health["useful_rate"], "25.0%")
+            self.assertEqual(health["false_positive_rate"], "25.0%")
+            self.assertEqual(health["unclear_rate"], "0.0%")
 
     def test_workspace_status_hashes_diff_without_exposing_body_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

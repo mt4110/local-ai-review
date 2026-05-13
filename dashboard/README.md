@@ -26,6 +26,11 @@ The dashboard reads aggregate JSON from `scripts/dashboard_snapshot.py`. It does
 not run reviews, post PR comments, write verdicts, activate calibration, or show
 raw review bodies/diffs.
 
+The snapshot includes read-only review health, stamp stock, and calibration
+health aggregates: useful / false-positive / unclear rates, missed / covered
+external examples, external and review-gap stamp inbox counts, unscored runs,
+candidate activation inbox counts, and active calibration audit status.
+
 When a workspace target is configured, the snapshot also shows read-only git
 status: repo, branch, dirty/ahead-behind state, changed file count, diff byte
 count, and a diff fingerprint. The diff text itself is not returned to the
