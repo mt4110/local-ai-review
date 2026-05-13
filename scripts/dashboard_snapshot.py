@@ -1597,11 +1597,11 @@ def calibration_recent_target_evidence(
         if not (
             has_object(objects, "external_items")
             and has_object(objects, "item_verdicts")
-            and has_columns(connection, "external_items", {"id", "repo", "path", "created_at"})
+            and has_columns(connection, "external_items", {"id", "repo", "path"})
             and has_columns(
                 connection,
                 "item_verdicts",
-                {"id", "target_kind", "target_id", "verdict"},
+                {"id", "target_kind", "target_id", "verdict", "scored_at"},
             )
         ):
             return 0
@@ -1626,7 +1626,7 @@ def calibration_recent_target_evidence(
             ) AS verdicts
             ON verdicts.target_kind = 'external_item'
             AND verdicts.target_id = external_items.id
-            WHERE external_items.created_at >= ?
+            WHERE verdicts.scored_at >= ?
               AND verdicts.verdict = 'missed_by_local'
               {repo_filter}
             GROUP BY external_items.path, verdicts.verdict
