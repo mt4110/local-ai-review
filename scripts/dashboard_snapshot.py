@@ -1580,7 +1580,7 @@ def calibration_recent_target_evidence(
             ) AS latest
             ON latest.id = verdicts.id
             WHERE verdicts.target_kind = 'review_item'
-              AND verdicts.scored_at >= ?
+              AND verdicts.scored_at > ?
               AND verdicts.verdict = ?
               {repo_filter}
             GROUP BY items.path
@@ -1622,7 +1622,7 @@ def calibration_recent_target_evidence(
             ) AS verdicts
             ON verdicts.target_kind = 'external_item'
             AND verdicts.target_id = external_items.id
-            WHERE verdicts.scored_at >= ?
+            WHERE verdicts.scored_at > ?
               AND verdicts.verdict = 'missed_by_local'
               {repo_filter}
             GROUP BY external_items.path, verdicts.verdict
@@ -1662,7 +1662,7 @@ def calibration_runs_after(
         f"""
         SELECT COUNT(*) AS total
         FROM {table}
-        WHERE created_at >= ?
+        WHERE created_at > ?
           {repo_filter}
         """,
         params,

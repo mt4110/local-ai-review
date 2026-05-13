@@ -633,6 +633,97 @@ class DashboardSnapshotTests(unittest.TestCase):
             self.assertEqual(health["recent"][0]["status"], "watch_missed")
             self.assertEqual(health["recent"][0]["target_after"], 1)
 
+    def test_calibration_health_excludes_activation_time_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "review.db"
+            with sqlite3.connect(db_path) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.executescript(
+                    """
+                    CREATE TABLE review_runs (
+                        id INTEGER PRIMARY KEY,
+                        created_at TEXT NOT NULL,
+                        repo TEXT NOT NULL
+                    );
+                    CREATE TABLE review_items (
+                        id INTEGER PRIMARY KEY,
+                        run_id INTEGER NOT NULL,
+                        path TEXT NOT NULL DEFAULT ''
+                    );
+                    CREATE TABLE item_verdicts (
+                        id INTEGER PRIMARY KEY,
+                        target_kind TEXT NOT NULL,
+                        target_id INTEGER NOT NULL,
+                        verdict TEXT NOT NULL,
+                        scored_at TEXT NOT NULL DEFAULT ''
+                    );
+                    CREATE TABLE learning_calibrations (
+                        id INTEGER PRIMARY KEY,
+                        calibration_id TEXT NOT NULL,
+                        scope_repo TEXT NOT NULL DEFAULT '',
+                        path_class TEXT NOT NULL DEFAULT '',
+                        signal_kind TEXT NOT NULL DEFAULT '',
+                        evidence_count INTEGER NOT NULL DEFAULT 0,
+                        confidence TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL DEFAULT 'active',
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO review_runs (
+                        id,
+                        created_at,
+                        repo
+                    ) VALUES (1, '2026-05-01T00:00:00Z', 'owner/repo');
+                    INSERT INTO review_items (
+                        id,
+                        run_id,
+                        path
+                    ) VALUES (1, 1, 'src/app.py');
+                    INSERT INTO item_verdicts (
+                        id,
+                        target_kind,
+                        target_id,
+                        verdict,
+                        scored_at
+                    ) VALUES (1, 'review_item', 1, 'false_positive', '2026-05-01T00:00:00Z');
+                    INSERT INTO learning_calibrations (
+                        id,
+                        calibration_id,
+                        scope_repo,
+                        path_class,
+                        signal_kind,
+                        evidence_count,
+                        confidence,
+                        status,
+                        created_at,
+                        updated_at
+                    ) VALUES (
+                        1,
+                        'cal-activation-tie',
+                        'owner/repo',
+                        'code',
+                        'local_false_positive',
+                        3,
+                        'medium',
+                        'active',
+                        '2026-05-01T00:00:00Z',
+                        '2026-05-01T00:00:00Z'
+                    );
+                    """
+                )
+                objects = dashboard_snapshot.sqlite_objects(connection)
+
+                health = dashboard_snapshot.calibration_health_counts(
+                    connection,
+                    objects=objects,
+                    repo="owner/repo",
+                    limit=5,
+                )
+
+            self.assertEqual(health["status"], "warming_up")
+            self.assertEqual(health["recent"][0]["runs_after"], 0)
+            self.assertEqual(health["recent"][0]["target_after"], 0)
+
     def test_workspace_status_hashes_diff_without_exposing_body_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / "repo"
