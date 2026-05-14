@@ -71,6 +71,7 @@ DEFAULT_WATCH_SHARPENER_DIR = TOOL_ROOT / "out" / "review-history" / "watch-shar
 DEFAULT_CALIBRATION_RISK_GATE_DIR = TOOL_ROOT / "out" / "review-history" / "calibration-risk-gate"
 DEFAULT_PROMPT_REGRESSION_AUDIT_DIR = TOOL_ROOT / "out" / "review-history" / "prompt-regression-audit"
 DEFAULT_BACKFILL_PUMP_DIR = TOOL_ROOT / "out" / "review-history" / "backfill-pump"
+DEFAULT_SPECBACKFILL_OVERLAP_DIR = TOOL_ROOT / "out" / "review-history" / "specbackfill-overlap"
 DEFAULT_MATCHER_EXPLAIN_DIR = TOOL_ROOT / "out" / "review-history" / "matcher-explain"
 DEFAULT_TRAINING_EXPORT_DIR = TOOL_ROOT / "out" / "review-history" / "training-export"
 DEFAULT_RULE_CANDIDATE_EXTRACTOR_DIR = TOOL_ROOT / "out" / "review-history" / "rule-candidate-extractor"
@@ -421,6 +422,22 @@ class LinkDiagnostic:
     best_watch_score: float
     best_watch_relation: str
     best_watch_item_id: int | None
+
+
+@dataclass(frozen=True)
+class SpecbackfillFinding:
+    ordinal: int
+    finding_id: str
+    omission_signature: str
+    rule_id: str
+    severity: str
+    confidence: str
+    path: str
+    line: int | None
+    title: str
+    why: str
+    expected_companions: tuple[str, ...]
+    fingerprint: str
 
 
 class GitHubRequestError(Exception):
@@ -14545,6 +14562,852 @@ def external_report_counts(
     return total, linked, verdict_rows
 
 
+def specbackfill_finding_body(finding: SpecbackfillFinding) -> str:
+    parts = [
+        f"rule_id: {finding.rule_id}",
+        f"omission_signature: {finding.omission_signature}",
+        finding.why,
+    ]
+    if finding.expected_companions:
+        parts.append("expected companions: " + ", ".join(finding.expected_companions))
+    return "\n".join(part for part in parts if part)
+
+
+def specbackfill_normalized_fingerprint(
+    *,
+    finding_id: str,
+    omission_signature: str,
+    rule_id: str,
+    severity: str,
+    confidence: str,
+    path: str,
+    line: int | None,
+    title: str,
+    why: str,
+    expected_companions: tuple[str, ...],
+) -> str:
+    if finding_id:
+        return finding_id
+    return stable_fingerprint(
+        "specbackfill",
+        omission_signature,
+        rule_id,
+        severity,
+        confidence,
+        path,
+        line,
+        title,
+        why,
+        "\n".join(expected_companions),
+    )
+
+
+def specbackfill_first_evidence(finding: dict[str, Any]) -> tuple[str, int | None]:
+    evidence = finding.get("evidence")
+    if not isinstance(evidence, list):
+        return "", None
+    for item in evidence:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("file") or item.get("path") or "")
+        line = as_optional_int(item.get("line") or item.get("new_line"))
+        if path or line is not None:
+            return path, line
+    return "", None
+
+
+def parse_specbackfill_findings_payload(payload: Any) -> list[SpecbackfillFinding]:
+    if isinstance(payload, dict):
+        raw_findings = payload.get("findings", [])
+    elif isinstance(payload, list):
+        raw_findings = payload
+    else:
+        raise SystemExit("specbackfill JSON must be an object with findings or a findings array")
+    if not isinstance(raw_findings, list):
+        raise SystemExit("specbackfill JSON findings must be an array")
+
+    findings: list[SpecbackfillFinding] = []
+    for ordinal, raw in enumerate(raw_findings, start=1):
+        if not isinstance(raw, dict):
+            continue
+        path, line = specbackfill_first_evidence(raw)
+        expected_raw = raw.get("expected_companions")
+        expected_companions = (
+            tuple(str(value) for value in expected_raw if value is not None)
+            if isinstance(expected_raw, list)
+            else tuple()
+        )
+        finding_id = str(raw.get("finding_id") or "")
+        omission_signature = str(raw.get("omission_signature") or "")
+        rule_id = str(raw.get("rule_id") or "")
+        severity = str(raw.get("severity") or "")
+        confidence = str(raw.get("confidence") or "")
+        title = str(raw.get("title") or rule_id or "specbackfill finding")
+        why = str(raw.get("why") or raw.get("body") or "")
+        fingerprint = specbackfill_normalized_fingerprint(
+            finding_id=finding_id,
+            omission_signature=omission_signature,
+            rule_id=rule_id,
+            severity=severity,
+            confidence=confidence,
+            path=path,
+            line=line,
+            title=title,
+            why=why,
+            expected_companions=expected_companions,
+        )
+        findings.append(
+            SpecbackfillFinding(
+                ordinal=ordinal,
+                finding_id=finding_id,
+                omission_signature=omission_signature,
+                rule_id=rule_id,
+                severity=severity,
+                confidence=confidence,
+                path=path,
+                line=line,
+                title=title,
+                why=why,
+                expected_companions=expected_companions,
+                fingerprint=fingerprint,
+            )
+        )
+    return findings
+
+
+def load_specbackfill_findings(path_text: str) -> tuple[list[SpecbackfillFinding], dict[str, Any]]:
+    if not path_text:
+        return [], {"provided": False}
+    if path_text == "-":
+        raw = sys.stdin.read()
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"specbackfill JSON could not be parsed from stdin: {exc}") from exc
+        return parse_specbackfill_findings_payload(payload), {
+            "provided": True,
+            "path": "-",
+            "sha256": sha256_text(raw),
+        }
+    path = Path(path_text).expanduser().resolve()
+    if not path.is_file():
+        raise SystemExit(f"specbackfill JSON not found: {path}")
+    try:
+        raw = path.read_text(encoding="utf-8")
+        payload = json.loads(raw)
+    except OSError as exc:
+        raise SystemExit(f"specbackfill JSON could not be read: {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"specbackfill JSON could not be parsed: {path}: {exc}") from exc
+    return parse_specbackfill_findings_payload(payload), {
+        "provided": True,
+        "path": str(path),
+        "sha256": sha256_text(raw),
+    }
+
+
+def specbackfill_finding_as_external(
+    finding: SpecbackfillFinding,
+    *,
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+) -> ExternalReviewItem:
+    return ExternalReviewItem(
+        repo=repo,
+        pr_number=pr_number,
+        head_sha=head_sha,
+        import_head_sha=head_sha,
+        source="specbackfill",
+        path=finding.path,
+        line=finding.line,
+        title=finding.title,
+        body=specbackfill_finding_body(finding),
+        url="",
+        github_comment_id="",
+        github_thread_id="",
+        fingerprint=finding.fingerprint,
+    )
+
+
+def specbackfill_finding_as_candidate(finding: SpecbackfillFinding) -> LinkCandidate:
+    return LinkCandidate(
+        id=finding.ordinal,
+        run_id=0,
+        item_type="finding",
+        source="specbackfill",
+        path=finding.path,
+        line=finding.line,
+        title=finding.title,
+        body=specbackfill_finding_body(finding),
+        fix="",
+        verification="",
+        fingerprint=finding.fingerprint,
+    )
+
+
+def specbackfill_overlap_repo_scope(args: argparse.Namespace) -> str:
+    if getattr(args, "all_repos", False):
+        return ""
+    if getattr(args, "repo", ""):
+        return str(args.repo)
+    try:
+        project_dir, repo_override, _target = resolve_workspace_target(args)
+        root = discover_git_root(project_dir)
+        return detect_repo(root, repo_override).full_name
+    except SystemExit:
+        return ""
+
+
+def specbackfill_overlap_run_row(
+    connection: sqlite3.Connection | None,
+    run_id: int | None,
+) -> sqlite3.Row | None:
+    if connection is None or run_id is None:
+        return None
+    if not sqlite_table_exists(connection, "review_runs"):
+        return None
+    return connection.execute(
+        """
+        SELECT *
+        FROM review_runs
+        WHERE id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+
+
+def specbackfill_overlap_scope(
+    *,
+    args: argparse.Namespace,
+    run_row: sqlite3.Row | None,
+) -> dict[str, Any]:
+    if run_row is not None:
+        run_repo = str(run_row["repo"] or "")
+        run_pr_number = as_optional_int(run_row["pr_number"])
+        run_head_sha = str(run_row["head_sha"] or "")
+        conflicts: list[str] = []
+        if getattr(args, "all_repos", False):
+            conflicts.append("--all-repos cannot be combined with --run")
+        arg_repo = str(getattr(args, "repo", "") or "")
+        if arg_repo and arg_repo != run_repo:
+            conflicts.append(f"--repo {arg_repo} does not match run repo {run_repo}")
+        arg_pr_number = as_optional_int(getattr(args, "pr", None))
+        if arg_pr_number is not None and arg_pr_number != run_pr_number:
+            conflicts.append(f"--pr {arg_pr_number} does not match run PR {run_pr_number or 0}")
+        arg_head_sha = str(getattr(args, "head_sha", "") or "")
+        if arg_head_sha and arg_head_sha != run_head_sha:
+            conflicts.append("--head-sha does not match run head SHA")
+        if conflicts:
+            raise SystemExit("Conflicting --run scope: " + "; ".join(conflicts))
+        return {
+            "repo": run_repo,
+            "pr_number": run_pr_number,
+            "head_sha": run_head_sha,
+            "run_id": as_optional_int(getattr(args, "run", None)),
+        }
+
+    repo = ""
+    if not getattr(args, "all_repos", False) and getattr(args, "repo", ""):
+        repo = str(args.repo)
+    else:
+        repo = specbackfill_overlap_repo_scope(args)
+    pr_number = as_optional_int(getattr(args, "pr", None))
+    head_sha = str(getattr(args, "head_sha", "") or "")
+    return {
+        "repo": repo,
+        "pr_number": pr_number,
+        "head_sha": head_sha,
+        "run_id": as_optional_int(getattr(args, "run", None)),
+    }
+
+
+def specbackfill_overlap_local_rows(
+    connection: sqlite3.Connection | None,
+    *,
+    scope: dict[str, Any],
+    local_source: str,
+    include_watch: bool,
+    limit: int,
+) -> list[sqlite3.Row]:
+    if connection is None:
+        return []
+    if not (sqlite_table_exists(connection, "review_runs") and sqlite_table_exists(connection, "review_items")):
+        return []
+    filters = ["1 = 1"]
+    params: list[Any] = []
+    run_id = as_optional_int(scope.get("run_id"))
+    repo = str(scope.get("repo") or "")
+    pr_number = as_optional_int(scope.get("pr_number"))
+    head_sha = str(scope.get("head_sha") or "")
+    if run_id is not None:
+        filters.append("runs.id = ?")
+        params.append(run_id)
+    else:
+        if repo:
+            filters.append("runs.repo = ?")
+            params.append(repo)
+        if pr_number is not None:
+            filters.append("runs.pr_number = ?")
+            params.append(pr_number)
+        if head_sha:
+            filters.append("(runs.head_sha = ? OR runs.head_sha = '')")
+            params.append(head_sha)
+    item_types = ["finding", "watch"] if include_watch else ["finding"]
+    filters.append(f"items.item_type IN ({sqlite_placeholders(len(item_types))})")
+    params.extend(item_types)
+    if local_source == "model":
+        filters.append("items.source = 'model'")
+    elif local_source == "non-specbackfill":
+        filters.append("items.source <> 'specbackfill'")
+    limit_sql, limit_params = query_limit_clause(limit)
+    return connection.execute(
+        f"""
+        SELECT
+            items.*,
+            runs.repo,
+            runs.pr_number,
+            runs.head_sha
+        FROM review_items AS items
+        JOIN review_runs AS runs
+        ON runs.id = items.run_id
+        WHERE {" AND ".join(filters)}
+        ORDER BY runs.id DESC, items.item_type, items.ordinal
+        {limit_sql}
+        """,
+        [*params, *limit_params],
+    ).fetchall()
+
+
+def specbackfill_overlap_external_rows(
+    connection: sqlite3.Connection | None,
+    *,
+    scope: dict[str, Any],
+    limit: int,
+) -> list[sqlite3.Row]:
+    if connection is None or not sqlite_table_exists(connection, "external_items"):
+        return []
+    filters = ["1 = 1"]
+    params: list[Any] = []
+    repo = str(scope.get("repo") or "")
+    pr_number = as_optional_int(scope.get("pr_number"))
+    head_sha = str(scope.get("head_sha") or "")
+    if repo:
+        filters.append("repo = ?")
+        params.append(repo)
+    if pr_number is not None:
+        filters.append("pr_number = ?")
+        params.append(pr_number)
+    if head_sha:
+        filters.append("(import_head_sha = ? OR head_sha = ? OR head_sha = '')")
+        params.extend([head_sha, head_sha])
+    limit_sql, limit_params = query_limit_clause(limit)
+    return connection.execute(
+        f"""
+        SELECT *
+        FROM external_items
+        WHERE {" AND ".join(filters)}
+        ORDER BY id DESC
+        {limit_sql}
+        """,
+        [*params, *limit_params],
+    ).fetchall()
+
+
+def specbackfill_overlap_link_candidates(rows: list[sqlite3.Row]) -> list[LinkCandidate]:
+    candidates: list[LinkCandidate] = []
+    for row in rows:
+        candidates.append(
+            LinkCandidate(
+                id=int(row["id"]),
+                run_id=int(row["run_id"]),
+                item_type=str(row["item_type"] or ""),
+                source=str(row["source"] or ""),
+                path=str(row["path"] or ""),
+                line=as_optional_int(row["line"]),
+                title=str(row["title"] or ""),
+                body=str(row["body"] or ""),
+                fix=str(row["fix"] or ""),
+                verification=str(row["verification"] or ""),
+                fingerprint=str(row["fingerprint"] or ""),
+            )
+        )
+    return candidates
+
+
+def specbackfill_overlap_existing_link_count(
+    connection: sqlite3.Connection | None,
+    *,
+    local_rows: list[sqlite3.Row],
+    external_rows: list[sqlite3.Row],
+) -> int:
+    if connection is None or not sqlite_table_exists(connection, "item_links"):
+        return 0
+    local_ids = [int(row["id"]) for row in local_rows]
+    external_ids = [int(row["id"]) for row in external_rows]
+    if not local_ids or not external_ids:
+        return 0
+    count = 0
+    for local_batch in sqlite_batched_values(local_ids):
+        local_placeholders = sqlite_placeholders(len(local_batch))
+        for external_batch in sqlite_batched_values(external_ids):
+            external_placeholders = sqlite_placeholders(len(external_batch))
+            count += int(
+                connection.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM item_links
+                    WHERE review_item_id IN ({local_placeholders})
+                      AND external_item_id IN ({external_placeholders})
+                    """,
+                    [*local_batch, *external_batch],
+                ).fetchone()[0]
+            )
+    return count
+
+
+def specbackfill_finding_record(finding: SpecbackfillFinding) -> dict[str, Any]:
+    return {
+        "ordinal": finding.ordinal,
+        "finding_id": finding.finding_id,
+        "omission_signature": finding.omission_signature,
+        "rule_id": finding.rule_id,
+        "severity": finding.severity,
+        "confidence": finding.confidence,
+        "path": finding.path,
+        "line": finding.line,
+        "title_digest": learning_body_digest(finding.title),
+        "body_digest": learning_body_digest(finding.why),
+        "expected_companions": list(finding.expected_companions),
+        "fingerprint": finding.fingerprint,
+    }
+
+
+def specbackfill_local_match_record(
+    match: LinkMatch,
+    *,
+    spec_by_ordinal: dict[int, SpecbackfillFinding],
+    local_by_id: dict[int, LinkCandidate],
+) -> dict[str, Any]:
+    finding = spec_by_ordinal[match.external_item_id]
+    candidate = local_by_id[match.review_item_id]
+    return {
+        "pair": "specbackfill_to_local",
+        "rule_id": finding.rule_id,
+        "specbackfill_ordinal": finding.ordinal,
+        "specbackfill_finding_id": finding.finding_id,
+        "specbackfill_omission_signature": finding.omission_signature,
+        "path": finding.path or candidate.path,
+        "line": finding.line if finding.line is not None else candidate.line,
+        "local_review_item_id": candidate.id,
+        "local_run_id": candidate.run_id,
+        "local_source": candidate.source,
+        "local_item_type": candidate.item_type,
+        "local_title_digest": learning_body_digest(candidate.title),
+        "score": round(match.score, 4),
+        "relation": match.relation,
+    }
+
+
+def specbackfill_external_match_record(
+    match: LinkMatch,
+    *,
+    spec_by_ordinal: dict[int, SpecbackfillFinding],
+    external_by_id: dict[int, ExternalReviewItem],
+) -> dict[str, Any]:
+    finding = spec_by_ordinal[match.review_item_id]
+    external = external_by_id[match.external_item_id]
+    return {
+        "pair": "specbackfill_to_external",
+        "rule_id": finding.rule_id,
+        "specbackfill_ordinal": finding.ordinal,
+        "specbackfill_finding_id": finding.finding_id,
+        "specbackfill_omission_signature": finding.omission_signature,
+        "path": finding.path or external.path,
+        "line": finding.line if finding.line is not None else external.line,
+        "external_item_id": match.external_item_id,
+        "external_source": external.source,
+        "external_title_digest": learning_body_digest(external.title),
+        "score": round(match.score, 4),
+        "relation": match.relation,
+    }
+
+
+def external_local_match_record(
+    match: LinkMatch,
+    *,
+    external_by_id: dict[int, ExternalReviewItem],
+    local_by_id: dict[int, LinkCandidate],
+) -> dict[str, Any]:
+    external = external_by_id[match.external_item_id]
+    candidate = local_by_id[match.review_item_id]
+    return {
+        "pair": "external_to_local",
+        "path": external.path or candidate.path,
+        "line": external.line if external.line is not None else candidate.line,
+        "external_item_id": match.external_item_id,
+        "external_source": external.source,
+        "external_title_digest": learning_body_digest(external.title),
+        "local_review_item_id": candidate.id,
+        "local_run_id": candidate.run_id,
+        "local_source": candidate.source,
+        "local_item_type": candidate.item_type,
+        "local_title_digest": learning_body_digest(candidate.title),
+        "score": round(match.score, 4),
+        "relation": match.relation,
+    }
+
+
+def specbackfill_overlap_payload(
+    *,
+    args: argparse.Namespace,
+    db_path: Path,
+    db_available: bool,
+    scope: dict[str, Any],
+    specbackfill_input: dict[str, Any],
+    findings: list[SpecbackfillFinding],
+    local_rows: list[sqlite3.Row],
+    external_rows: list[sqlite3.Row],
+    existing_external_local_links: int,
+) -> dict[str, Any]:
+    local_candidates = specbackfill_overlap_link_candidates(local_rows)
+    external_items = external_items_from_rows(external_rows)
+    spec_external_items = [
+        (finding.ordinal, specbackfill_finding_as_external(
+            finding,
+            repo=str(scope.get("repo") or ""),
+            pr_number=int(scope.get("pr_number") or 0),
+            head_sha=str(scope.get("head_sha") or ""),
+        ))
+        for finding in findings
+    ]
+    spec_candidates = [specbackfill_finding_as_candidate(finding) for finding in findings]
+    spec_by_ordinal = {finding.ordinal: finding for finding in findings}
+    local_by_id = {candidate.id: candidate for candidate in local_candidates}
+    external_by_id = {external_id: item for external_id, item in external_items}
+
+    spec_local_matches = build_link_matches(
+        spec_external_items,
+        local_candidates,
+        min_score=args.min_link_score,
+        note_prefix="specbackfill_overlap:",
+    )
+    spec_external_matches = build_link_matches(
+        external_items,
+        spec_candidates,
+        min_score=args.min_link_score,
+        note_prefix="specbackfill_overlap:",
+    )
+    external_local_matches = build_link_matches(
+        external_items,
+        local_candidates,
+        min_score=args.min_link_score,
+        note_prefix="specbackfill_overlap:",
+    )
+
+    spec_local_records = [
+        specbackfill_local_match_record(
+            match,
+            spec_by_ordinal=spec_by_ordinal,
+            local_by_id=local_by_id,
+        )
+        for match in spec_local_matches
+        if match.external_item_id in spec_by_ordinal and match.review_item_id in local_by_id
+    ]
+    spec_external_records = [
+        specbackfill_external_match_record(
+            match,
+            spec_by_ordinal=spec_by_ordinal,
+            external_by_id=external_by_id,
+        )
+        for match in spec_external_matches
+        if match.review_item_id in spec_by_ordinal and match.external_item_id in external_by_id
+    ]
+    external_local_records = [
+        external_local_match_record(
+            match,
+            external_by_id=external_by_id,
+            local_by_id=local_by_id,
+        )
+        for match in external_local_matches
+        if match.external_item_id in external_by_id and match.review_item_id in local_by_id
+    ]
+    local_matched_spec_ordinals = {int(record["specbackfill_ordinal"]) for record in spec_local_records}
+    external_matched_spec_ordinals = {int(record["specbackfill_ordinal"]) for record in spec_external_records}
+    rule_rows: dict[str, dict[str, Any]] = {}
+    for finding in findings:
+        rule_id = finding.rule_id or "(none)"
+        row = rule_rows.setdefault(
+            rule_id,
+            {
+                "rule_id": rule_id,
+                "findings": 0,
+                "matched_local": 0,
+                "matched_external": 0,
+            },
+        )
+        row["findings"] += 1
+        if finding.ordinal in local_matched_spec_ordinals:
+            row["matched_local"] += 1
+        if finding.ordinal in external_matched_spec_ordinals:
+            row["matched_external"] += 1
+
+    unmatched_spec = [
+        specbackfill_finding_record(finding)
+        for finding in findings
+        if finding.ordinal not in local_matched_spec_ordinals
+        and finding.ordinal not in external_matched_spec_ordinals
+    ]
+    return {
+        "schema_name": "local-ai-review-specbackfill-overlap-preview",
+        "schema_version": 1,
+        "created_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "db": str(db_path),
+        "db_available": db_available,
+        "specbackfill_available": bool(shutil.which("specbackfill")),
+        "specbackfill_input": specbackfill_input,
+        "scope": scope,
+        "policy": {
+            "db_writes": False,
+            "github_api_reads": False,
+            "pr_checkout": False,
+            "pr_code_execution": False,
+            "pr_comment_posting": False,
+            "pr_title_body_mutation": False,
+            "raw_body_or_diff_output": False,
+        },
+        "options": {
+            "min_link_score": args.min_link_score,
+            "local_source": args.local_source,
+            "include_watch": bool(args.include_watch),
+            "limit": args.limit,
+            "match_limit": args.match_limit,
+        },
+        "counts": {
+            "specbackfill_findings": len(findings),
+            "local_review_items": len(local_rows),
+            "external_items": len(external_rows),
+            "specbackfill_local_overlaps": len(spec_local_records),
+            "specbackfill_external_overlaps": len(spec_external_records),
+            "external_local_candidate_overlaps": len(external_local_records),
+            "existing_external_local_links": existing_external_local_links,
+            "unmatched_specbackfill_findings": len(unmatched_spec),
+        },
+        "rules": sorted(rule_rows.values(), key=lambda row: (-int(row["findings"]), str(row["rule_id"]))),
+        "specbackfill_findings": [specbackfill_finding_record(finding) for finding in findings],
+        "matches": [
+            *spec_local_records[: args.match_limit],
+            *spec_external_records[: args.match_limit],
+            *external_local_records[: args.match_limit],
+        ],
+        "unmatched_specbackfill_findings": unmatched_spec[: args.match_limit],
+    }
+
+
+def specbackfill_overlap_report(payload: dict[str, Any]) -> str:
+    counts = payload["counts"]
+    scope = payload["scope"]
+    input_record = payload.get("specbackfill_input") or {}
+    lines = [
+        "# Specbackfill Overlap Preview",
+        "",
+        "Report-only preview. This command reads the review-history DB and optional specbackfill JSON, writes artifacts, and does not write DB rows or mutate GitHub.",
+        "",
+        "## Scope",
+        "",
+        f"- DB: `{payload['db']}`",
+        f"- DB available: `{payload['db_available']}`",
+        f"- Repository: `{scope.get('repo') or 'global'}`",
+        f"- PR: `{scope.get('pr_number') if scope.get('pr_number') is not None else 'all'}`",
+        f"- Head SHA: `{scope.get('head_sha') or ''}`",
+        f"- Run ID: `{scope.get('run_id') if scope.get('run_id') is not None else ''}`",
+        f"- specbackfill on PATH: `{payload.get('specbackfill_available')}`",
+        f"- specbackfill JSON: `{input_record.get('path', '(not provided)')}`",
+        "",
+        "## Counts",
+        "",
+        f"- specbackfill findings: {counts['specbackfill_findings']}",
+        f"- local review items: {counts['local_review_items']}",
+        f"- external items: {counts['external_items']}",
+        f"- specbackfill to local overlaps: {counts['specbackfill_local_overlaps']}",
+        f"- specbackfill to external overlaps: {counts['specbackfill_external_overlaps']}",
+        f"- external to local candidate overlaps: {counts['external_local_candidate_overlaps']}",
+        f"- existing external/local DB links: {counts['existing_external_local_links']}",
+        f"- unmatched specbackfill findings: {counts['unmatched_specbackfill_findings']}",
+        "",
+        "## Rule Summary",
+        "",
+    ]
+    rules = payload.get("rules") or []
+    if rules:
+        lines.append("| Rule | Findings | Matched local | Matched external |")
+        lines.append("|---|---:|---:|---:|")
+        for row in rules:
+            lines.append(
+                "| `{rule}` | {findings} | {local} | {external} |".format(
+                    rule=markdown_cell(row.get("rule_id", "")),
+                    findings=row.get("findings", 0),
+                    local=row.get("matched_local", 0),
+                    external=row.get("matched_external", 0),
+                )
+            )
+    else:
+        lines.append("- No specbackfill findings were provided.")
+    matches = payload.get("matches") or []
+    lines.extend(["", "## Match Samples", ""])
+    if matches:
+        lines.append("| Pair | Rule | Path | Line | Local | External | Score | Relation |")
+        lines.append("|---|---|---|---:|---|---|---:|---|")
+        for record in matches[:12]:
+            lines.append(
+                "| {pair} | `{rule}` | `{path}` | {line} | {local} | {external} | {score:.2f} | `{relation}` |".format(
+                    pair=markdown_cell(record.get("pair", "")),
+                    rule=markdown_cell(record.get("rule_id", "")),
+                    path=markdown_cell(record.get("path", "")),
+                    line=record.get("line") if record.get("line") is not None else "",
+                    local=(
+                        f"`{record.get('local_source')}:{record.get('local_review_item_id')}`"
+                        if record.get("local_review_item_id") is not None
+                        else ""
+                    ),
+                    external=(
+                        f"`{record.get('external_source')}:{record.get('external_item_id')}`"
+                        if record.get("external_item_id") is not None
+                        else ""
+                    ),
+                    score=float(record.get("score") or 0.0),
+                    relation=markdown_cell(record.get("relation", "")),
+                )
+            )
+    elif (
+        int(counts["specbackfill_local_overlaps"] or 0)
+        + int(counts["specbackfill_external_overlaps"] or 0)
+        + int(counts["external_local_candidate_overlaps"] or 0)
+    ):
+        lines.append("- Match samples were omitted by the current `--match-limit`.")
+    else:
+        lines.append("- No deterministic overlaps reached the current threshold.")
+    unmatched = payload.get("unmatched_specbackfill_findings") or []
+    lines.extend(["", "## Unmatched Specbackfill Findings", ""])
+    if unmatched:
+        lines.append("| Rule | Path | Line | Signature |")
+        lines.append("|---|---|---:|---|")
+        for record in unmatched[:12]:
+            lines.append(
+                "| `{rule}` | `{path}` | {line} | `{signature}` |".format(
+                    rule=markdown_cell(record.get("rule_id", "")),
+                    path=markdown_cell(record.get("path", "")),
+                    line=record.get("line") if record.get("line") is not None else "",
+                    signature=markdown_cell(record.get("omission_signature", "")),
+                )
+            )
+    else:
+        if int(counts["unmatched_specbackfill_findings"] or 0):
+            lines.append("- Unmatched records were omitted by the current `--match-limit`.")
+        else:
+            lines.append("- Every provided specbackfill finding matched local or external evidence at the current threshold.")
+    lines.extend(
+        [
+            "",
+            "## Safety",
+            "",
+            "- No DB writes.",
+            "- No GitHub API calls.",
+            "- No PR checkout or PR code execution.",
+            "- No PR comments, title edits, or body edits.",
+            "- Match artifacts use ids, paths, line numbers, rule ids, and digests; raw DB bodies and raw diff text are not rendered.",
+        ]
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def command_specbackfill_overlap(args: argparse.Namespace) -> None:
+    db_path = sqlite_db_path(args.db)
+    findings, specbackfill_input = load_specbackfill_findings(str(args.specbackfill_json or ""))
+    db_available = db_path.is_file()
+    if args.run is not None and not db_available:
+        raise SystemExit(f"review DB not found for --run {args.run}: {db_path}")
+    connection_context = connect_review_db_readonly(db_path, row_factory=True) if db_available else None
+    if connection_context is None:
+        run_row = None
+        scope = specbackfill_overlap_scope(args=args, run_row=None)
+        local_rows: list[sqlite3.Row] = []
+        external_rows: list[sqlite3.Row] = []
+        existing_links = 0
+    else:
+        with managed_sqlite_connection(connection_context) as connection:
+            connection.row_factory = sqlite3.Row
+            run_row = specbackfill_overlap_run_row(connection, as_optional_int(args.run))
+            if args.run is not None and run_row is None:
+                raise SystemExit(f"review run not found: {args.run}")
+            scope = specbackfill_overlap_scope(args=args, run_row=run_row)
+            local_rows = specbackfill_overlap_local_rows(
+                connection,
+                scope=scope,
+                local_source=args.local_source,
+                include_watch=bool(args.include_watch),
+                limit=args.limit,
+            )
+            external_rows = specbackfill_overlap_external_rows(
+                connection,
+                scope=scope,
+                limit=args.limit,
+            )
+            existing_links = specbackfill_overlap_existing_link_count(
+                connection,
+                local_rows=local_rows,
+                external_rows=external_rows,
+            )
+    payload = specbackfill_overlap_payload(
+        args=args,
+        db_path=db_path,
+        db_available=db_available,
+        scope=scope,
+        specbackfill_input=specbackfill_input,
+        findings=findings,
+        local_rows=local_rows,
+        external_rows=external_rows,
+        existing_external_local_links=existing_links,
+    )
+    report = specbackfill_overlap_report(payload)
+    if args.dry_run:
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        else:
+            print(report.rstrip())
+        return
+
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    repo_slug = slugify_path_part(str(scope.get("repo") or "global"))
+    pr_part = f"-pr-{scope['pr_number']}" if scope.get("pr_number") is not None else ""
+    stem = f"specbackfill-overlap-{stamp}-{repo_slug}{pr_part}"
+    report_path = output_dir / f"{stem}.md"
+    json_path = output_dir / f"{stem}.json"
+    latest_report_path = output_dir / "latest.md"
+    latest_json_path = output_dir / "latest.json"
+    payload = {
+        **payload,
+        "artifact_paths": {
+            "report": str(report_path),
+            "json": str(json_path),
+            "latest_report": str(latest_report_path),
+            "latest_json": str(latest_json_path),
+        },
+    }
+    report = specbackfill_overlap_report(payload)
+    report_path.write_text(report, encoding="utf-8")
+    write_json(json_path, payload)
+    latest_report_path.write_text(report, encoding="utf-8")
+    write_json(latest_json_path, payload)
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
+        print(report.rstrip())
+        print(f"\nOK: specbackfill overlap report={report_path}")
+
+
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -19170,7 +20033,7 @@ def build_review_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Auto-detect and run local PR review",
         epilog=(
-            "Subcommands: status, target, daily, backup, db-plan, second-opinion, async-status, app-developer-review-status, external-verdict, stamp-assist, notify-test, calibration, score, scoring-pump, review-gap-stamp-pump, recall-pattern-miner, watch-sharpener, calibration-risk-gate, prompt-regression-audit, backfill-pump, matcher-explain, training-export-splitter, rule-candidate-extractor, report, learn-preview, learn-candidates, learn-pump, learn-review, learn-propose, learn-next, learn-apply, learn-audit, export-jsonl, "
+            "Subcommands: status, target, daily, backup, db-plan, second-opinion, async-status, app-developer-review-status, external-verdict, stamp-assist, notify-test, calibration, score, scoring-pump, review-gap-stamp-pump, recall-pattern-miner, watch-sharpener, calibration-risk-gate, prompt-regression-audit, backfill-pump, matcher-explain, training-export-splitter, rule-candidate-extractor, learning-scoreboard, report, specbackfill-overlap, learn-preview, learn-candidates, learn-pump, learn-review, learn-propose, learn-next, learn-apply, learn-audit, export-jsonl, "
             "import-github-reviews, import-github-history, install, update"
         ),
     )
@@ -20195,6 +21058,36 @@ def build_report_parser() -> argparse.ArgumentParser:
     return report
 
 
+def build_specbackfill_overlap_parser() -> argparse.ArgumentParser:
+    overlap = argparse.ArgumentParser(
+        description="Preview deterministic overlap between specbackfill JSON, local review items, and external review items"
+    )
+    overlap.set_defaults(func=command_specbackfill_overlap)
+    add_workspace_options(overlap)
+    overlap.add_argument(
+        "--specbackfill-json",
+        help="Path to `specbackfill check --format json --fail-on off` output; use '-' for stdin",
+    )
+    overlap.add_argument("--all-repos", action="store_true", help="Use global DB scope when --run/--repo are omitted")
+    overlap.add_argument("--pr", type=parse_non_negative, help="Restrict DB rows to one PR number")
+    overlap.add_argument("--head-sha", help="Restrict DB rows to a head SHA/import head SHA")
+    overlap.add_argument("--run", type=parse_non_negative, help="Use one local review run as the scope anchor")
+    overlap.add_argument("--output-dir", default=str(DEFAULT_SPECBACKFILL_OVERLAP_DIR))
+    overlap.add_argument(
+        "--local-source",
+        choices=("model", "non-specbackfill", "all"),
+        default="model",
+        help="Which local review_items to compare against specbackfill findings",
+    )
+    overlap.add_argument("--include-watch", action="store_true", help="Include local watch items as candidates")
+    overlap.add_argument("--limit", type=parse_non_negative, default=200, help="Local/external DB rows to inspect")
+    overlap.add_argument("--match-limit", type=parse_non_negative, default=50, help="Match records to include per class")
+    overlap.add_argument("--min-link-score", type=float, default=0.55)
+    overlap.add_argument("--dry-run", action="store_true", help="Print the preview without writing artifact files")
+    overlap.add_argument("--json", action="store_true", help="Print JSON payload instead of markdown")
+    return overlap
+
+
 def build_calibration_parser() -> argparse.ArgumentParser:
     calibration = argparse.ArgumentParser(
         description="Write an artifact-only calibration report from existing local review history"
@@ -20823,6 +21716,7 @@ COMMAND_PARSERS = {
     "rule-candidate-extractor": build_rule_candidate_extractor_parser,
     "learning-scoreboard": build_learning_scoreboard_parser,
     "report": build_report_parser,
+    "specbackfill-overlap": build_specbackfill_overlap_parser,
     "learn-preview": build_learn_preview_parser,
     "learn-candidates": build_learn_candidates_parser,
     "learn-pump": build_learn_pump_parser,

@@ -512,6 +512,16 @@ to fetch/match without writing external items, links, verdicts, or queue state.
 `llreview report` and `llreview export-jsonl` also include queue state and skip
 reasons so skipped/deferred candidates stay visible to the learning loop.
 
+`llreview specbackfill-overlap --specbackfill-json specbackfill.json --repo
+owner/name --pr 42` previews overlap between `specbackfill check --format json
+--fail-on off` findings and existing local `review_items` / imported
+`external_items`. By default it compares against local model findings only. It
+does not write DB rows, call the GitHub API, check out PR code, execute PR code,
+post PR comments, or mutate PR titles/bodies. The Markdown/JSON artifacts under
+`out/review-history/specbackfill-overlap/` render ids, paths, line numbers,
+rule ids, and digests instead of raw DB bodies or raw diff text. Use `--dry-run`
+to print the same preview without writing artifacts.
+
 For 20-minute scheduled operation, use `scripts/backfill-pump-scheduler.py`
 first. It is separate from the Discord watcher: a short one-shot launchd wrapper
 around `llreview backfill-pump`. The default mode is report-only,
