@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
 import sqlite3
 import sys
 import tempfile
@@ -31,6 +34,11 @@ from review_db import (  # noqa: E402
 )
 from llreview import (  # noqa: E402
     POSTGRES_COPY_NULL,
+    BACKFILL_DEFAULT_MAX_CHANGED_LINES,
+    BACKFILL_DEFAULT_MIN_INTERVAL_MINUTES,
+    command_import_github_history,
+    command_import_github_reviews,
+    external_items_from_comments,
     learning_calibration_statuses_by_candidate,
     postgres_copy_value,
     review_path_class,
@@ -112,6 +120,188 @@ class ReviewDbConfigTests(unittest.TestCase):
     def test_connect_postgres_dsn_fails_with_clear_backend_error(self) -> None:
         with self.assertRaises(UnsupportedReviewDbBackendError):
             connect_review_db("postgresql://localhost/llreview")
+
+
+class ImportGithubHistoryTests(unittest.TestCase):
+    def test_issue_comment_signal_filter_requires_actionable_anchor(self) -> None:
+        items = external_items_from_comments(
+            repo="mt4110/example",
+            pr_number=42,
+            default_head_sha="abc123",
+            import_head_sha="abc123",
+            prefer_default_head_sha=True,
+            comments=[
+                {"id": 1, "body": "LGTM", "user": {"login": "reviewer"}},
+                {"id": 2, "body": "Summary: looks fine\n\nTests not run", "user": {"login": "bot"}},
+                {
+                    "id": 3,
+                    "body": "`scripts/app.py` is missing validation for the new config.",
+                    "user": {"login": "reviewer"},
+                },
+                {"id": 4, "body": "Should we merge this?", "user": {"login": "reviewer"}},
+                {"id": 5, "body": "Dockerfile is missing the runtime env.", "user": {"login": "reviewer"}},
+                {"id": 6, "body": "Security looks fine.", "user": {"login": "reviewer"}},
+                {"id": 7, "body": "README.md please.", "user": {"login": "reviewer"}},
+            ],
+            comment_kind="issue_comment",
+        )
+
+        self.assertEqual([item.github_comment_id for item in items], ["issue_comment:3", "issue_comment:5"])
+
+    def test_dry_run_preview_without_refresh_queue_does_not_create_db(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            local_root = root / "local-root"
+            local_root.mkdir()
+            db_path = root / "missing.db"
+            args = argparse.Namespace(
+                project_dir=str(ROOT),
+                repo=None,
+                db=str(db_path),
+                owner="mt4110",
+                local_root=[str(local_root)],
+                remote_repo_limit=0,
+                remote_pr_limit=0,
+                remote_per_repo_pr_limit=0,
+                local_repo_limit=5,
+                local_pr_limit=5,
+                local_per_repo_pr_limit=5,
+                limit=5,
+                max_doc_ratio=0.70,
+                max_generated_ratio=0.50,
+                max_changed_lines=BACKFILL_DEFAULT_MAX_CHANGED_LINES,
+                dry_run=True,
+                one=False,
+                min_interval_minutes=BACKFILL_DEFAULT_MIN_INTERVAL_MINUTES,
+                retry_delay_minutes=60,
+                min_link_score=0.55,
+                no_verdicts=False,
+                pin_queue_head_sha=False,
+                refresh_queue=False,
+                remote_only=False,
+                local_only=True,
+                no_issue_comments=False,
+            )
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                command_import_github_history(args)
+
+            self.assertFalse(db_path.exists())
+            self.assertIn("DRY RUN: queue not written", output.getvalue())
+
+    def test_one_dry_run_without_queue_does_not_create_db_or_require_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "missing.db"
+            args = argparse.Namespace(
+                project_dir=str(ROOT),
+                repo=None,
+                db=str(db_path),
+                owner="mt4110",
+                local_root=[],
+                remote_repo_limit=0,
+                remote_pr_limit=0,
+                remote_per_repo_pr_limit=0,
+                local_repo_limit=0,
+                local_pr_limit=0,
+                local_per_repo_pr_limit=0,
+                limit=5,
+                max_doc_ratio=0.70,
+                max_generated_ratio=0.50,
+                max_changed_lines=BACKFILL_DEFAULT_MAX_CHANGED_LINES,
+                dry_run=True,
+                one=True,
+                min_interval_minutes=BACKFILL_DEFAULT_MIN_INTERVAL_MINUTES,
+                retry_delay_minutes=60,
+                min_link_score=0.55,
+                no_verdicts=False,
+                pin_queue_head_sha=False,
+                refresh_queue=False,
+                remote_only=True,
+                local_only=False,
+                no_issue_comments=False,
+            )
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                command_import_github_history(args)
+
+            self.assertFalse(db_path.exists())
+            self.assertIn("No github_backfill_queue table", output.getvalue())
+
+    def test_one_dry_run_rejects_refresh_queue(self) -> None:
+        args = argparse.Namespace(
+            project_dir=str(ROOT),
+            repo=None,
+            db=":memory:",
+            owner="mt4110",
+            local_root=[],
+            remote_repo_limit=0,
+            remote_pr_limit=0,
+            remote_per_repo_pr_limit=0,
+            local_repo_limit=0,
+            local_pr_limit=0,
+            local_per_repo_pr_limit=0,
+            limit=5,
+            max_doc_ratio=0.70,
+            max_generated_ratio=0.50,
+            max_changed_lines=BACKFILL_DEFAULT_MAX_CHANGED_LINES,
+            dry_run=True,
+            one=True,
+            min_interval_minutes=BACKFILL_DEFAULT_MIN_INTERVAL_MINUTES,
+            retry_delay_minutes=60,
+            min_link_score=0.55,
+            no_verdicts=False,
+            pin_queue_head_sha=False,
+            refresh_queue=True,
+            remote_only=True,
+            local_only=False,
+            no_issue_comments=False,
+        )
+
+        with self.assertRaisesRegex(SystemExit, "dry-run must not change queue state"):
+            command_import_github_history(args)
+
+    def test_import_github_reviews_dry_run_does_not_create_db(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            comments_path = root / "comments.json"
+            db_path = root / "missing.db"
+            comments_path.write_text(
+                """
+                [
+                  {
+                    "id": 1001,
+                    "body": "Missing validation for the new option.",
+                    "path": "scripts/app.py",
+                    "line": 12,
+                    "user": {"login": "reviewer"}
+                  }
+                ]
+                """,
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                project_dir=str(ROOT),
+                repo="mt4110/example",
+                db=str(db_path),
+                pr=42,
+                run=None,
+                include_issue_comments=False,
+                comments_json=str(comments_path),
+                issue_comments_json=None,
+                head_sha="",
+                min_link_score=0.55,
+                dry_run=True,
+                no_verdicts=False,
+            )
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                command_import_github_reviews(args)
+
+            self.assertFalse(db_path.exists())
+            self.assertIn("DRY RUN: would import 1 external review items", output.getvalue())
 
 
 class ReviewDbAggregateTests(unittest.TestCase):
