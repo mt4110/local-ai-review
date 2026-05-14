@@ -15325,6 +15325,8 @@ def command_specbackfill_overlap(args: argparse.Namespace) -> None:
     db_path = sqlite_db_path(args.db)
     findings, specbackfill_input = load_specbackfill_findings(str(args.specbackfill_json or ""))
     db_available = db_path.is_file()
+    if args.run is not None and not db_available:
+        raise SystemExit(f"review DB not found for --run {args.run}: {db_path}")
     connection_context = connect_review_db_readonly(db_path, row_factory=True) if db_available else None
     if connection_context is None:
         run_row = None

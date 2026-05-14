@@ -561,6 +561,33 @@ class SpecbackfillOverlapTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "Conflicting --run scope"):
                 command_specbackfill_overlap(args)
 
+    def test_specbackfill_overlap_rejects_run_with_missing_db(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            spec_path = root / "specbackfill.json"
+            spec_path.write_text('{"findings": []}', encoding="utf-8")
+            args = argparse.Namespace(
+                db=str(root / "missing.db"),
+                project_dir=None,
+                repo="owner/repo",
+                specbackfill_json=str(spec_path),
+                all_repos=False,
+                pr=None,
+                head_sha="",
+                run=1,
+                output_dir=str(root / "overlap"),
+                local_source="model",
+                include_watch=False,
+                limit=50,
+                match_limit=20,
+                min_link_score=0.55,
+                dry_run=True,
+                json=False,
+            )
+
+            with self.assertRaisesRegex(SystemExit, "review DB not found for --run 1"):
+                command_specbackfill_overlap(args)
+
 
 class ImportGithubHistoryTests(unittest.TestCase):
     def import_history_args(self, db_path: Path, *, dry_run: bool, one: bool = True) -> argparse.Namespace:
