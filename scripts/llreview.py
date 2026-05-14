@@ -11419,6 +11419,20 @@ def as_optional_int(value: Any) -> int | None:
         return None
 
 
+def sqlite_table_exists(connection: sqlite3.Connection, table: str) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name = ?
+        LIMIT 1
+        """,
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
 def strip_review_boilerplate(value: str) -> str:
     text = re.sub(r"<details\b.*?</details>", " ", value, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"\n\s*Useful\?\s*React with.*$", "", text, flags=re.IGNORECASE | re.DOTALL)
@@ -11492,6 +11506,55 @@ def external_title_from_body(body: str) -> str:
     return "External review comment"
 
 
+ISSUE_COMMENT_ACK_RE = re.compile(
+    r"^(?:"
+    r"lgtm|looks good(?: to me)?|approved|ship it|"
+    r"thanks?|thank you|done|fixed|resolved|ack(?:nowledged)?|"
+    r"merged|no action needed"
+    r")[.! ]*$",
+    flags=re.IGNORECASE,
+)
+
+ISSUE_COMMENT_PATH_RE = re.compile(
+    r"(?:^|[\s`'\"(])"
+    r"(?:"
+    r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*"
+    r"\.(?:"
+    r"py|pyi|js|jsx|ts|tsx|svelte|go|rs|rb|java|kt|swift|c|cc|cpp|h|hpp|"
+    r"sql|json|ya?ml|toml|ini|env|md|mdx|rst|sh|bash|zsh"
+    r")"
+    r"|(?:[A-Za-z0-9_.-]+/)*(?:Dockerfile|Makefile)"
+    r")"
+    r"(?=$|[\s`'\"),:;])"
+)
+
+ISSUE_COMMENT_ACTIONABLE_PHRASES = (
+    "authorization",
+    "data loss",
+    "does not",
+    "doesn t",
+    "doesn't",
+    "not handled",
+    "permission check",
+    "schema mismatch",
+    "security issue",
+    "test gap",
+)
+
+ISSUE_COMMENT_ACTIONABLE_WORD_RE = re.compile(
+    r"(?:^|\s)(?:"
+    r"breaks?|bugs?|crashes?|deadlocks?|duplicates?|errors?|exceptions?|"
+    r"fails?|failed|failing|incorrect|ignores?|ignored|leaks?|migrations?|"
+    r"mismatches?|missing|null|omits?|omitted|races?|regressions?|"
+    r"undefined|unsafe|invalid|validation|wrong"
+    r")(?:$|\s)"
+)
+
+ISSUE_COMMENT_ANCHORED_ACTION_RE = re.compile(
+    r"(?:^|\s)(?:must|needs?|should)(?:$|\s)"
+)
+
+
 def should_skip_issue_comment(body: str) -> bool:
     normalized = normalize_review_text(body)
     if not normalized:
@@ -11504,7 +11567,23 @@ def should_skip_issue_comment(body: str) -> bool:
         return True
     if "didn t find any major issues" in normalized:
         return True
+    if ISSUE_COMMENT_ACK_RE.fullmatch(markdown_to_plain_text(body).strip()):
+        return True
     return False
+
+
+def looks_actionable_issue_comment(body: str) -> bool:
+    normalized = normalize_review_text(body)
+    if not normalized:
+        return False
+    has_anchor = bool(ISSUE_COMMENT_PATH_RE.search(body)) or bool(
+        re.search(r"(?:^|\s)(?:line|lines|l)\s*#?\d+\b", normalized)
+    )
+    if any(term in normalized for term in ISSUE_COMMENT_ACTIONABLE_PHRASES):
+        return True
+    if ISSUE_COMMENT_ACTIONABLE_WORD_RE.search(normalized):
+        return True
+    return has_anchor and ISSUE_COMMENT_ANCHORED_ACTION_RE.search(normalized) is not None
 
 
 def external_item_fingerprint(item: ExternalReviewItem) -> str:
@@ -11577,8 +11656,11 @@ def external_item_from_comment(
     body = str(comment.get("body") or "")
     if comment_kind != "issue_comment" and comment.get("in_reply_to_id") is not None:
         return None
-    if comment_kind == "issue_comment" and should_skip_issue_comment(body):
-        return None
+    if comment_kind == "issue_comment":
+        if should_skip_issue_comment(body):
+            return None
+        if not looks_actionable_issue_comment(body):
+            return None
     clean_body = strip_review_boilerplate(body)
     if not normalize_review_text(clean_body):
         return None
@@ -12474,6 +12556,8 @@ def existing_external_item_count(
     repo: str,
     pr_number: int,
 ) -> int:
+    if not sqlite_table_exists(connection, "external_items"):
+        return 0
     return int(
         connection.execute(
             """
@@ -12800,6 +12884,11 @@ def existing_local_review_signal_count(
     pr_number: int,
     head_sha: str,
 ) -> int:
+    if not (
+        sqlite_table_exists(connection, "review_runs")
+        and sqlite_table_exists(connection, "review_items")
+    ):
+        return 0
     clauses: list[str] = ["runs.repo = ?"]
     params: list[Any] = [repo]
     identity_clauses: list[str] = []
@@ -13112,13 +13201,13 @@ def upsert_backfill_queue(
     return saved
 
 
-def refresh_backfill_queue_from_args(
+def build_backfill_candidates_from_args(
     connection: sqlite3.Connection,
     args: argparse.Namespace,
     *,
     owner: str,
     token: str,
-) -> tuple[list[BackfillCandidate], int]:
+) -> list[BackfillCandidate]:
     default_project_dir, _, _ = resolve_workspace_target(args)
     local_roots = [
         Path(value).expanduser().resolve()
@@ -13155,6 +13244,22 @@ def refresh_backfill_queue_from_args(
                 max_changed_lines=args.max_changed_lines,
             )
         )
+    return candidates
+
+
+def refresh_backfill_queue_from_args(
+    connection: sqlite3.Connection,
+    args: argparse.Namespace,
+    *,
+    owner: str,
+    token: str,
+) -> tuple[list[BackfillCandidate], int]:
+    candidates = build_backfill_candidates_from_args(
+        connection,
+        args,
+        owner=owner,
+        token=token,
+    )
     return candidates, upsert_backfill_queue(connection, candidates)
 
 
@@ -13291,8 +13396,25 @@ def mark_backfill_row_failed(
 def import_github_history_one(args: argparse.Namespace, *, db_path: Path) -> None:
     if args.local_only:
         raise SystemExit("--one imports remote_github queue rows; local-only rows are preview/queue only")
-    with connect_review_db(db_path) as connection:
+    if args.dry_run and not db_path.is_file():
+        print(
+            "No github_backfill_queue table. Refresh the queue first: "
+            "llreview import-github-history --dry-run --refresh-queue"
+        )
+        return
+    connection_context = (
+        connect_review_db_readonly(db_path, row_factory=True)
+        if args.dry_run
+        else connect_review_db(db_path)
+    )
+    with connection_context as connection:
         connection.row_factory = sqlite3.Row
+        if not sqlite_table_exists(connection, "github_backfill_queue"):
+            print(
+                "No github_backfill_queue table. Refresh the queue first: "
+                "llreview import-github-history --dry-run --refresh-queue"
+            )
+            return
         if not args.dry_run:
             gate = remote_backfill_rate_gate(
                 connection,
@@ -13361,6 +13483,12 @@ def format_ratio(value: float) -> str:
     return f"{value * 100:.0f}%"
 
 
+def format_backfill_time(value: str) -> str:
+    if not value:
+        return ""
+    return value.replace("T", " ").replace("Z", " UTC")
+
+
 def print_backfill_preview(candidates: list[BackfillCandidate], *, limit: int) -> None:
     print("# GitHub History Backfill Preview")
     print()
@@ -13375,8 +13503,8 @@ def print_backfill_preview(candidates: list[BackfillCandidate], *, limit: int) -
             + ", ".join(f"{key}={count}" for key, count in sorted(counts.items()))
         )
     print()
-    print("| # | Source | State | Repo | PR | Docs | Generated | Files | Lines | Signal | Reason | Note |")
-    print("|---:|---|---|---|---:|---:|---:|---:|---:|---:|---|---|")
+    print("| # | Source | State | Repo | PR | Merged | Updated | Docs | Generated | Files | Lines | External comments | Reason | Note |")
+    print("|---:|---|---|---|---:|---|---|---:|---:|---:|---:|---:|---|---|")
     for candidate in candidates[:limit]:
         pr_value = str(candidate.pr_number) if candidate.pr_number > 0 else ""
         print(
@@ -13388,6 +13516,8 @@ def print_backfill_preview(candidates: list[BackfillCandidate], *, limit: int) -
                     markdown_cell(candidate.state),
                     markdown_cell(candidate.repo),
                     markdown_cell(pr_value),
+                    markdown_cell(format_backfill_time(candidate.merged_at)),
+                    markdown_cell(format_backfill_time(candidate.updated_at_github)),
                     format_ratio(candidate.doc_ratio),
                     format_ratio(candidate.generated_ratio),
                     str(candidate.changed_files),
@@ -13404,21 +13534,36 @@ def print_backfill_preview(candidates: list[BackfillCandidate], *, limit: int) -
 def command_import_github_history(args: argparse.Namespace) -> None:
     if not args.dry_run and not (args.one or args.refresh_queue):
         raise SystemExit("import-github-history writes only with --one or --refresh-queue; use --dry-run to preview")
+    if args.one and args.dry_run and args.refresh_queue:
+        raise SystemExit("--one --dry-run cannot be combined with --refresh-queue because dry-run must not change queue state")
     db_path = sqlite_db_path(args.db)
-    ensure_db_schema(db_path)
     owner = str(args.owner or BACKFILL_DEFAULT_OWNER)
     if owner != BACKFILL_DEFAULT_OWNER:
         raise SystemExit("minimal backfill currently only supports --owner mt4110")
+    should_write_db = bool(args.refresh_queue or (args.one and not args.dry_run))
+    if should_write_db:
+        ensure_db_schema(db_path)
     token = ""
-    if not args.local_only:
+    needs_scan_token = not args.local_only and (args.refresh_queue or not args.one)
+    if needs_scan_token:
         token, token_source = github_token()
         if not token:
             raise SystemExit(f"GitHub auth unavailable: {token_source}")
 
     candidates: list[BackfillCandidate] = []
-    with connect_review_db(db_path) as connection:
+    connection_context = (
+        connect_review_db(db_path)
+        if should_write_db
+        else (
+            connect_review_db_readonly(db_path, row_factory=True)
+            if db_path.is_file()
+            else sqlite3.connect(":memory:")
+        )
+    )
+    with connection_context as connection:
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
+        if should_write_db:
+            connection.execute("PRAGMA foreign_keys = ON")
         saved = 0
         if args.refresh_queue:
             candidates, saved = refresh_backfill_queue_from_args(
@@ -13428,7 +13573,7 @@ def command_import_github_history(args: argparse.Namespace) -> None:
                 token=token,
             )
         elif not args.one:
-            candidates, _ = refresh_backfill_queue_from_args(
+            candidates = build_backfill_candidates_from_args(
                 connection,
                 args,
                 owner=owner,
@@ -15489,7 +15634,8 @@ def command_scoring_pump(args: argparse.Namespace) -> None:
 
 def command_import_github_reviews(args: argparse.Namespace) -> None:
     db_path = sqlite_db_path(args.db)
-    ensure_db_schema(db_path)
+    if not args.dry_run:
+        ensure_db_schema(db_path)
 
     comments: list[Any] = []
     issue_comments: list[Any] = []
@@ -15575,15 +15721,28 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
         item.github_comment_id for item in imported_items if item.github_comment_id
     }
 
-    with connect_review_db(db_path) as connection:
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        stale_external_ids = stale_github_external_item_ids(
-            connection,
-            repo=repo.full_name,
-            pr_number=pr_number,
-            current_github_comment_ids=current_github_comment_ids,
+    connection_context = (
+        connect_review_db(db_path)
+        if not args.dry_run
+        else (
+            connect_review_db_readonly(db_path, row_factory=True)
+            if db_path.is_file()
+            else sqlite3.connect(":memory:")
         )
+    )
+    with connection_context as connection:
+        connection.row_factory = sqlite3.Row
+        if not args.dry_run:
+            connection.execute("PRAGMA foreign_keys = ON")
+        if sqlite_table_exists(connection, "external_items"):
+            stale_external_ids = stale_github_external_item_ids(
+                connection,
+                repo=repo.full_name,
+                pr_number=pr_number,
+                current_github_comment_ids=current_github_comment_ids,
+            )
+        else:
+            stale_external_ids = []
         if explicit_head_sha and head_sha:
             head_shas = {head_sha}
         else:
@@ -15594,24 +15753,32 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
                 # match a local run for the revision being imported.
                 head_shas.add(head_sha)
         allow_pr_fallback = not (args.comments_json and not explicit_head_sha)
-        candidate_run_count = count_link_candidate_runs(
-            connection,
-            repo=repo.full_name,
-            pr_number=pr_number,
-            head_shas=head_shas,
-            head_ref=head_ref,
-            run_id=args.run,
-            allow_pr_fallback=allow_pr_fallback,
+        has_local_review_tables = (
+            sqlite_table_exists(connection, "review_runs")
+            and sqlite_table_exists(connection, "review_items")
         )
-        candidates = load_link_candidates(
-            connection,
-            repo=repo.full_name,
-            pr_number=pr_number,
-            head_shas=head_shas,
-            head_ref=head_ref,
-            run_id=args.run,
-            allow_pr_fallback=allow_pr_fallback,
-        )
+        if has_local_review_tables:
+            candidate_run_count = count_link_candidate_runs(
+                connection,
+                repo=repo.full_name,
+                pr_number=pr_number,
+                head_shas=head_shas,
+                head_ref=head_ref,
+                run_id=args.run,
+                allow_pr_fallback=allow_pr_fallback,
+            )
+            candidates = load_link_candidates(
+                connection,
+                repo=repo.full_name,
+                pr_number=pr_number,
+                head_shas=head_shas,
+                head_ref=head_ref,
+                run_id=args.run,
+                allow_pr_fallback=allow_pr_fallback,
+            )
+        else:
+            candidate_run_count = 0
+            candidates = []
         dry_matches = build_link_matches(
             [(index + 1, item) for index, item in enumerate(imported_items)],
             candidates,
