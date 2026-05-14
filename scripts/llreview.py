@@ -12675,6 +12675,31 @@ def backfill_candidate_from_queue_row(
     )
 
 
+def backfill_queue_has_identity_conflict(
+    connection: sqlite3.Connection,
+    *,
+    row_id: int,
+    repo: str,
+    pr_number: int,
+    source_kind: str,
+    head_sha: str,
+) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM github_backfill_queue
+        WHERE repo = ?
+          AND pr_number = ?
+          AND source_kind = ?
+          AND head_sha = ?
+          AND id != ?
+        LIMIT 1
+        """,
+        (repo, pr_number, source_kind, head_sha, row_id),
+    ).fetchone()
+    return row is not None
+
+
 def remote_backfill_preflight_candidate(
     connection: sqlite3.Connection,
     row: sqlite3.Row,
@@ -12743,6 +12768,36 @@ def remote_backfill_preflight_candidate(
     updated_at = str(pr_payload.get("updated_at") or row["updated_at_github"] or "")
     merged_at = str(pr_payload.get("merged_at") or "")
     title = truncate_text(str(pr_payload.get("title") or row["note"] or ""), 90)
+    row_id = int(row["id"] or 0)
+    row_head_sha = str(row["head_sha"] or "")
+    source_kind = str(row["source_kind"] or "remote_github")
+    if head_sha and backfill_queue_has_identity_conflict(
+        connection,
+        row_id=row_id,
+        repo=repo,
+        pr_number=pr_number,
+        source_kind=source_kind,
+        head_sha=head_sha,
+    ):
+        return BackfillCandidate(
+            repo=repo,
+            pr_number=pr_number,
+            source_kind=source_kind,
+            remote_state="available",
+            state="skipped",
+            priority=int(row["priority"] or 0),
+            updated_at_github=updated_at,
+            merged_at=merged_at,
+            head_sha=row_head_sha,
+            doc_ratio=float(row["doc_ratio"] or 0.0),
+            generated_ratio=float(row["generated_ratio"] or 0.0),
+            actionable_external_comments=int(row["actionable_external_comments"] or 0),
+            skip_reason="skipped_duplicate_queue_head",
+            note=f"{title}; preflight latest head already queued ({head_sha[:12]})",
+            changed_files=int(row["changed_files"] or 0),
+            changed_lines=int(row["changed_lines"] or 0),
+            diff_fingerprint=str(row["diff_fingerprint"] or ""),
+        )
     if not merged_at:
         return BackfillCandidate(
             repo=repo,

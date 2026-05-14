@@ -542,6 +542,92 @@ class ImportGithubHistoryTests(unittest.TestCase):
                     self.assertEqual(row, ("skipped", expected_reason, 1))
                     self.assertIn("SKIPPED: one-at-a-time import stopped before writes", output.getvalue())
 
+    def test_one_real_skips_stale_head_when_latest_queue_row_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "review.db"
+            self.seed_remote_queue_row(db_path, changed_lines=10, signal=1)
+            with sqlite_connection(db_path) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO github_backfill_queue (
+                        repo,
+                        pr_number,
+                        source_kind,
+                        remote_state,
+                        state,
+                        priority,
+                        updated_at_github,
+                        merged_at,
+                        head_sha,
+                        doc_ratio,
+                        generated_ratio,
+                        changed_files,
+                        changed_lines,
+                        actionable_external_comments,
+                        note
+                    ) VALUES (
+                        'mt4110/example',
+                        42,
+                        'remote_github',
+                        'available',
+                        'pending',
+                        2,
+                        '2026-05-03T00:00:00Z',
+                        '2026-05-03T00:00:00Z',
+                        'def456',
+                        0,
+                        0,
+                        1,
+                        20,
+                        2,
+                        'newer row'
+                    )
+                    """
+                )
+            args = self.import_history_args(db_path, dry_run=False)
+
+            def fake_github_request(path: str, token: str) -> object:
+                if path == "/repos/mt4110/example":
+                    return {
+                        "full_name": "mt4110/example",
+                        "fork": False,
+                        "owner": {"login": "mt4110"},
+                    }
+                if path == "/repos/mt4110/example/pulls/42":
+                    return {
+                        "number": 42,
+                        "merged_at": "2026-05-03T00:00:00Z",
+                        "updated_at": "2026-05-03T00:00:00Z",
+                        "title": "Already refreshed",
+                        "head": {"sha": "def456"},
+                    }
+                raise AssertionError(path)
+
+            output = io.StringIO()
+            with mock.patch("llreview.github_token", return_value=("token", "test token")):
+                with mock.patch("llreview.github_request", side_effect=fake_github_request):
+                    with mock.patch("llreview.github_paginated_request") as paginated:
+                        with mock.patch("llreview.backfill_actionable_external_count") as count_comments:
+                            with mock.patch("llreview.command_import_github_reviews") as importer:
+                                with contextlib.redirect_stdout(output):
+                                    command_import_github_history(args)
+
+            paginated.assert_not_called()
+            count_comments.assert_not_called()
+            importer.assert_not_called()
+            with sqlite_connection(db_path) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT head_sha, state, skip_reason, attempt_count
+                    FROM github_backfill_queue
+                    ORDER BY id
+                    """
+                ).fetchall()
+
+            self.assertEqual(rows[0], ("abc123", "skipped", "skipped_duplicate_queue_head", 1))
+            self.assertEqual(rows[1], ("def456", "pending", "", 0))
+            self.assertIn("SKIPPED: one-at-a-time import stopped before writes", output.getvalue())
+
     def test_one_real_rechecks_docs_heavy_before_import(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "review.db"
