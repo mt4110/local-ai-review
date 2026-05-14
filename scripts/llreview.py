@@ -15,6 +15,7 @@ import argparse
 import contextlib
 import csv
 import difflib
+import fcntl
 import functools
 import hashlib
 import html
@@ -13629,6 +13630,29 @@ def mark_backfill_row_failed(
     )
 
 
+def backfill_import_lock_path(db_path: Path) -> Path:
+    return db_path.with_name(f"{db_path.name}.github-backfill-import.lock")
+
+
+@contextlib.contextmanager
+def acquire_backfill_import_lock(db_path: Path):
+    lock_path = backfill_import_lock_path(db_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False, lock_path
+            return
+        lock_handle.seek(0)
+        lock_handle.truncate()
+        lock_handle.write(
+            f"pid={os.getpid()} started_at={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+        )
+        lock_handle.flush()
+        yield True, lock_path
+
+
 def update_backfill_row_from_candidate(
     connection: sqlite3.Connection,
     row_id: int,
@@ -13690,6 +13714,17 @@ def update_backfill_row_from_candidate(
 
 
 def import_github_history_one(args: argparse.Namespace, *, db_path: Path) -> None:
+    if not args.dry_run:
+        with acquire_backfill_import_lock(db_path) as (lock_acquired, lock_path):
+            if not lock_acquired:
+                print(f"SKIP: another backfill import holds {lock_path}")
+                return
+            import_github_history_one_unlocked(args, db_path=db_path)
+        return
+    import_github_history_one_unlocked(args, db_path=db_path)
+
+
+def import_github_history_one_unlocked(args: argparse.Namespace, *, db_path: Path) -> None:
     if args.local_only:
         raise SystemExit("--one imports remote_github queue rows; local-only rows are preview/queue only")
     if args.dry_run and not db_path.is_file():
@@ -14308,6 +14343,8 @@ def command_backfill_pump(args: argparse.Namespace) -> None:
         raise SystemExit("backfill-pump currently supports --owner mt4110 only")
     if args.import_one and args.local_only:
         raise SystemExit("--import-one imports remote_github queue rows; do not combine it with --local-only")
+    if args.dry_run and args.refresh_queue:
+        raise SystemExit("--dry-run cannot be combined with --refresh-queue because dry-run must not change queue state")
     db_path = sqlite_db_path(args.db)
     ensure_db_schema(db_path)
     refresh_result: dict[str, Any] | None = None

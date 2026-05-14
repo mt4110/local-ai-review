@@ -25,8 +25,11 @@ Japanese version: [README.md](README.md)
 - `.github/workflows/local-llm-review.yml`: MVP GitHub Actions workflow.
 - `scripts/verify-workflow-policy.py`: static safety check for the workflow.
 - `scripts/local-ai-review-watcher.py`: watcher limited to `status` / `wake-if-down`.
+- `scripts/backfill-pump-scheduler.py`: one-shot launchd-safe wrapper for `llreview backfill-pump`.
 - `config/local-ai-review-watcher.env.example`: example local env file for the watcher.
+- `config/local-ai-review-backfill-pump.env.example`: example env file for the backfill pump scheduler.
 - `launchd/dev.local-ai-review.watcher.discord.plist.example`: launchd example for the Discord interactions endpoint.
+- `launchd/dev.local-ai-review.backfill-pump.plist.example`: 20-minute launchd example for the backfill pump.
 - `docs/local-llm-shutdown-runbook-en.md`: detailed runbook for stopping the local LLM.
 - `docs/local-llm-watcher-design-en.md`: watcher, Discord notification, and idle unload design.
 - `docs/local-llm-watcher-runtime-ops-en.md`: env file, Discord App, live status, and launchd operations.

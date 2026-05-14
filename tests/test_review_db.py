@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import io
 import sqlite3
 import sys
@@ -37,6 +38,7 @@ from llreview import (  # noqa: E402
     POSTGRES_COPY_NULL,
     BACKFILL_DEFAULT_MAX_CHANGED_LINES,
     BACKFILL_DEFAULT_MIN_INTERVAL_MINUTES,
+    command_backfill_pump,
     command_import_github_history,
     command_import_github_reviews,
     ensure_db_schema,
@@ -355,6 +357,41 @@ class ImportGithubHistoryTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "dry-run must not change queue state"):
             command_import_github_history(args)
 
+    def test_backfill_pump_dry_run_rejects_refresh_queue(self) -> None:
+        args = argparse.Namespace(
+            project_dir=str(ROOT),
+            repo=None,
+            db=":memory:",
+            output_dir=str(ROOT / "out" / "review-history" / "backfill-pump-test"),
+            owner="mt4110",
+            local_root=[],
+            remote_repo_limit=0,
+            remote_pr_limit=0,
+            remote_per_repo_pr_limit=0,
+            local_repo_limit=0,
+            local_pr_limit=0,
+            local_per_repo_pr_limit=0,
+            queue_limit=5,
+            max_doc_ratio=0.70,
+            max_generated_ratio=0.50,
+            max_changed_lines=BACKFILL_DEFAULT_MAX_CHANGED_LINES,
+            refresh_queue=True,
+            import_one=True,
+            dry_run=True,
+            min_interval_minutes=BACKFILL_DEFAULT_MIN_INTERVAL_MINUTES,
+            retry_delay_minutes=60,
+            min_link_score=0.55,
+            no_verdicts=False,
+            pin_queue_head_sha=False,
+            remote_only=True,
+            local_only=False,
+            no_issue_comments=False,
+            json=False,
+        )
+
+        with self.assertRaisesRegex(SystemExit, "dry-run cannot be combined with --refresh-queue"):
+            command_backfill_pump(args)
+
     def test_import_github_reviews_dry_run_does_not_create_db(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -493,6 +530,35 @@ class ImportGithubHistoryTests(unittest.TestCase):
 
             self.assertEqual(row, ("pending", 1))
             self.assertIn("DEFERRED: remote import rate limit is active", output.getvalue())
+
+    def test_one_real_skips_when_import_lock_is_held(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "review.db"
+            self.seed_remote_queue_row(db_path)
+            args = self.import_history_args(db_path, dry_run=False)
+            lock_path = db_path.with_name(f"{db_path.name}.github-backfill-import.lock")
+            with lock_path.open("a+", encoding="utf-8") as lock_handle:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+                output = io.StringIO()
+                with mock.patch("llreview.github_token") as token:
+                    with mock.patch("llreview.command_import_github_reviews") as importer:
+                        with contextlib.redirect_stdout(output):
+                            command_import_github_history(args)
+
+                token.assert_not_called()
+                importer.assert_not_called()
+
+            with sqlite_connection(db_path) as connection:
+                row = connection.execute(
+                    """
+                    SELECT state, attempt_count, last_attempt_at
+                    FROM github_backfill_queue
+                    """
+                ).fetchone()
+
+            self.assertEqual(row, ("pending", 0, None))
+            self.assertIn("SKIP: another backfill import holds", output.getvalue())
 
     def test_one_real_rechecks_fork_and_merged_gates_before_import(self) -> None:
         cases = [

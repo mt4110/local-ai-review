@@ -512,6 +512,32 @@ to fetch/match without writing external items, links, verdicts, or queue state.
 `llreview report` and `llreview export-jsonl` also include queue state and skip
 reasons so skipped/deferred candidates stay visible to the learning loop.
 
+For 20-minute scheduled operation, use `scripts/backfill-pump-scheduler.py`
+first. It is separate from the Discord watcher: a short one-shot launchd wrapper
+around `llreview backfill-pump`. The default mode is report-only,
+`LLREVIEW_BACKFILL_PUMP_MODE=dry-run` previews one import, and only
+`LLREVIEW_BACKFILL_PUMP_MODE=import-one` performs a real import. The wrapper uses
+a non-blocking lock to avoid duplicate launchd runs, and
+`llreview import-github-history --one` also uses a DB-adjacent import lock to
+avoid parallel imports from manual and scheduled commands. The wrapper passes
+`--min-interval-minutes 20` and `--retry-delay-minutes 60`, and rejects dry-run
+plus queue refresh because that would blur the no-write boundary. When
+notifications are enabled, it sends only failures or meaningful milestones where
+an import/external item count actually advances.
+
+```sh
+mkdir -p ~/.config/local-ai-review-backfill-pump
+cp config/local-ai-review-backfill-pump.env.example ~/.config/local-ai-review-backfill-pump/env
+chmod 600 ~/.config/local-ai-review-backfill-pump/env
+python3 scripts/backfill-pump-scheduler.py --env-file ~/.config/local-ai-review-backfill-pump/env --print-command
+python3 scripts/backfill-pump-scheduler.py --env-file ~/.config/local-ai-review-backfill-pump/env
+```
+
+For launchd, copy `launchd/dev.local-ai-review.backfill-pump.plist.example` into
+`~/Library/LaunchAgents/` and replace the placeholder paths. The plist uses
+`StartInterval=1200` and no `KeepAlive`. To stop it, unload the launch agent; to
+pause imports without unloading, set the env file mode back to `report`.
+
 `llreview learn-preview` shows the aggregate calibration that will be fed into
 the next review. Normal `llreview` runs automatically add that calibration to
 the reviewer prompt, but only as aggregate counts: verdict reasons, external

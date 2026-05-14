@@ -260,6 +260,18 @@ TTY では `llreview` が phase、elapsed、model-reviewed file count、finding/
 
 `llreview import-github-history --dry-run` は、過去の merged PR と local git 履歴を教材候補として preview します。remote GitHub PR は `--remote-*` limit で API 量を制限し、local git は `--local-*` limit で CPU/output 量だけを制限します。local scan は token 不要で、preferred GitHub remote の owner が `mt4110` ではない repository は `skipped_owner_not_mt4110` で block します。skip reason を DB の `github_backfill_queue` に残したい場合だけ `--refresh-queue` を付けます。queue から remote candidate を1件だけ進める場合は `--one` を付けます。`--one --dry-run` は選択PRと import/link 件数だけを確認し、実 import は既定で20分に1件までに制限します。`llreview backfill-pump` はこの queue を日常運用向けにまとめ、before/after、rate gate、次候補、external item delta を `out/review-history/backfill-pump/` に保存します。既定は report-only、`--import-one` で一件だけ進め、`--import-one --dry-run` は external item / link / verdict / queue state を書きません。`llreview report` / `llreview export-jsonl` は queue state と skip reason も出します。
 
+20分ごとの自動運用に載せる場合は、まず `scripts/backfill-pump-scheduler.py` を使います。これは Discord watcher とは別物で、短く起動して終了する launchd 用 one-shot wrapper です。既定は report-only、`LLREVIEW_BACKFILL_PUMP_MODE=dry-run` は一件 import の preview だけ、`LLREVIEW_BACKFILL_PUMP_MODE=import-one` だけが実 import です。wrapper は非 blocking lock で重複起動を避け、`llreview import-github-history --one` 本体も DB 横の import lock で並列 import を避けます。wrapper は `--min-interval-minutes 20` と `--retry-delay-minutes 60` を `llreview backfill-pump` に渡し、dry-run と queue refresh の同時指定を拒否します。通知を有効にしても、failure または imported/external item が増えた meaningful milestone だけを通知します。
+
+```sh
+mkdir -p ~/.config/local-ai-review-backfill-pump
+cp config/local-ai-review-backfill-pump.env.example ~/.config/local-ai-review-backfill-pump/env
+chmod 600 ~/.config/local-ai-review-backfill-pump/env
+python3 scripts/backfill-pump-scheduler.py --env-file ~/.config/local-ai-review-backfill-pump/env --print-command
+python3 scripts/backfill-pump-scheduler.py --env-file ~/.config/local-ai-review-backfill-pump/env
+```
+
+launchd 化する場合は `launchd/dev.local-ai-review.backfill-pump.plist.example` を `~/Library/LaunchAgents/` にコピーして path を自分の環境へ置き換えます。plist は `StartInterval=1200` で、`KeepAlive` は使いません。止める時は launch agent を unload すればよく、env file の mode を `report` に戻すだけでも import は止まります。
+
 `llreview learn-preview` は、DB に蓄積された local verdict、external verdict、backfill queue を集計し、次回 review に入る aggregate calibration を表示します。通常の `llreview` はこの集計を reviewer prompt に自動で追加しますが、raw comment や raw diff は入れません。対象は verdict reason、external verdict count、path class、queue state などの集計だけです。止めたい場合は `llreview --no-history-calibration` を使います。この feedback は review の疑い方と優先度を調整するためのもので、prompt/rule の自動書き換えは繰り返し evidence が揃った後に別途行います。
 
 `llreview learn-candidates` は、aggregate evidence から `prompt_candidate` / `rule_candidate` / `needs_data` を導出します。candidate は evidence count、path class、reason/source、confidence、status、recommended action を持ちます。`proposed` は提案だけで、`active` は既に operator-approved DB calibration として次回 prompt に入る状態です。prompt や rule の source file は変更しません。一覧には短い ID と行番号が出ます。`llreview learn-candidates --inspect` は先頭候補、`--inspect 2` は2行目、`--inspect <candidate-id>` は candidate を支える sample を表示します。既定では本文全文を出さず body digest だけを表示し、短いローカル確認用 excerpt が必要な場合だけ `--show-text` を付けます。外部 item の sample は inspection 出力内の shortcut から `external-verdict --candidate <candidate-id> --sample <n>` で採点できます。削除済み repository や他 repository の queue も含めて見る場合は `--all-repos` を付けます。`llreview report` と `llreview export-jsonl` にも同じ candidate preview を含めます。
