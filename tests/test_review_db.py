@@ -485,6 +485,82 @@ class SpecbackfillOverlapTests(unittest.TestCase):
             self.assertIn("Match samples were omitted by the current `--match-limit`.", rendered)
             self.assertNotIn("No deterministic overlaps reached the current threshold.", rendered)
 
+    def test_specbackfill_overlap_rejects_repo_conflict_when_run_is_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db_path = root / "review.db"
+            spec_path = root / "specbackfill.json"
+            ensure_db_schema(db_path)
+            spec_path.write_text('{"findings": []}', encoding="utf-8")
+            with sqlite_connection(db_path) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO review_runs (
+                        id,
+                        repo,
+                        pr_number,
+                        diff_source,
+                        head_sha,
+                        model,
+                        ollama_base_url,
+                        diff_bytes,
+                        changed_files,
+                        reviewed_files_count,
+                        findings_count,
+                        watch_items_count,
+                        static_findings_count,
+                        model_findings_count,
+                        static_watch_items_count,
+                        model_watch_items_count,
+                        existing_review_comments_count,
+                        elapsed_seconds,
+                        report_markdown
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        1,
+                        "owner/repo",
+                        42,
+                        "diff",
+                        "abc123",
+                        "local-model",
+                        "http://127.0.0.1:11434",
+                        100,
+                        1,
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        1.0,
+                        "report",
+                    ),
+                )
+
+            args = argparse.Namespace(
+                db=str(db_path),
+                project_dir=None,
+                repo="other/repo",
+                specbackfill_json=str(spec_path),
+                all_repos=False,
+                pr=42,
+                head_sha="abc123",
+                run=1,
+                output_dir=str(root / "overlap"),
+                local_source="model",
+                include_watch=False,
+                limit=50,
+                match_limit=20,
+                min_link_score=0.55,
+                dry_run=True,
+                json=False,
+            )
+            with self.assertRaisesRegex(SystemExit, "Conflicting --run scope"):
+                command_specbackfill_overlap(args)
+
 
 class ImportGithubHistoryTests(unittest.TestCase):
     def import_history_args(self, db_path: Path, *, dry_run: bool, one: bool = True) -> argparse.Namespace:

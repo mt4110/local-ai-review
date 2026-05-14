@@ -14782,19 +14782,38 @@ def specbackfill_overlap_scope(
     args: argparse.Namespace,
     run_row: sqlite3.Row | None,
 ) -> dict[str, Any]:
+    if run_row is not None:
+        run_repo = str(run_row["repo"] or "")
+        run_pr_number = as_optional_int(run_row["pr_number"])
+        run_head_sha = str(run_row["head_sha"] or "")
+        conflicts: list[str] = []
+        if getattr(args, "all_repos", False):
+            conflicts.append("--all-repos cannot be combined with --run")
+        arg_repo = str(getattr(args, "repo", "") or "")
+        if arg_repo and arg_repo != run_repo:
+            conflicts.append(f"--repo {arg_repo} does not match run repo {run_repo}")
+        arg_pr_number = as_optional_int(getattr(args, "pr", None))
+        if arg_pr_number is not None and arg_pr_number != run_pr_number:
+            conflicts.append(f"--pr {arg_pr_number} does not match run PR {run_pr_number or 0}")
+        arg_head_sha = str(getattr(args, "head_sha", "") or "")
+        if arg_head_sha and arg_head_sha != run_head_sha:
+            conflicts.append("--head-sha does not match run head SHA")
+        if conflicts:
+            raise SystemExit("Conflicting --run scope: " + "; ".join(conflicts))
+        return {
+            "repo": run_repo,
+            "pr_number": run_pr_number,
+            "head_sha": run_head_sha,
+            "run_id": as_optional_int(getattr(args, "run", None)),
+        }
+
     repo = ""
     if not getattr(args, "all_repos", False) and getattr(args, "repo", ""):
         repo = str(args.repo)
-    elif run_row is not None:
-        repo = str(run_row["repo"] or "")
     else:
         repo = specbackfill_overlap_repo_scope(args)
     pr_number = as_optional_int(getattr(args, "pr", None))
-    if pr_number is None and run_row is not None:
-        pr_number = as_optional_int(run_row["pr_number"])
     head_sha = str(getattr(args, "head_sha", "") or "")
-    if not head_sha and run_row is not None:
-        head_sha = str(run_row["head_sha"] or "")
     return {
         "repo": repo,
         "pr_number": pr_number,
