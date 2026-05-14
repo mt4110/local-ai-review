@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -38,11 +39,26 @@ from llreview import (  # noqa: E402
     BACKFILL_DEFAULT_MIN_INTERVAL_MINUTES,
     command_import_github_history,
     command_import_github_reviews,
+    ensure_db_schema,
     external_items_from_comments,
     learning_calibration_statuses_by_candidate,
     postgres_copy_value,
     review_path_class,
 )
+
+
+@contextlib.contextmanager
+def sqlite_connection(db_path: Path):
+    with contextlib.closing(sqlite3.connect(db_path)) as connection:
+        with connection:
+            yield connection
+
+
+@contextlib.contextmanager
+def sqlite_memory_connection():
+    with contextlib.closing(sqlite3.connect(":memory:")) as connection:
+        with connection:
+            yield connection
 
 
 class ReviewDbDialectTests(unittest.TestCase):
@@ -72,7 +88,7 @@ class ReviewDbDialectTests(unittest.TestCase):
     def test_learning_calibration_statuses_use_newest_row_per_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "review.db"
-            with sqlite3.connect(db_path) as connection:
+            with sqlite_connection(db_path) as connection:
                 connection.row_factory = sqlite3.Row
                 connection.executescript(
                     """
@@ -123,6 +139,83 @@ class ReviewDbConfigTests(unittest.TestCase):
 
 
 class ImportGithubHistoryTests(unittest.TestCase):
+    def import_history_args(self, db_path: Path, *, dry_run: bool, one: bool = True) -> argparse.Namespace:
+        return argparse.Namespace(
+            project_dir=str(ROOT),
+            repo=None,
+            db=str(db_path),
+            owner="mt4110",
+            local_root=[],
+            remote_repo_limit=0,
+            remote_pr_limit=0,
+            remote_per_repo_pr_limit=0,
+            local_repo_limit=0,
+            local_pr_limit=0,
+            local_per_repo_pr_limit=0,
+            limit=5,
+            max_doc_ratio=0.70,
+            max_generated_ratio=0.50,
+            max_changed_lines=BACKFILL_DEFAULT_MAX_CHANGED_LINES,
+            dry_run=dry_run,
+            one=one,
+            min_interval_minutes=BACKFILL_DEFAULT_MIN_INTERVAL_MINUTES,
+            retry_delay_minutes=60,
+            min_link_score=0.55,
+            no_verdicts=False,
+            pin_queue_head_sha=False,
+            refresh_queue=False,
+            remote_only=True,
+            local_only=False,
+            no_issue_comments=False,
+        )
+
+    def seed_remote_queue_row(
+        self,
+        db_path: Path,
+        *,
+        repo: str = "mt4110/example",
+        state: str = "pending",
+        doc_ratio: float = 0.0,
+        generated_ratio: float = 0.0,
+        changed_files: int = 1,
+        changed_lines: int = 12,
+        signal: int = 1,
+    ) -> None:
+        ensure_db_schema(db_path)
+        with sqlite_connection(db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO github_backfill_queue (
+                    repo,
+                    pr_number,
+                    source_kind,
+                    remote_state,
+                    state,
+                    priority,
+                    updated_at_github,
+                    merged_at,
+                    head_sha,
+                    doc_ratio,
+                    generated_ratio,
+                    changed_files,
+                    changed_lines,
+                    actionable_external_comments,
+                    note
+                ) VALUES (?, 42, 'remote_github', 'available', ?, 1,
+                    '2026-05-01T00:00:00Z',
+                    '2026-05-01T00:00:00Z',
+                    'abc123',
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    'seed row'
+                )
+                """,
+                (repo, state, doc_ratio, generated_ratio, changed_files, changed_lines, signal),
+            )
+
     def test_issue_comment_signal_filter_requires_actionable_anchor(self) -> None:
         items = external_items_from_comments(
             repo="mt4110/example",
@@ -303,12 +396,439 @@ class ImportGithubHistoryTests(unittest.TestCase):
             self.assertFalse(db_path.exists())
             self.assertIn("DRY RUN: would import 1 external review items", output.getvalue())
 
+    def test_one_dry_run_reads_queue_without_mutating_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "review.db"
+            self.seed_remote_queue_row(db_path)
+            args = self.import_history_args(db_path, dry_run=True)
+
+            def fake_import(import_args: argparse.Namespace) -> None:
+                self.assertTrue(import_args.dry_run)
+                print("DRY RUN: would import 2 external review items from mt4110/example#42")
+                print("Link candidate runs: 1")
+                print("Link candidates: 3")
+                print("Would create/update links: 1")
+                print("Would remove stale external items: 0")
+                print("Sources: human=2")
+
+            output = io.StringIO()
+            with mock.patch("llreview.command_import_github_reviews", side_effect=fake_import):
+                with contextlib.redirect_stdout(output):
+                    command_import_github_history(args)
+
+            with sqlite_connection(db_path) as connection:
+                row = connection.execute(
+                    """
+                    SELECT state, skip_reason, attempt_count, last_attempt_at, next_attempt_at
+                    FROM github_backfill_queue
+                    """
+                ).fetchone()
+                external_count = connection.execute("SELECT COUNT(*) FROM external_items").fetchone()[0]
+                link_count = connection.execute("SELECT COUNT(*) FROM item_links").fetchone()[0]
+                verdict_count = connection.execute("SELECT COUNT(*) FROM item_verdicts").fetchone()[0]
+
+            self.assertEqual(row, ("pending", "", 0, None, None))
+            self.assertEqual(external_count, 0)
+            self.assertEqual(link_count, 0)
+            self.assertEqual(verdict_count, 0)
+            self.assertIn("Selected remote queue row", output.getvalue())
+            self.assertIn("DRY RUN: external items will not be written", output.getvalue())
+            self.assertIn("Would create/update links: 1", output.getvalue())
+
+    def test_one_real_marks_owner_mismatch_skipped_without_import(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "review.db"
+            self.seed_remote_queue_row(db_path, repo="other/example")
+            args = self.import_history_args(db_path, dry_run=False)
+
+            output = io.StringIO()
+            with mock.patch("llreview.command_import_github_reviews") as importer:
+                with contextlib.redirect_stdout(output):
+                    command_import_github_history(args)
+
+            importer.assert_not_called()
+            with sqlite_connection(db_path) as connection:
+                row = connection.execute(
+                    """
+                    SELECT state, skip_reason, attempt_count, last_attempt_at
+                    FROM github_backfill_queue
+                    """
+                ).fetchone()
+
+            self.assertEqual(row[0], "skipped")
+            self.assertEqual(row[1], "skipped_owner_not_mt4110")
+            self.assertEqual(row[2], 1)
+            self.assertIsNotNone(row[3])
+            self.assertIn("SKIPPED: one-at-a-time import stopped before writes", output.getvalue())
+
+    def test_one_real_respects_twenty_minute_rate_gate_before_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "review.db"
+            self.seed_remote_queue_row(db_path)
+            with sqlite_connection(db_path) as connection:
+                connection.execute(
+                    """
+                    UPDATE github_backfill_queue
+                    SET last_attempt_at = CURRENT_TIMESTAMP,
+                        attempt_count = 1
+                    """
+                )
+            args = self.import_history_args(db_path, dry_run=False)
+
+            output = io.StringIO()
+            with mock.patch("llreview.github_token") as token:
+                with mock.patch("llreview.command_import_github_reviews") as importer:
+                    with contextlib.redirect_stdout(output):
+                        command_import_github_history(args)
+
+            token.assert_not_called()
+            importer.assert_not_called()
+            with sqlite_connection(db_path) as connection:
+                row = connection.execute(
+                    """
+                    SELECT state, attempt_count
+                    FROM github_backfill_queue
+                    """
+                ).fetchone()
+
+            self.assertEqual(row, ("pending", 1))
+            self.assertIn("DEFERRED: remote import rate limit is active", output.getvalue())
+
+    def test_one_real_rechecks_fork_and_merged_gates_before_import(self) -> None:
+        cases = [
+            ("fork", {"fork": True}, {"merged_at": "2026-05-02T00:00:00Z"}, "skipped_fork"),
+            ("not_merged", {"fork": False}, {"merged_at": ""}, "skipped_not_merged"),
+        ]
+        for name, repo_overrides, pr_overrides, expected_reason in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    db_path = Path(tmpdir) / "review.db"
+                    self.seed_remote_queue_row(db_path)
+                    args = self.import_history_args(db_path, dry_run=False)
+
+                    def fake_github_request(path: str, token: str) -> object:
+                        if path == "/repos/mt4110/example":
+                            return {
+                                "full_name": "mt4110/example",
+                                "owner": {"login": "mt4110"},
+                                **repo_overrides,
+                            }
+                        if path == "/repos/mt4110/example/pulls/42":
+                            return {
+                                "number": 42,
+                                "updated_at": "2026-05-03T00:00:00Z",
+                                "title": f"Preflight {name}",
+                                "head": {"sha": "def456"},
+                                **pr_overrides,
+                            }
+                        raise AssertionError(path)
+
+                    output = io.StringIO()
+                    with mock.patch("llreview.github_token", return_value=("token", "test token")):
+                        with mock.patch("llreview.github_request", side_effect=fake_github_request):
+                            with mock.patch("llreview.command_import_github_reviews") as importer:
+                                with contextlib.redirect_stdout(output):
+                                    command_import_github_history(args)
+
+                    importer.assert_not_called()
+                    with sqlite_connection(db_path) as connection:
+                        row = connection.execute(
+                            """
+                            SELECT state, skip_reason, attempt_count
+                            FROM github_backfill_queue
+                            """
+                        ).fetchone()
+
+                    self.assertEqual(row, ("skipped", expected_reason, 1))
+                    self.assertIn("SKIPPED: one-at-a-time import stopped before writes", output.getvalue())
+
+    def test_one_real_rechecks_docs_heavy_before_import(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "review.db"
+            self.seed_remote_queue_row(db_path, doc_ratio=0.0, changed_lines=10, signal=1)
+            args = self.import_history_args(db_path, dry_run=False)
+
+            def fake_github_request(path: str, token: str) -> object:
+                if path == "/repos/mt4110/example":
+                    return {
+                        "full_name": "mt4110/example",
+                        "fork": False,
+                        "owner": {"login": "mt4110"},
+                    }
+                if path == "/repos/mt4110/example/pulls/42":
+                    return {
+                        "number": 42,
+                        "merged_at": "2026-05-02T00:00:00Z",
+                        "updated_at": "2026-05-03T00:00:00Z",
+                        "title": "Docs mostly changed",
+                        "head": {"sha": "def456"},
+                    }
+                raise AssertionError(path)
+
+            def fake_paginated_request(path: str, token: str) -> list[object]:
+                self.assertEqual(path, "/repos/mt4110/example/pulls/42/files")
+                return [
+                    {
+                        "filename": "README.md",
+                        "changes": 100,
+                        "additions": 80,
+                        "deletions": 20,
+                        "status": "modified",
+                    }
+                ]
+
+            output = io.StringIO()
+            with mock.patch("llreview.github_token", return_value=("token", "test token")):
+                with mock.patch("llreview.github_request", side_effect=fake_github_request):
+                    with mock.patch("llreview.github_paginated_request", side_effect=fake_paginated_request):
+                        with mock.patch("llreview.command_import_github_reviews") as importer:
+                            with contextlib.redirect_stdout(output):
+                                command_import_github_history(args)
+
+            importer.assert_not_called()
+            with sqlite_connection(db_path) as connection:
+                row = connection.execute(
+                    """
+                    SELECT state, skip_reason, attempt_count, head_sha, doc_ratio, changed_lines
+                    FROM github_backfill_queue
+                    """
+                ).fetchone()
+
+            self.assertEqual(row[0], "skipped")
+            self.assertEqual(row[1], "skipped_docs_heavy")
+            self.assertEqual(row[2], 1)
+            self.assertEqual(row[3], "def456")
+            self.assertEqual(row[4], 1.0)
+            self.assertEqual(row[5], 100)
+            self.assertIn("Preflight remote row: state=skipped", output.getvalue())
+
+    def test_one_real_rechecks_generated_and_actionable_gates_before_import(self) -> None:
+        cases = [
+            (
+                "generated",
+                [
+                    {
+                        "filename": "package-lock.json",
+                        "changes": 100,
+                        "additions": 90,
+                        "deletions": 10,
+                        "status": "modified",
+                    }
+                ],
+                2,
+                "skipped_generated_heavy",
+                0.0,
+                1.0,
+            ),
+            (
+                "no_actionable",
+                [
+                    {
+                        "filename": "scripts/app.py",
+                        "changes": 20,
+                        "additions": 18,
+                        "deletions": 2,
+                        "status": "modified",
+                    }
+                ],
+                0,
+                "skipped_no_actionable_external_comments",
+                0.0,
+                0.0,
+            ),
+        ]
+        for name, files, actionable_count, expected_reason, expected_doc, expected_generated in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    db_path = Path(tmpdir) / "review.db"
+                    self.seed_remote_queue_row(db_path, changed_lines=10, signal=1)
+                    args = self.import_history_args(db_path, dry_run=False)
+
+                    def fake_github_request(path: str, token: str) -> object:
+                        if path == "/repos/mt4110/example":
+                            return {
+                                "full_name": "mt4110/example",
+                                "fork": False,
+                                "owner": {"login": "mt4110"},
+                            }
+                        if path == "/repos/mt4110/example/pulls/42":
+                            return {
+                                "number": 42,
+                                "merged_at": "2026-05-02T00:00:00Z",
+                                "updated_at": "2026-05-03T00:00:00Z",
+                                "title": f"Preflight {name}",
+                                "head": {"sha": "def456"},
+                            }
+                        raise AssertionError(path)
+
+                    output = io.StringIO()
+                    with mock.patch("llreview.github_token", return_value=("token", "test token")):
+                        with mock.patch("llreview.github_request", side_effect=fake_github_request):
+                            with mock.patch("llreview.github_paginated_request", return_value=files):
+                                with mock.patch(
+                                    "llreview.backfill_actionable_external_count",
+                                    return_value=actionable_count,
+                                ):
+                                    with mock.patch("llreview.command_import_github_reviews") as importer:
+                                        with contextlib.redirect_stdout(output):
+                                            command_import_github_history(args)
+
+                    importer.assert_not_called()
+                    with sqlite_connection(db_path) as connection:
+                        row = connection.execute(
+                            """
+                            SELECT state, skip_reason, attempt_count, doc_ratio, generated_ratio
+                            FROM github_backfill_queue
+                            """
+                        ).fetchone()
+
+                    self.assertEqual(row[0], "skipped")
+                    self.assertEqual(row[1], expected_reason)
+                    self.assertEqual(row[2], 1)
+                    self.assertEqual(row[3], expected_doc)
+                    self.assertEqual(row[4], expected_generated)
+                    self.assertIn("SKIPPED: one-at-a-time import stopped before writes", output.getvalue())
+
+    def test_one_real_marks_duplicate_without_dropping_existing_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "review.db"
+            self.seed_remote_queue_row(db_path, changed_lines=10, signal=3)
+            with sqlite_connection(db_path) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO external_items (
+                        repo,
+                        pr_number,
+                        source,
+                        body,
+                        fingerprint
+                    ) VALUES (
+                        'mt4110/example',
+                        42,
+                        'copilot',
+                        'Imported already',
+                        'fingerprint'
+                    )
+                    """
+                )
+            args = self.import_history_args(db_path, dry_run=False)
+
+            def fake_github_request(path: str, token: str) -> object:
+                if path == "/repos/mt4110/example":
+                    return {
+                        "full_name": "mt4110/example",
+                        "fork": False,
+                        "owner": {"login": "mt4110"},
+                    }
+                if path == "/repos/mt4110/example/pulls/42":
+                    return {
+                        "number": 42,
+                        "merged_at": "2026-05-02T00:00:00Z",
+                        "updated_at": "2026-05-03T00:00:00Z",
+                        "title": "Already imported",
+                        "head": {"sha": "def456"},
+                    }
+                raise AssertionError(path)
+
+            output = io.StringIO()
+            with mock.patch("llreview.github_token", return_value=("token", "test token")):
+                with mock.patch("llreview.github_request", side_effect=fake_github_request):
+                    with mock.patch(
+                        "llreview.github_paginated_request",
+                        return_value=[
+                            {
+                                "filename": "scripts/app.py",
+                                "changes": 20,
+                                "additions": 18,
+                                "deletions": 2,
+                                "status": "modified",
+                            }
+                        ],
+                    ):
+                        with mock.patch("llreview.backfill_actionable_external_count") as count_comments:
+                            with mock.patch("llreview.command_import_github_reviews") as importer:
+                                with contextlib.redirect_stdout(output):
+                                    command_import_github_history(args)
+
+            count_comments.assert_not_called()
+            importer.assert_not_called()
+            with sqlite_connection(db_path) as connection:
+                row = connection.execute(
+                    """
+                    SELECT state, skip_reason, actionable_external_comments
+                    FROM github_backfill_queue
+                    """
+                ).fetchone()
+
+            self.assertEqual(row, ("skipped", "skipped_duplicate_import", 3))
+            self.assertIn("SKIPPED: one-at-a-time import stopped before writes", output.getvalue())
+
+    def test_one_real_imports_one_pending_row_after_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "review.db"
+            self.seed_remote_queue_row(db_path, changed_lines=10, signal=1)
+            args = self.import_history_args(db_path, dry_run=False)
+
+            def fake_github_request(path: str, token: str) -> object:
+                if path == "/repos/mt4110/example":
+                    return {
+                        "full_name": "mt4110/example",
+                        "fork": False,
+                        "owner": {"login": "mt4110"},
+                    }
+                if path == "/repos/mt4110/example/pulls/42":
+                    return {
+                        "number": 42,
+                        "merged_at": "2026-05-02T00:00:00Z",
+                        "updated_at": "2026-05-03T00:00:00Z",
+                        "title": "Importable",
+                        "head": {"sha": "def456"},
+                    }
+                raise AssertionError(path)
+
+            def fake_import(import_args: argparse.Namespace) -> None:
+                self.assertFalse(import_args.dry_run)
+                self.assertEqual(import_args.repo, "mt4110/example")
+                self.assertEqual(import_args.pr, 42)
+
+            output = io.StringIO()
+            with mock.patch("llreview.github_token", return_value=("token", "test token")):
+                with mock.patch("llreview.github_request", side_effect=fake_github_request):
+                    with mock.patch(
+                        "llreview.github_paginated_request",
+                        return_value=[
+                            {
+                                "filename": "scripts/app.py",
+                                "changes": 20,
+                                "additions": 18,
+                                "deletions": 2,
+                                "status": "modified",
+                            }
+                        ],
+                    ):
+                        with mock.patch("llreview.backfill_actionable_external_count", return_value=1):
+                            with mock.patch("llreview.command_import_github_reviews", side_effect=fake_import) as importer:
+                                with contextlib.redirect_stdout(output):
+                                    command_import_github_history(args)
+
+            importer.assert_called_once()
+            with sqlite_connection(db_path) as connection:
+                row = connection.execute(
+                    """
+                    SELECT state, skip_reason, attempt_count, head_sha, changed_lines
+                    FROM github_backfill_queue
+                    """
+                ).fetchone()
+
+            self.assertEqual(row, ("imported", "", 1, "def456", 20))
+            self.assertIn("OK: marked github_backfill_queue", output.getvalue())
+
 
 class ReviewDbAggregateTests(unittest.TestCase):
     def test_count_helpers_use_quoted_identifiers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "review.db"
-            with sqlite3.connect(db_path) as connection:
+            with sqlite_connection(db_path) as connection:
                 connection.execute('CREATE TABLE "odd table" (id INTEGER PRIMARY KEY)')
                 connection.executemany('INSERT INTO "odd table" (id) VALUES (?)', [(1,), (2,)])
                 connection.execute("CREATE TABLE empty_table (id INTEGER PRIMARY KEY)")
@@ -320,7 +840,7 @@ class ReviewDbAggregateTests(unittest.TestCase):
                 )
 
     def test_review_run_counts_support_repo_filter(self) -> None:
-        with sqlite3.connect(":memory:") as connection:
+        with sqlite_memory_connection() as connection:
             connection.execute(
                 """
                 CREATE TABLE review_run_summary (
@@ -366,7 +886,7 @@ class ReviewDbAggregateTests(unittest.TestCase):
             )
 
     def test_external_item_counts_return_link_and_latest_verdict_mix(self) -> None:
-        with sqlite3.connect(":memory:") as connection:
+        with sqlite_memory_connection() as connection:
             connection.executescript(
                 """
                 CREATE TABLE external_items (
@@ -439,7 +959,7 @@ class ReviewDbAggregateTests(unittest.TestCase):
             self.assertEqual(external_link_health_counts(connection, repo="missing"), [])
 
     def test_backfill_queue_counts_group_records_and_totals(self) -> None:
-        with sqlite3.connect(":memory:") as connection:
+        with sqlite_memory_connection() as connection:
             connection.execute(
                 """
                 CREATE TABLE github_backfill_queue (
@@ -497,7 +1017,7 @@ class ReviewDbAggregateTests(unittest.TestCase):
             )
 
     def test_active_calibration_counts_include_global_and_repo_scope(self) -> None:
-        with sqlite3.connect(":memory:") as connection:
+        with sqlite_memory_connection() as connection:
             connection.execute(
                 """
                 CREATE TABLE learning_calibrations (
@@ -554,7 +1074,7 @@ class ReviewDbAggregateTests(unittest.TestCase):
             self.assertEqual(counts["recent"][0]["instruction"], "repo inst...")
 
     def test_recent_review_runs_return_dashboard_rows(self) -> None:
-        with sqlite3.connect(":memory:") as connection:
+        with sqlite_memory_connection() as connection:
             connection.execute(
                 """
                 CREATE TABLE review_run_summary (
@@ -622,7 +1142,7 @@ class ReviewDbAggregateTests(unittest.TestCase):
             )
 
     def test_recent_item_verdicts_join_local_and_external_targets(self) -> None:
-        with sqlite3.connect(":memory:") as connection:
+        with sqlite_memory_connection() as connection:
             connection.executescript(
                 """
                 CREATE TABLE review_runs (
