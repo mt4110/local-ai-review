@@ -521,6 +521,20 @@ to fetch/match without writing external items, links, verdicts, or queue state.
 `llreview report` and `llreview export-jsonl` also include queue state and skip
 reasons, so skipped/deferred candidates remain part of the learning ledger.
 
+Use `llreview specbackfill-import-preview --specbackfill-json specbackfill.json
+--run <run-id>` to normalize `specbackfill check --format json --fail-on off`
+findings into would-be `review_items(source='specbackfill')` rows without DB
+writes. It reports the required run anchor, append ordinals, rule ids,
+fingerprints, and evidence digests while hiding raw body text, raw evidence, and
+raw diff text.
+
+Use `llreview specbackfill-import-apply --specbackfill-json specbackfill.json
+--run <run-id>` only when you intentionally want to store those deterministic
+findings. The apply path reuses the preview candidates, inserts only
+`would_insert` rows, skips existing fingerprints and duplicate input
+fingerprints, and writes Markdown/JSON artifacts after the import. `--dry-run`
+checks the apply plan without writing rows or artifacts.
+
 Use `llreview learn-preview` to inspect the aggregate calibration that will feed
 the next review. Normal `llreview` runs now add only aggregate review-history
 signals to the reviewer prompt: verdict reasons, external verdict counts, path

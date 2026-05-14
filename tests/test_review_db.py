@@ -42,6 +42,7 @@ from llreview import (  # noqa: E402
     command_backfill_pump,
     command_import_github_history,
     command_import_github_reviews,
+    command_specbackfill_import_apply,
     command_specbackfill_import_preview,
     command_specbackfill_overlap,
     ensure_db_schema,
@@ -540,6 +541,452 @@ class SpecbackfillOverlapTests(unittest.TestCase):
             self.assertEqual(duplicate["preview_action"], "duplicate_input")
             self.assertEqual(duplicate["ordinal"], 4)
             self.assertEqual(duplicate["existing_review_item_id"], 11)
+
+    def test_command_specbackfill_import_apply_inserts_idempotently_and_writes_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db_path = root / "review.db"
+            output_dir = root / "import-apply"
+            spec_path = root / "specbackfill.json"
+            ensure_db_schema(db_path)
+            spec_path.write_text(
+                json.dumps(
+                    {
+                        "version": "v0",
+                        "findings": [
+                            {
+                                "finding_id": "v0-db001",
+                                "omission_signature": "db001.schema_changed.migration_companion",
+                                "rule_id": "DB001",
+                                "severity": "error",
+                                "confidence": "high",
+                                "title": "Schema changed, but no matching migration companion moved with this diff",
+                                "why": "Schema-affecting lines moved in the diff, but no matching migration companion evidence moved with them.",
+                                "evidence": [{"file": "schema.prisma", "line": 3, "excerpt": "email String @unique"}],
+                                "expected_companions": ["migration file", "migration test"],
+                            },
+                            {
+                                "finding_id": "v0-db001",
+                                "omission_signature": "db001.schema_changed.migration_companion",
+                                "rule_id": "DB001",
+                                "severity": "error",
+                                "confidence": "high",
+                                "title": "Schema changed, but no matching migration companion moved with this diff",
+                                "why": "Schema-affecting lines moved in the diff, but no matching migration companion evidence moved with them.",
+                                "evidence": [{"file": "schema.prisma", "line": 3, "excerpt": "email String @unique"}],
+                                "expected_companions": ["migration file", "migration test"],
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with sqlite_connection(db_path) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO review_runs (
+                        id,
+                        repo,
+                        pr_number,
+                        diff_source,
+                        head_sha,
+                        model,
+                        ollama_base_url,
+                        diff_bytes,
+                        changed_files,
+                        reviewed_files_count,
+                        findings_count,
+                        watch_items_count,
+                        static_findings_count,
+                        model_findings_count,
+                        static_watch_items_count,
+                        model_watch_items_count,
+                        existing_review_comments_count,
+                        elapsed_seconds,
+                        report_markdown
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        1,
+                        "owner/repo",
+                        42,
+                        "diff",
+                        "abc123",
+                        "local-model",
+                        "http://127.0.0.1:11434",
+                        100,
+                        1,
+                        1,
+                        1,
+                        0,
+                        0,
+                        1,
+                        0,
+                        0,
+                        0,
+                        1.0,
+                        "report",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO review_items (
+                        id,
+                        run_id,
+                        item_type,
+                        ordinal,
+                        source,
+                        severity,
+                        confidence,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fix,
+                        verification,
+                        fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        10,
+                        1,
+                        "finding",
+                        1,
+                        "model",
+                        "P2",
+                        "high",
+                        "schema.prisma",
+                        3,
+                        "Missing migration companion",
+                        "Schema changed, but no matching migration companion moved with this diff.",
+                        "",
+                        "",
+                        "local-fp",
+                    ),
+                )
+
+            args = argparse.Namespace(
+                db=str(db_path),
+                project_dir=None,
+                repo="owner/repo",
+                specbackfill_json=str(spec_path),
+                pr=42,
+                head_sha="abc123",
+                run=1,
+                output_dir=str(output_dir),
+                dry_run=False,
+                json=False,
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                command_specbackfill_import_apply(args)
+
+            latest_json = (output_dir / "latest.json").read_text(encoding="utf-8")
+            latest_report = (output_dir / "latest.md").read_text(encoding="utf-8")
+            self.assertNotIn("email String @unique", latest_json)
+            self.assertNotIn("email String @unique", latest_report)
+            payload = json.loads(latest_json)
+            self.assertTrue(payload["policy"]["db_writes"])
+            self.assertFalse(payload["apply"]["dry_run"])
+            self.assertEqual(payload["counts"]["would_insert"], 1)
+            self.assertEqual(payload["counts"]["inserted"], 1)
+            self.assertEqual(payload["counts"]["duplicate_input"], 1)
+            self.assertEqual(len(payload["apply"]["inserted_review_item_ids"]), 1)
+            inserted = payload["apply"]["inserted_review_items"][0]
+            self.assertEqual(inserted["ordinal"], 2)
+            self.assertEqual(inserted["source"], "specbackfill")
+            self.assertIn("OK: specbackfill import apply report=", output.getvalue())
+
+            with sqlite_connection(db_path) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT run_id, item_type, ordinal, source, severity, confidence, path, line, title, body, fingerprint
+                    FROM review_items
+                    WHERE source = 'specbackfill'
+                    ORDER BY id
+                    """
+                ).fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][0], 1)
+            self.assertEqual(rows[0][1], "finding")
+            self.assertEqual(rows[0][2], 2)
+            self.assertEqual(rows[0][4], "error")
+            self.assertEqual(rows[0][5], "high")
+            self.assertEqual(rows[0][6], "schema.prisma")
+            self.assertEqual(rows[0][7], 3)
+            self.assertEqual(rows[0][10], "v0-db001")
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                command_specbackfill_import_apply(args)
+            payload = json.loads((output_dir / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["counts"]["inserted"], 0)
+            self.assertEqual(payload["counts"]["already_present"], 1)
+            self.assertEqual(payload["counts"]["duplicate_input"], 1)
+            with sqlite_connection(db_path) as connection:
+                specbackfill_count = connection.execute(
+                    "SELECT COUNT(*) FROM review_items WHERE source = 'specbackfill'"
+                ).fetchone()[0]
+            self.assertEqual(specbackfill_count, 1)
+
+    def test_command_specbackfill_import_apply_dry_run_does_not_write_rows_or_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db_path = root / "review.db"
+            output_dir = root / "import-apply"
+            spec_path = root / "specbackfill.json"
+            ensure_db_schema(db_path)
+            spec_path.write_text(
+                json.dumps(
+                    {
+                        "findings": [
+                            {
+                                "finding_id": "v0-db001",
+                                "rule_id": "DB001",
+                                "severity": "error",
+                                "confidence": "high",
+                                "title": "Schema changed without migration companion",
+                                "why": "Schema-affecting lines moved.",
+                                "evidence": [{"file": "schema.prisma", "line": 3}],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with sqlite_connection(db_path) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO review_runs (
+                        id,
+                        repo,
+                        pr_number,
+                        diff_source,
+                        head_sha,
+                        model,
+                        ollama_base_url,
+                        diff_bytes,
+                        changed_files,
+                        reviewed_files_count,
+                        findings_count,
+                        watch_items_count,
+                        static_findings_count,
+                        model_findings_count,
+                        static_watch_items_count,
+                        model_watch_items_count,
+                        existing_review_comments_count,
+                        elapsed_seconds,
+                        report_markdown
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        1,
+                        "owner/repo",
+                        42,
+                        "diff",
+                        "abc123",
+                        "local-model",
+                        "http://127.0.0.1:11434",
+                        100,
+                        1,
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        1.0,
+                        "report",
+                    ),
+                )
+
+            args = argparse.Namespace(
+                db=str(db_path),
+                project_dir=None,
+                repo="owner/repo",
+                specbackfill_json=str(spec_path),
+                pr=42,
+                head_sha="abc123",
+                run=1,
+                output_dir=str(output_dir),
+                dry_run=True,
+                json=True,
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                command_specbackfill_import_apply(args)
+
+            payload = json.loads(output.getvalue())
+            self.assertFalse(payload["policy"]["db_writes"])
+            self.assertTrue(payload["apply"]["dry_run"])
+            self.assertEqual(payload["counts"]["would_insert"], 1)
+            self.assertEqual(payload["counts"]["inserted"], 0)
+            self.assertFalse(output_dir.exists())
+            with sqlite_connection(db_path) as connection:
+                specbackfill_count = connection.execute(
+                    "SELECT COUNT(*) FROM review_items WHERE source = 'specbackfill'"
+                ).fetchone()[0]
+            self.assertEqual(specbackfill_count, 0)
+
+    def test_command_specbackfill_import_apply_skips_existing_fingerprint_from_any_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db_path = root / "review.db"
+            spec_path = root / "specbackfill.json"
+            ensure_db_schema(db_path)
+            spec_path.write_text(
+                json.dumps(
+                    {
+                        "findings": [
+                            {
+                                "finding_id": "shared-fingerprint",
+                                "rule_id": "DB001",
+                                "title": "Schema changed without migration companion",
+                                "why": "Schema-affecting lines moved.",
+                                "evidence": [{"file": "schema.prisma", "line": 3}],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with sqlite_connection(db_path) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO review_runs (
+                        id,
+                        repo,
+                        pr_number,
+                        diff_source,
+                        head_sha,
+                        model,
+                        ollama_base_url,
+                        diff_bytes,
+                        changed_files,
+                        reviewed_files_count,
+                        findings_count,
+                        watch_items_count,
+                        static_findings_count,
+                        model_findings_count,
+                        static_watch_items_count,
+                        model_watch_items_count,
+                        existing_review_comments_count,
+                        elapsed_seconds,
+                        report_markdown
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        1,
+                        "owner/repo",
+                        42,
+                        "diff",
+                        "abc123",
+                        "local-model",
+                        "http://127.0.0.1:11434",
+                        100,
+                        1,
+                        1,
+                        1,
+                        0,
+                        0,
+                        1,
+                        0,
+                        0,
+                        0,
+                        1.0,
+                        "report",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO review_items (
+                        id,
+                        run_id,
+                        item_type,
+                        ordinal,
+                        source,
+                        severity,
+                        confidence,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fix,
+                        verification,
+                        fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        20,
+                        1,
+                        "finding",
+                        3,
+                        "model",
+                        "P2",
+                        "high",
+                        "schema.prisma",
+                        3,
+                        "Schema changed without migration companion",
+                        "Schema-affecting lines moved.",
+                        "",
+                        "",
+                        "shared-fingerprint",
+                    ),
+                )
+
+            args = argparse.Namespace(
+                db=str(db_path),
+                project_dir=None,
+                repo="owner/repo",
+                specbackfill_json=str(spec_path),
+                pr=42,
+                head_sha="abc123",
+                run=1,
+                output_dir=str(root / "import-apply"),
+                dry_run=False,
+                json=True,
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                command_specbackfill_import_apply(args)
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["counts"]["inserted"], 0)
+            self.assertEqual(payload["counts"]["already_present"], 1)
+            self.assertEqual(payload["import_state"]["existing_review_item_fingerprints"], 1)
+            self.assertEqual(payload["import_state"]["existing_specbackfill_fingerprints"], 0)
+            self.assertEqual(payload["import_state"]["existing_non_specbackfill_fingerprints"], 1)
+            candidate = payload["review_item_candidates"][0]
+            self.assertEqual(candidate["existing_review_item_id"], 20)
+            self.assertEqual(candidate["existing_source"], "model")
+            with sqlite_connection(db_path) as connection:
+                rows = connection.execute(
+                    "SELECT source, fingerprint FROM review_items ORDER BY id"
+                ).fetchall()
+            self.assertEqual(rows, [("model", "shared-fingerprint")])
+
+    def test_command_specbackfill_import_apply_requires_run_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            spec_path = root / "specbackfill.json"
+            spec_path.write_text('{"findings":[]}', encoding="utf-8")
+            args = argparse.Namespace(
+                db=str(root / "missing.db"),
+                project_dir=None,
+                repo="owner/repo",
+                specbackfill_json=str(spec_path),
+                pr=None,
+                head_sha="",
+                run=None,
+                output_dir=str(root / "import-apply"),
+                dry_run=False,
+                json=False,
+            )
+            with self.assertRaises(SystemExit) as error:
+                command_specbackfill_import_apply(args)
+            self.assertIn("--run", str(error.exception))
 
     def test_command_specbackfill_overlap_writes_artifacts_without_db_links(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

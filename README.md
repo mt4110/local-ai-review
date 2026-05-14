@@ -183,6 +183,7 @@ llreview import-github-history --dry-run
 llreview backfill-pump
 llreview matcher-explain
 llreview specbackfill-import-preview --specbackfill-json specbackfill.json
+llreview specbackfill-import-apply --specbackfill-json specbackfill.json --run <run-id>
 llreview training-export-splitter
 llreview rule-candidate-extractor
 llreview learning-scoreboard
@@ -325,6 +326,8 @@ make review-db-down
 `llreview import-github-history --dry-run` は、過去の merged PR と local git 履歴を教材候補として preview します。remote GitHub PR は `--remote-repo-limit` / `--remote-pr-limit` / `--remote-per-repo-pr-limit` で API 量を制限し、local git は `--local-repo-limit` / `--local-pr-limit` / `--local-per-repo-pr-limit` で CPU/output 量だけを制限します。local scan は GitHub API token を要求せず、preferred GitHub remote の owner が `mt4110` ではない repository は `skipped_owner_not_mt4110` で block します。skip reason を DB の `github_backfill_queue` に残したい場合は `--refresh-queue` を明示します。queue から remote candidate を1件だけ実 import する場合は `llreview import-github-history --one` を使います。`--one --dry-run` は選択されるPRと import/link 件数だけを確認し、実 import は20分に1件の limiter を既定で守ります。`llreview backfill-pump` はこの queue を日常運用向けにまとめ、before/after、rate gate、次候補、external item delta を `out/review-history/backfill-pump/` に保存します。通常は report-only、`--import-one` で一件だけ進め、`--import-one --dry-run` は external item / link / verdict / queue state を書きません。`llreview report` と `llreview export-jsonl` は queue state / skip reason も出力します。
 
 `llreview specbackfill-import-preview --specbackfill-json specbackfill.json --run <run-id>` は、`specbackfill check --format json --fail-on off` の findings を将来の `review_items(source='specbackfill')` 行にできるかを artifact-only で確認します。`run_id`、`item_type='finding'`、`source='specbackfill'`、path、line、rule id、fingerprint、evidence digest を正規化し、既存同一 fingerprint があれば `already_present`、入力内重複があれば `duplicate_input` として数えます。新規候補の ordinal は対象 run の既存 finding ordinal の後ろへ append する preview です。DB writes、GitHub API、PR checkout、PR code execution、PR comment 投稿は行わず、raw body / raw evidence / raw diff は出しません。`--dry-run` は artifact を書かずに同じ preview を表示します。
+
+`llreview specbackfill-import-apply --specbackfill-json specbackfill.json --run <run-id>` は、preview と同じ正規化結果のうち `would_insert` だけを `review_items(source='specbackfill')` に保存する明示 opt-in command です。`review_runs.id` を必須 anchor にし、既存 fingerprint と入力内 duplicate fingerprint は増やしません。保存後も Markdown/JSON artifact を書き、artifact には raw body / raw evidence / raw diff を出しません。確認だけなら `--dry-run` を使います。
 
 `llreview learn-preview` は DB 内の review items、external items、backfill queue を集計し、次回 review に使われる aggregate calibration を preview します。通常の `llreview` は、raw comment や raw diff ではなく verdict reason / external verdict / path class / queue state の集計だけを一時ファイル経由で reviewer prompt に追加します。無効化する場合は `llreview --no-history-calibration` を使います。この段階では prompt や rule を自動で書き換えず、単発の逸話ではなく繰り返し出た evidence だけを次回レビューの優先度調整に使います。
 
