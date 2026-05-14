@@ -16079,7 +16079,6 @@ def command_specbackfill_import_apply(args: argparse.Namespace) -> None:
 
     if args.dry_run:
         with managed_sqlite_connection(connect_review_db_readonly(db_path, row_factory=True)) as connection:
-            connection.row_factory = sqlite3.Row
             run_row = specbackfill_overlap_run_row(connection, as_optional_int(args.run))
             if run_row is None:
                 raise SystemExit(f"review run not found: {args.run}")
@@ -16112,7 +16111,6 @@ def command_specbackfill_import_apply(args: argparse.Namespace) -> None:
     with managed_sqlite_connection(
         connect_review_db(db_path, row_factory=True, foreign_keys=True)
     ) as connection:
-        connection.row_factory = sqlite3.Row
         connection.execute("BEGIN IMMEDIATE")
         run_row = specbackfill_overlap_run_row(connection, as_optional_int(args.run))
         if run_row is None:
@@ -16142,7 +16140,6 @@ def command_specbackfill_import_apply(args: argparse.Namespace) -> None:
             dry_run=False,
         )
 
-    report = specbackfill_import_apply_report(payload)
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
