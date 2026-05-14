@@ -12,6 +12,7 @@ falls back to a pre-PR diff when no PR exists yet.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import difflib
 import functools
@@ -87,6 +88,17 @@ DEFAULT_BACKUP_DIR = (
     / "llreview-learning-backup"
 )
 DEFAULT_INSTALL_PATH = Path.home() / ".local" / "bin" / "llreview"
+
+
+@contextlib.contextmanager
+def managed_sqlite_connection(connection: sqlite3.Connection):
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
+
+
 GITHUB_API = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
 PROGRESS_PREFIX = "LLREVIEW_EVENT "
 IMPORT_LINK_NOTE_PREFIX = "github_importer:"
@@ -12634,6 +12646,230 @@ def classify_backfill_state(
     return "pending", ""
 
 
+def backfill_candidate_from_queue_row(
+    row: sqlite3.Row,
+    *,
+    remote_state: str | None = None,
+    state: str | None = None,
+    skip_reason: str | None = None,
+    note: str | None = None,
+) -> BackfillCandidate:
+    return BackfillCandidate(
+        repo=str(row["repo"] or ""),
+        pr_number=int(row["pr_number"] or 0),
+        source_kind=str(row["source_kind"] or ""),
+        remote_state=remote_state if remote_state is not None else str(row["remote_state"] or ""),
+        state=state if state is not None else str(row["state"] or ""),
+        priority=int(row["priority"] or 0),
+        updated_at_github=str(row["updated_at_github"] or ""),
+        merged_at=str(row["merged_at"] or ""),
+        head_sha=str(row["head_sha"] or ""),
+        doc_ratio=float(row["doc_ratio"] or 0.0),
+        generated_ratio=float(row["generated_ratio"] or 0.0),
+        actionable_external_comments=int(row["actionable_external_comments"] or 0),
+        skip_reason=skip_reason if skip_reason is not None else str(row["skip_reason"] or ""),
+        note=note if note is not None else str(row["note"] or ""),
+        changed_files=int(row["changed_files"] or 0),
+        changed_lines=int(row["changed_lines"] or 0),
+        diff_fingerprint=str(row["diff_fingerprint"] or ""),
+    )
+
+
+def backfill_queue_has_identity_conflict(
+    connection: sqlite3.Connection,
+    *,
+    row_id: int,
+    repo: str,
+    pr_number: int,
+    source_kind: str,
+    head_sha: str,
+) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM github_backfill_queue
+        WHERE repo = ?
+          AND pr_number = ?
+          AND source_kind = ?
+          AND head_sha = ?
+          AND id != ?
+        LIMIT 1
+        """,
+        (repo, pr_number, source_kind, head_sha, row_id),
+    ).fetchone()
+    return row is not None
+
+
+def remote_backfill_preflight_candidate(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    owner: str,
+    token: str,
+    include_issue_comments: bool,
+    max_doc_ratio: float,
+    max_generated_ratio: float,
+    max_changed_lines: int,
+) -> BackfillCandidate:
+    repo = str(row["repo"] or "")
+    pr_number = int(row["pr_number"] or 0)
+    note_prefix = truncate_text(str(row["note"] or ""), 90)
+    if "/" not in repo or repo.split("/", 1)[0] != owner:
+        return backfill_candidate_from_queue_row(
+            row,
+            state="skipped",
+            skip_reason="skipped_owner_not_mt4110",
+            note=f"{note_prefix}; preflight owner mismatch".strip("; "),
+        )
+    if pr_number <= 0:
+        return backfill_candidate_from_queue_row(
+            row,
+            state="skipped",
+            skip_reason="failed_parse",
+            note=f"{note_prefix}; preflight missing PR number".strip("; "),
+        )
+
+    encoded_repo = urllib.parse.quote(repo, safe="/")
+    repo_payload = github_request(f"/repos/{encoded_repo}", token)
+    if not isinstance(repo_payload, dict):
+        return backfill_candidate_from_queue_row(
+            row,
+            state="failed_retryable",
+            skip_reason="failed_github_api",
+            note=f"{note_prefix}; repository metadata unavailable".strip("; "),
+        )
+    repo_owner = str((repo_payload.get("owner") or {}).get("login") or repo.split("/", 1)[0])
+    repo_full_name = str(repo_payload.get("full_name") or repo)
+    if repo_owner != owner or repo_full_name.split("/", 1)[0] != owner:
+        return backfill_candidate_from_queue_row(
+            row,
+            state="skipped",
+            skip_reason="skipped_owner_not_mt4110",
+            note=f"{note_prefix}; preflight repository owner={repo_owner}".strip("; "),
+        )
+    if bool(repo_payload.get("fork")):
+        return backfill_candidate_from_queue_row(
+            row,
+            remote_state="available",
+            state="skipped",
+            skip_reason="skipped_fork",
+            note=f"{note_prefix}; preflight repository is a fork".strip("; "),
+        )
+
+    pr_payload = github_request(f"/repos/{encoded_repo}/pulls/{pr_number}", token)
+    if not isinstance(pr_payload, dict):
+        return backfill_candidate_from_queue_row(
+            row,
+            state="failed_retryable",
+            skip_reason="failed_github_api",
+            note=f"{note_prefix}; PR metadata unavailable".strip("; "),
+        )
+    head_sha = str((pr_payload.get("head") or {}).get("sha") or row["head_sha"] or "")
+    updated_at = str(pr_payload.get("updated_at") or row["updated_at_github"] or "")
+    merged_at = str(pr_payload.get("merged_at") or "")
+    title = truncate_text(str(pr_payload.get("title") or row["note"] or ""), 90)
+    row_id = int(row["id"] or 0)
+    row_head_sha = str(row["head_sha"] or "")
+    source_kind = str(row["source_kind"] or "remote_github")
+    if head_sha and backfill_queue_has_identity_conflict(
+        connection,
+        row_id=row_id,
+        repo=repo,
+        pr_number=pr_number,
+        source_kind=source_kind,
+        head_sha=head_sha,
+    ):
+        return BackfillCandidate(
+            repo=repo,
+            pr_number=pr_number,
+            source_kind=source_kind,
+            remote_state="available",
+            state="skipped",
+            priority=int(row["priority"] or 0),
+            updated_at_github=updated_at,
+            merged_at=merged_at,
+            head_sha=row_head_sha,
+            doc_ratio=float(row["doc_ratio"] or 0.0),
+            generated_ratio=float(row["generated_ratio"] or 0.0),
+            actionable_external_comments=int(row["actionable_external_comments"] or 0),
+            skip_reason="skipped_duplicate_queue_head",
+            note=f"{title}; preflight latest head already queued ({head_sha[:12]})",
+            changed_files=int(row["changed_files"] or 0),
+            changed_lines=int(row["changed_lines"] or 0),
+            diff_fingerprint=str(row["diff_fingerprint"] or ""),
+        )
+    if not merged_at:
+        return BackfillCandidate(
+            repo=repo,
+            pr_number=pr_number,
+            source_kind="remote_github",
+            remote_state="available",
+            state="skipped",
+            priority=int(row["priority"] or 0),
+            updated_at_github=updated_at,
+            merged_at="",
+            head_sha=head_sha,
+            doc_ratio=float(row["doc_ratio"] or 0.0),
+            generated_ratio=float(row["generated_ratio"] or 0.0),
+            actionable_external_comments=int(row["actionable_external_comments"] or 0),
+            skip_reason="skipped_not_merged",
+            note=f"{title}; preflight PR is not merged".strip("; "),
+            changed_files=int(row["changed_files"] or 0),
+            changed_lines=int(row["changed_lines"] or 0),
+            diff_fingerprint=str(row["diff_fingerprint"] or ""),
+        )
+
+    files = github_paginated_request(f"/repos/{encoded_repo}/pulls/{pr_number}/files", token)
+    doc_ratio, generated_ratio, changed_lines = backfill_changed_line_ratios(files)
+    changed_files = len([file_row for file_row in files if isinstance(file_row, dict)])
+    diff_fingerprint = backfill_files_fingerprint(files)
+    existing_count = existing_external_item_count(connection, repo=repo, pr_number=pr_number)
+    actionable_count = int(row["actionable_external_comments"] or 0)
+    if (
+        doc_ratio <= max_doc_ratio
+        and generated_ratio <= max_generated_ratio
+        and existing_count <= 0
+        and (max_changed_lines <= 0 or changed_lines <= max_changed_lines)
+    ):
+        actionable_count = backfill_actionable_external_count(
+            token=token,
+            repo=repo,
+            pr_number=pr_number,
+            head_sha=head_sha,
+            include_issue_comments=include_issue_comments,
+        )
+    state, skip_reason = classify_backfill_state(
+        doc_ratio=doc_ratio,
+        generated_ratio=generated_ratio,
+        changed_lines=changed_lines,
+        actionable_external_comments=actionable_count,
+        existing_external_items=existing_count,
+        max_doc_ratio=max_doc_ratio,
+        max_generated_ratio=max_generated_ratio,
+        max_changed_lines=max_changed_lines,
+    )
+    note = f"{title}; preflight changed_lines={changed_lines}"
+    return BackfillCandidate(
+        repo=repo,
+        pr_number=pr_number,
+        source_kind="remote_github",
+        remote_state="available",
+        state=state,
+        priority=int(row["priority"] or 0),
+        updated_at_github=updated_at,
+        merged_at=merged_at,
+        head_sha=head_sha,
+        doc_ratio=doc_ratio,
+        generated_ratio=generated_ratio,
+        actionable_external_comments=actionable_count,
+        skip_reason=skip_reason,
+        note=note,
+        changed_files=changed_files,
+        changed_lines=changed_lines,
+        diff_fingerprint=diff_fingerprint,
+    )
+
+
 def build_remote_backfill_candidates(
     connection: sqlite3.Connection,
     *,
@@ -13393,6 +13629,66 @@ def mark_backfill_row_failed(
     )
 
 
+def update_backfill_row_from_candidate(
+    connection: sqlite3.Connection,
+    row_id: int,
+    candidate: BackfillCandidate,
+    *,
+    count_attempt: bool,
+    retry_delay_minutes: int,
+) -> None:
+    next_attempt_sql = "NULL"
+    params: list[Any] = [
+        candidate.remote_state,
+        candidate.state,
+        candidate.updated_at_github,
+        candidate.merged_at,
+        candidate.head_sha,
+        candidate.doc_ratio,
+        candidate.generated_ratio,
+        candidate.changed_files,
+        candidate.changed_lines,
+        candidate.diff_fingerprint,
+        candidate.actionable_external_comments,
+        candidate.skip_reason,
+        truncate_text(candidate.note, 240),
+    ]
+    if count_attempt and candidate.state == "failed_retryable":
+        next_attempt_sql = "datetime(CURRENT_TIMESTAMP, '+' || ? || ' minutes')"
+        params.append(retry_delay_minutes)
+    attempt_sql = ""
+    if count_attempt:
+        attempt_sql = """
+            last_attempt_at = CURRENT_TIMESTAMP,
+            next_attempt_at = {next_attempt_sql},
+            attempt_count = attempt_count + 1,
+        """.format(next_attempt_sql=next_attempt_sql)
+    params.append(row_id)
+    connection.execute(
+        f"""
+        UPDATE github_backfill_queue
+        SET
+            remote_state = ?,
+            state = ?,
+            updated_at_github = ?,
+            merged_at = ?,
+            head_sha = ?,
+            doc_ratio = ?,
+            generated_ratio = ?,
+            changed_files = ?,
+            changed_lines = ?,
+            diff_fingerprint = ?,
+            actionable_external_comments = ?,
+            skip_reason = ?,
+            note = ?,
+            {attempt_sql}
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        params,
+    )
+
+
 def import_github_history_one(args: argparse.Namespace, *, db_path: Path) -> None:
     if args.local_only:
         raise SystemExit("--one imports remote_github queue rows; local-only rows are preview/queue only")
@@ -13407,7 +13703,7 @@ def import_github_history_one(args: argparse.Namespace, *, db_path: Path) -> Non
         if args.dry_run
         else connect_review_db(db_path)
     )
-    with connection_context as connection:
+    with managed_sqlite_connection(connection_context) as connection:
         connection.row_factory = sqlite3.Row
         if not sqlite_table_exists(connection, "github_backfill_queue"):
             print(
@@ -13438,10 +13734,84 @@ def import_github_history_one(args: argparse.Namespace, *, db_path: Path) -> Non
         print(
             "Selected remote queue row: "
             f"id={row_id} {repo}#{pr_number} "
-            f"priority={row['priority']} signal={row['actionable_external_comments']}"
+            f"state={row['state']} priority={row['priority']} "
+            f"signal={row['actionable_external_comments']} "
+            f"docs={format_ratio(float(row['doc_ratio'] or 0.0))} "
+            f"generated={format_ratio(float(row['generated_ratio'] or 0.0))} "
+            f"files={row['changed_files']} lines={row['changed_lines']}"
         )
         if args.dry_run:
             print("DRY RUN: external items will not be written and queue state will not change")
+        else:
+            if "/" not in repo or repo.split("/", 1)[0] != BACKFILL_DEFAULT_OWNER:
+                candidate = remote_backfill_preflight_candidate(
+                    connection,
+                    row,
+                    owner=BACKFILL_DEFAULT_OWNER,
+                    token="",
+                    include_issue_comments=not args.no_issue_comments,
+                    max_doc_ratio=args.max_doc_ratio,
+                    max_generated_ratio=args.max_generated_ratio,
+                    max_changed_lines=args.max_changed_lines,
+                )
+            else:
+                token, token_source = github_token()
+                if not token:
+                    mark_backfill_row_failed(
+                        connection,
+                        row_id,
+                        retry_delay_minutes=args.retry_delay_minutes,
+                        reason="deferred_auth",
+                        note=f"GitHub auth unavailable: {token_source}",
+                    )
+                    print(f"DEFERRED: GitHub auth unavailable: {token_source}")
+                    return
+                try:
+                    candidate = remote_backfill_preflight_candidate(
+                        connection,
+                        row,
+                        owner=BACKFILL_DEFAULT_OWNER,
+                        token=token,
+                        include_issue_comments=not args.no_issue_comments,
+                        max_doc_ratio=args.max_doc_ratio,
+                        max_generated_ratio=args.max_generated_ratio,
+                        max_changed_lines=args.max_changed_lines,
+                    )
+                except GitHubRequestError as exc:
+                    mark_backfill_row_failed(
+                        connection,
+                        row_id,
+                        retry_delay_minutes=args.retry_delay_minutes,
+                        reason="failed_github_api",
+                        note=str(exc),
+                    )
+                    print(f"FAILED: preflight GitHub API check failed: {exc}")
+                    return
+            update_backfill_row_from_candidate(
+                connection,
+                row_id,
+                candidate,
+                count_attempt=candidate.state != "pending",
+                retry_delay_minutes=args.retry_delay_minutes,
+            )
+            print(
+                "Preflight remote row: "
+                f"state={candidate.state} reason={candidate.skip_reason or '(none)'} "
+                f"signal={candidate.actionable_external_comments} "
+                f"docs={format_ratio(candidate.doc_ratio)} "
+                f"generated={format_ratio(candidate.generated_ratio)} "
+                f"files={candidate.changed_files} lines={candidate.changed_lines}"
+            )
+            if candidate.state != "pending":
+                status = "DEFERRED" if candidate.state == "deferred" else "SKIPPED"
+                print(
+                    f"{status}: one-at-a-time import stopped before writes "
+                    f"(reason={candidate.skip_reason or candidate.state})"
+                )
+                return
+            repo = candidate.repo
+            pr_number = candidate.pr_number
+            head_sha = candidate.head_sha
 
     import_args = argparse.Namespace(
         db=str(db_path),
@@ -13463,7 +13833,7 @@ def import_github_history_one(args: argparse.Namespace, *, db_path: Path) -> Non
         if args.dry_run:
             raise
         message = str(exc) or f"import failed with exit code {exc.code}"
-        with connect_review_db(db_path) as connection:
+        with managed_sqlite_connection(connect_review_db(db_path)) as connection:
             mark_backfill_row_failed(
                 connection,
                 row_id,
@@ -13474,13 +13844,19 @@ def import_github_history_one(args: argparse.Namespace, *, db_path: Path) -> Non
         raise
 
     if not args.dry_run:
-        with connect_review_db(db_path) as connection:
+        with managed_sqlite_connection(connect_review_db(db_path)) as connection:
             mark_backfill_row_imported(connection, row_id)
         print(f"OK: marked github_backfill_queue id={row_id} imported")
 
 
 def format_ratio(value: float) -> str:
     return f"{value * 100:.0f}%"
+
+
+def format_source_counts(source_counts: dict[str, int]) -> str:
+    if not source_counts:
+        return "none"
+    return ", ".join(f"{source}={count}" for source, count in sorted(source_counts.items()))
 
 
 def format_backfill_time(value: str) -> str:
@@ -13560,7 +13936,7 @@ def command_import_github_history(args: argparse.Namespace) -> None:
             else sqlite3.connect(":memory:")
         )
     )
-    with connection_context as connection:
+    with managed_sqlite_connection(connection_context) as connection:
         connection.row_factory = sqlite3.Row
         if should_write_db:
             connection.execute("PRAGMA foreign_keys = ON")
@@ -15730,7 +16106,7 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
             else sqlite3.connect(":memory:")
         )
     )
-    with connection_context as connection:
+    with managed_sqlite_connection(connection_context) as connection:
         connection.row_factory = sqlite3.Row
         if not args.dry_run:
             connection.execute("PRAGMA foreign_keys = ON")
@@ -15793,11 +16169,7 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
             print(f"Link candidates: {len(candidates)}")
             print(f"Would create/update links: {len(dry_matches)}")
             print(f"Would remove stale external items: {len(stale_external_ids)}")
-            if source_counts:
-                print(
-                    "Sources: "
-                    + ", ".join(f"{source}={count}" for source, count in sorted(source_counts.items()))
-                )
+            print("Sources: " + format_source_counts(source_counts))
             return
 
         created = 0
@@ -15838,11 +16210,7 @@ def command_import_github_reviews(args: argparse.Namespace) -> None:
                 f"External importer verdicts cleared: {verdicts} "
                 "(no matching local review run candidates)"
             )
-    if source_counts:
-        print(
-            "Sources: "
-            + ", ".join(f"{source}={count}" for source, count in sorted(source_counts.items()))
-        )
+    print("Sources: " + format_source_counts(source_counts))
 
 
 def command_report(args: argparse.Namespace) -> None:

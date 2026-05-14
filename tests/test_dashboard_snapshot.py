@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -17,6 +18,13 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import dashboard_snapshot  # noqa: E402
+
+
+@contextlib.contextmanager
+def sqlite_connection(db_path: Path):
+    with contextlib.closing(sqlite3.connect(db_path)) as connection:
+        with connection:
+            yield connection
 
 
 class DashboardSnapshotTests(unittest.TestCase):
@@ -105,7 +113,7 @@ class DashboardSnapshotTests(unittest.TestCase):
     def test_latest_calibration_status_uses_newest_row_per_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "review.db"
-            with sqlite3.connect(db_path) as connection:
+            with sqlite_connection(db_path) as connection:
                 connection.row_factory = sqlite3.Row
                 connection.executescript(
                     """
@@ -238,7 +246,7 @@ class DashboardSnapshotTests(unittest.TestCase):
     def test_snapshot_uses_aggregate_rows_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "review.db"
-            with sqlite3.connect(db_path) as connection:
+            with sqlite_connection(db_path) as connection:
                 connection.executescript(
                     """
                     CREATE TABLE review_run_summary (
@@ -426,7 +434,7 @@ class DashboardSnapshotTests(unittest.TestCase):
     def test_calibration_health_uses_activation_time_not_last_update(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "review.db"
-            with sqlite3.connect(db_path) as connection:
+            with sqlite_connection(db_path) as connection:
                 connection.row_factory = sqlite3.Row
                 connection.executescript(
                     """
@@ -493,7 +501,7 @@ class DashboardSnapshotTests(unittest.TestCase):
     def test_review_health_rates_use_scored_local_findings(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "review.db"
-            with sqlite3.connect(db_path) as connection:
+            with sqlite_connection(db_path) as connection:
                 connection.row_factory = sqlite3.Row
                 connection.executescript(
                     """
@@ -532,7 +540,7 @@ class DashboardSnapshotTests(unittest.TestCase):
     def test_calibration_health_uses_external_verdict_time_for_missed_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "review.db"
-            with sqlite3.connect(db_path) as connection:
+            with sqlite_connection(db_path) as connection:
                 connection.row_factory = sqlite3.Row
                 connection.executescript(
                     """
@@ -636,7 +644,7 @@ class DashboardSnapshotTests(unittest.TestCase):
     def test_calibration_health_excludes_activation_time_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "review.db"
-            with sqlite3.connect(db_path) as connection:
+            with sqlite_connection(db_path) as connection:
                 connection.row_factory = sqlite3.Row
                 connection.executescript(
                     """
@@ -738,7 +746,7 @@ class DashboardSnapshotTests(unittest.TestCase):
             (root / "notes.txt").write_text("untracked private note\n", encoding="utf-8")
 
             db_path = Path(tmpdir) / "review.db"
-            with sqlite3.connect(db_path) as connection:
+            with sqlite_connection(db_path) as connection:
                 connection.executescript(
                     """
                     CREATE TABLE review_run_summary (
@@ -857,7 +865,7 @@ class DashboardSnapshotTests(unittest.TestCase):
             expected_diff = self.pre_pr_diff_text(root)
             fingerprint = hashlib.sha256(expected_diff.encode("utf-8")).hexdigest()
             db_path = Path(tmpdir) / "review.db"
-            with sqlite3.connect(db_path) as connection:
+            with sqlite_connection(db_path) as connection:
                 connection.executescript(
                     """
                     CREATE TABLE review_run_summary (
