@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import fcntl
 import io
+import json
 import sqlite3
 import sys
 import tempfile
@@ -41,10 +42,12 @@ from llreview import (  # noqa: E402
     command_backfill_pump,
     command_import_github_history,
     command_import_github_reviews,
+    command_specbackfill_overlap,
     ensure_db_schema,
     external_items_from_comments,
     learning_calibration_statuses_by_candidate,
     postgres_copy_value,
+    parse_specbackfill_findings_payload,
     review_path_class,
 )
 
@@ -138,6 +141,349 @@ class ReviewDbConfigTests(unittest.TestCase):
     def test_connect_postgres_dsn_fails_with_clear_backend_error(self) -> None:
         with self.assertRaises(UnsupportedReviewDbBackendError):
             connect_review_db("postgresql://localhost/llreview")
+
+
+class SpecbackfillOverlapTests(unittest.TestCase):
+    def test_parse_specbackfill_findings_uses_evidence_anchor_and_stable_id(self) -> None:
+        findings = parse_specbackfill_findings_payload(
+            {
+                "version": "v0",
+                "findings": [
+                    {
+                        "finding_id": "v0-example",
+                        "omission_signature": "db001.schema_changed.migration_companion",
+                        "rule_id": "DB001",
+                        "severity": "error",
+                        "confidence": "high",
+                        "title": "Schema changed, but no matching migration companion moved with this diff",
+                        "why": "Schema-affecting lines moved in the diff.",
+                        "evidence": [{"file": "schema.prisma", "line": 3, "excerpt": "email String @unique"}],
+                        "expected_companions": ["migration file", "migration test"],
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].fingerprint, "v0-example")
+        self.assertEqual(findings[0].path, "schema.prisma")
+        self.assertEqual(findings[0].line, 3)
+        self.assertEqual(findings[0].expected_companions, ("migration file", "migration test"))
+
+    def test_command_specbackfill_overlap_writes_artifacts_without_db_links(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db_path = root / "review.db"
+            output_dir = root / "overlap"
+            spec_path = root / "specbackfill.json"
+            ensure_db_schema(db_path)
+            spec_path.write_text(
+                json.dumps(
+                    {
+                        "version": "v0",
+                        "findings": [
+                            {
+                                "finding_id": "v0-db001",
+                                "omission_signature": "db001.schema_changed.migration_companion",
+                                "rule_id": "DB001",
+                                "severity": "error",
+                                "confidence": "high",
+                                "title": "Schema changed, but no matching migration companion moved with this diff",
+                                "why": "Schema-affecting lines moved in the diff, but no matching migration companion evidence moved with them.",
+                                "evidence": [{"file": "schema.prisma", "line": 3, "excerpt": "email String @unique"}],
+                                "expected_companions": ["migration file", "migration test"],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with sqlite_connection(db_path) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO review_runs (
+                        id,
+                        repo,
+                        pr_number,
+                        diff_source,
+                        head_sha,
+                        model,
+                        ollama_base_url,
+                        diff_bytes,
+                        changed_files,
+                        reviewed_files_count,
+                        findings_count,
+                        watch_items_count,
+                        static_findings_count,
+                        model_findings_count,
+                        static_watch_items_count,
+                        model_watch_items_count,
+                        existing_review_comments_count,
+                        elapsed_seconds,
+                        report_markdown
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        1,
+                        "owner/repo",
+                        42,
+                        "diff",
+                        "abc123",
+                        "local-model",
+                        "http://127.0.0.1:11434",
+                        100,
+                        1,
+                        1,
+                        1,
+                        0,
+                        0,
+                        1,
+                        0,
+                        0,
+                        0,
+                        1.0,
+                        "report",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO review_items (
+                        id,
+                        run_id,
+                        item_type,
+                        ordinal,
+                        source,
+                        severity,
+                        confidence,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fix,
+                        verification,
+                        fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        10,
+                        1,
+                        "finding",
+                        1,
+                        "model",
+                        "P2",
+                        "high",
+                        "schema.prisma",
+                        3,
+                        "Missing migration companion",
+                        "Schema changed, but no matching migration companion moved with this diff.",
+                        "",
+                        "",
+                        "local-fp",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO external_items (
+                        id,
+                        repo,
+                        pr_number,
+                        head_sha,
+                        import_head_sha,
+                        source,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        20,
+                        "owner/repo",
+                        42,
+                        "abc123",
+                        "abc123",
+                        "human",
+                        "schema.prisma",
+                        3,
+                        "Missing migration companion",
+                        "Schema changed, but no matching migration companion moved with this diff.",
+                        "external-fp",
+                    ),
+                )
+
+            args = argparse.Namespace(
+                db=str(db_path),
+                project_dir=None,
+                repo="owner/repo",
+                specbackfill_json=str(spec_path),
+                all_repos=False,
+                pr=42,
+                head_sha="abc123",
+                run=1,
+                output_dir=str(output_dir),
+                local_source="model",
+                include_watch=False,
+                limit=50,
+                match_limit=20,
+                min_link_score=0.55,
+                dry_run=False,
+                json=False,
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                command_specbackfill_overlap(args)
+
+            latest_json = (output_dir / "latest.json").read_text(encoding="utf-8")
+            latest_report = (output_dir / "latest.md").read_text(encoding="utf-8")
+            self.assertNotIn("email String @unique", latest_json)
+            self.assertNotIn("email String @unique", latest_report)
+            payload = json.loads(latest_json)
+            self.assertEqual(payload["counts"]["specbackfill_findings"], 1)
+            self.assertEqual(payload["counts"]["specbackfill_local_overlaps"], 1)
+            self.assertEqual(payload["counts"]["specbackfill_external_overlaps"], 1)
+            self.assertFalse(payload["policy"]["db_writes"])
+            self.assertIn("OK: specbackfill overlap report=", output.getvalue())
+            with sqlite_connection(db_path) as connection:
+                link_count = connection.execute("SELECT COUNT(*) FROM item_links").fetchone()[0]
+            self.assertEqual(link_count, 0)
+
+    def test_specbackfill_overlap_match_limit_zero_keeps_report_truthful(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db_path = root / "review.db"
+            spec_path = root / "specbackfill.json"
+            ensure_db_schema(db_path)
+            spec_path.write_text(
+                json.dumps(
+                    {
+                        "findings": [
+                            {
+                                "finding_id": "v0-db001",
+                                "omission_signature": "db001.schema_changed.migration_companion",
+                                "rule_id": "DB001",
+                                "severity": "error",
+                                "confidence": "high",
+                                "title": "Schema changed, but no matching migration companion moved with this diff",
+                                "why": "Schema-affecting lines moved in the diff.",
+                                "evidence": [{"file": "schema.prisma", "line": 3}],
+                                "expected_companions": ["migration file"],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with sqlite_connection(db_path) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO review_runs (
+                        id,
+                        repo,
+                        pr_number,
+                        diff_source,
+                        head_sha,
+                        model,
+                        ollama_base_url,
+                        diff_bytes,
+                        changed_files,
+                        reviewed_files_count,
+                        findings_count,
+                        watch_items_count,
+                        static_findings_count,
+                        model_findings_count,
+                        static_watch_items_count,
+                        model_watch_items_count,
+                        existing_review_comments_count,
+                        elapsed_seconds,
+                        report_markdown
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        1,
+                        "owner/repo",
+                        42,
+                        "diff",
+                        "abc123",
+                        "local-model",
+                        "http://127.0.0.1:11434",
+                        100,
+                        1,
+                        1,
+                        1,
+                        0,
+                        0,
+                        1,
+                        0,
+                        0,
+                        0,
+                        1.0,
+                        "report",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO review_items (
+                        id,
+                        run_id,
+                        item_type,
+                        ordinal,
+                        source,
+                        severity,
+                        confidence,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fix,
+                        verification,
+                        fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        10,
+                        1,
+                        "finding",
+                        1,
+                        "model",
+                        "P2",
+                        "high",
+                        "schema.prisma",
+                        3,
+                        "Missing migration companion",
+                        "Schema changed, but no matching migration companion moved with this diff.",
+                        "",
+                        "",
+                        "local-fp",
+                    ),
+                )
+
+            args = argparse.Namespace(
+                db=str(db_path),
+                project_dir=None,
+                repo="owner/repo",
+                specbackfill_json=str(spec_path),
+                all_repos=False,
+                pr=42,
+                head_sha="abc123",
+                run=1,
+                output_dir=str(root / "overlap"),
+                local_source="model",
+                include_watch=False,
+                limit=50,
+                match_limit=0,
+                min_link_score=0.55,
+                dry_run=True,
+                json=False,
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                command_specbackfill_overlap(args)
+
+            rendered = output.getvalue()
+            self.assertIn("specbackfill to local overlaps: 1", rendered)
+            self.assertIn("Match samples were omitted by the current `--match-limit`.", rendered)
+            self.assertNotIn("No deterministic overlaps reached the current threshold.", rendered)
 
 
 class ImportGithubHistoryTests(unittest.TestCase):
