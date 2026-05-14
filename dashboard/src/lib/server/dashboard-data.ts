@@ -125,12 +125,65 @@ function fallbackSnapshot(error: unknown): DashboardSnapshot {
       average_elapsed_seconds: 0
     },
     external: { total: 0, linked: 0, unlinked: 0, link_rate: 'n/a', verdict_rows: [] },
+    review_health: {
+      status: 'no_data',
+      summary: 'Dashboard snapshot failed before reading review health.',
+      local_findings: 0,
+      scored_local_findings: 0,
+      useful: 0,
+      false_positive: 0,
+      unclear: 0,
+      watch_only: 0,
+      missed: 0,
+      covered: 0,
+      useful_rate: 'n/a',
+      false_positive_rate: 'n/a',
+      unclear_rate: 'n/a',
+      missed_to_covered_ratio: 'n/a',
+      local_item_verdicts: {},
+      top_local_reasons: []
+    },
+    stamp_stock: {
+      external_stamp_inbox: 0,
+      review_gap_stamp_inbox: 0,
+      unscored_runs: 0,
+      candidate_activation_inbox: 0,
+      candidate_needs_data: 0,
+      backfill_pending: 0,
+      total: 0
+    },
     backfill_queue: { total: 0, signal: 0, by_state: {}, by_source_state: {}, records: [] },
     calibrations: { active: 0, recent: [] },
+    calibration_health: {
+      status: 'no_active',
+      summary: 'Dashboard snapshot failed before reading calibration health.',
+      active: 0,
+      supported: 0,
+      promising: 0,
+      insufficient_recent_runs: 0,
+      thin_evidence: 0,
+      watch_missed: 0,
+      watch_false_positives: 0,
+      needs_audit: 0,
+      with_recent_runs: 0,
+      recent: []
+    },
+    learning_candidates: {
+      threshold: 2,
+      total: 0,
+      proposed: 0,
+      active: 0,
+      paused: 0,
+      retired: 0,
+      needs_more_data: 0,
+      activation_inbox: 0,
+      by_signal: {}
+    },
     learning_readiness: {
       active_calibrations: 0,
       training_ready_external_examples: 0,
       human_gate_external_examples: 0,
+      candidate_activation_inbox: 0,
       postgres_optional_backend: 'optional'
     },
     backlog: {

@@ -51,7 +51,8 @@ button:disabled {
 
 .masthead h1,
 .section-band h2,
-.split-section h2 {
+.split-section h2,
+.split-section h3 {
   margin: 0;
   letter-spacing: 0;
 }
@@ -351,6 +352,91 @@ button:disabled {
   margin-top: 6px;
   font-size: 1.7rem;
   line-height: 1;
+}
+
+.mini-grid small {
+  display: block;
+  margin-top: 5px;
+  color: #64706b;
+  font-size: 0.78rem;
+}
+
+.compact-grid article {
+  min-height: 70px;
+}
+
+.compact-grid strong {
+  font-size: 1.35rem;
+}
+
+.health-panel,
+.stock-footer,
+.calibration-health,
+.coverage-line {
+  border: 1px solid #dfe6e1;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.86);
+}
+
+.health-panel {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+}
+
+.health-panel p,
+.calibration-health p,
+.stock-footer small,
+.coverage-line small {
+  color: #64706b;
+}
+
+.health-panel p,
+.calibration-health p {
+  margin: 0;
+  font-size: 0.94rem;
+}
+
+.coverage-line,
+.stock-footer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 3px 12px;
+  align-items: baseline;
+  padding: 12px;
+}
+
+.coverage-line small,
+.stock-footer small {
+  grid-column: 1 / 3;
+}
+
+.coverage-line span,
+.stock-footer span {
+  color: #64706b;
+  font-size: 0.86rem;
+}
+
+.reason-list {
+  display: grid;
+  gap: 6px;
+}
+
+.reason-list p {
+  margin: 0;
+  color: #56615d;
+  font-size: 0.9rem;
+}
+
+.calibration-health {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+  padding: 12px;
+}
+
+.calibration-health h3 {
+  font-size: 1rem;
 }
 
 .gate-list article {

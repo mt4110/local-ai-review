@@ -9,6 +9,16 @@
   $: currentWorkspace = snapshot.workspace?.current;
   $: workspaceEligibility = snapshot.workspace?.eligibility;
   $: specbackfill = snapshot.workspace?.specbackfill;
+  $: reviewHealth = snapshot.review_health;
+  $: stampStock = snapshot.stamp_stock;
+  $: calibrationHealth = snapshot.calibration_health;
+  $: learningCandidates = snapshot.learning_candidates;
+  $: reviewHealthWarn =
+    reviewHealth.status === 'watch_false_positive_rate' ||
+    reviewHealth.status === 'watch_recall' ||
+    reviewHealth.status === 'needs_scoring';
+  $: calibrationHealthWarn = calibrationHealth.status === 'warming_up';
+  $: calibrationHealthBlock = calibrationHealth.status === 'needs_audit';
 
   const numberFormatter = new Intl.NumberFormat('en-US');
 
@@ -52,6 +62,33 @@
     ];
   }
 
+  function reviewHealthRows() {
+    return [
+      ['Useful', reviewHealth.useful, reviewHealth.useful_rate],
+      ['False positive', reviewHealth.false_positive, reviewHealth.false_positive_rate],
+      ['Unclear', reviewHealth.unclear, reviewHealth.unclear_rate],
+      ['Watch only', reviewHealth.watch_only, 'item verdicts']
+    ];
+  }
+
+  function stampRows() {
+    return [
+      ['External stamps', stampStock.external_stamp_inbox],
+      ['Review-gap stamps', stampStock.review_gap_stamp_inbox],
+      ['Unscored runs', stampStock.unscored_runs],
+      ['Activation inbox', stampStock.candidate_activation_inbox]
+    ];
+  }
+
+  function calibrationRows() {
+    return [
+      ['Supported', calibrationHealth.supported],
+      ['Needs audit', calibrationHealth.needs_audit],
+      ['Later runs', calibrationHealth.with_recent_runs],
+      ['Thin evidence', calibrationHealth.thin_evidence]
+    ];
+  }
+
   function gateText(status: string): string {
     if (status === 'pass') return 'OK';
     if (status === 'warn') return 'Watch';
@@ -66,6 +103,17 @@
     if (status === 'idle') return 'Idle';
     if (status === 'up_to_date') return 'Current';
     return 'Unset';
+  }
+
+  function healthStatusText(status: string | undefined): string {
+    if (status === 'steady') return 'Steady';
+    if (status === 'watch_false_positive_rate') return 'FP watch';
+    if (status === 'watch_recall') return 'Recall watch';
+    if (status === 'needs_scoring') return 'Score';
+    if (status === 'supported') return 'Supported';
+    if (status === 'warming_up') return 'Warming';
+    if (status === 'needs_audit') return 'Audit';
+    return 'No data';
   }
 
   async function refresh() {
@@ -131,6 +179,61 @@
       <strong>{snapshot.db.size_label}</strong>
       <small>{snapshot.db.backend || 'sqlite'}</small>
     </article>
+  </section>
+
+  <section class="split-section">
+    <div>
+      <div class="section-heading compact">
+        <h2>Review Health</h2>
+        <span class="inline-state" class:warn={reviewHealthWarn}>
+          {healthStatusText(reviewHealth.status)}
+        </span>
+      </div>
+      <div class="health-panel">
+        <p>{reviewHealth.summary}</p>
+        <div class="mini-grid">
+          {#each reviewHealthRows() as row}
+            <article>
+              <span>{row[0]}</span>
+              <strong>{fmt(row[1])}</strong>
+              <small>{row[2]}</small>
+            </article>
+          {/each}
+        </div>
+        <div class="coverage-line">
+          <span>Missed / covered</span>
+          <strong>{fmt(reviewHealth.missed)} / {fmt(reviewHealth.covered)}</strong>
+          <small>{reviewHealth.missed_to_covered_ratio} missed share</small>
+        </div>
+        {#if reviewHealth.top_local_reasons.length}
+          <div class="reason-list">
+            {#each reviewHealth.top_local_reasons as row}
+              <p><strong>{row.verdict}</strong> {row.reason} ({fmt(row.count)})</p>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    </div>
+
+    <div>
+      <div class="section-heading compact">
+        <h2>Stamp Stock</h2>
+        <span>{fmt(stampStock.total)} waiting</span>
+      </div>
+      <div class="mini-grid backlog">
+        {#each stampRows() as row}
+          <article>
+            <span>{row[0]}</span>
+            <strong>{fmt(row[1])}</strong>
+          </article>
+        {/each}
+      </div>
+      <div class="stock-footer">
+        <span>Needs data</span>
+        <strong>{fmt(stampStock.candidate_needs_data)}</strong>
+        <small>candidate threshold {fmt(learningCandidates.threshold)}</small>
+      </div>
+    </div>
   </section>
 
   <section class="split-section">
@@ -252,6 +355,27 @@
             <strong>{fmt(row[1])}</strong>
           </article>
         {/each}
+      </div>
+      <div class="calibration-health">
+        <div class="section-heading compact">
+          <h3>Calibration Health</h3>
+          <span
+            class="inline-state"
+            class:warn={calibrationHealthWarn}
+            class:block={calibrationHealthBlock}
+          >
+            {healthStatusText(calibrationHealth.status)}
+          </span>
+        </div>
+        <p>{calibrationHealth.summary}</p>
+        <div class="mini-grid compact-grid">
+          {#each calibrationRows() as row}
+            <article>
+              <span>{row[0]}</span>
+              <strong>{fmt(row[1])}</strong>
+            </article>
+          {/each}
+        </div>
       </div>
       <div class="specbackfill-line" class:ready={specbackfill?.available}>
         <div>

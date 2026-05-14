@@ -24,6 +24,35 @@ export type DashboardExternalCounts = {
   verdict_rows: Array<Record<string, string | number>>;
 };
 
+export type DashboardReviewHealth = {
+  status: string;
+  summary: string;
+  local_findings: number;
+  scored_local_findings: number;
+  useful: number;
+  false_positive: number;
+  unclear: number;
+  watch_only: number;
+  missed: number;
+  covered: number;
+  useful_rate: string;
+  false_positive_rate: string;
+  unclear_rate: string;
+  missed_to_covered_ratio: string;
+  local_item_verdicts: Record<string, number>;
+  top_local_reasons: Array<Record<string, string | number>>;
+};
+
+export type DashboardStampStock = {
+  external_stamp_inbox: number;
+  review_gap_stamp_inbox: number;
+  unscored_runs: number;
+  candidate_activation_inbox: number;
+  candidate_needs_data: number;
+  backfill_pending: number;
+  total: number;
+};
+
 export type DashboardBackfillQueue = {
   total: number;
   signal: number;
@@ -121,6 +150,33 @@ export type DashboardReadinessGate = {
   ready: boolean;
 };
 
+export type DashboardLearningCandidates = {
+  threshold: number;
+  total: number;
+  proposed: number;
+  active: number;
+  paused: number;
+  retired: number;
+  needs_more_data: number;
+  activation_inbox: number;
+  by_signal: Record<string, number>;
+};
+
+export type DashboardCalibrationHealth = {
+  status: string;
+  summary: string;
+  active: number;
+  supported: number;
+  promising: number;
+  insufficient_recent_runs: number;
+  thin_evidence: number;
+  watch_missed: number;
+  watch_false_positives: number;
+  needs_audit: number;
+  with_recent_runs: number;
+  recent: Array<Record<string, string | number>>;
+};
+
 export type DashboardSnapshot = {
   schema_name: string;
   schema_version: number;
@@ -156,11 +212,15 @@ export type DashboardSnapshot = {
   tables?: CountMap;
   runs: DashboardRunCounts;
   external: DashboardExternalCounts;
+  review_health: DashboardReviewHealth;
+  stamp_stock: DashboardStampStock;
   backfill_queue: DashboardBackfillQueue;
   calibrations: {
     active: number;
     recent: Array<Record<string, string | number>>;
   };
+  calibration_health: DashboardCalibrationHealth;
+  learning_candidates: DashboardLearningCandidates;
   learning_readiness: Record<string, string | number | Record<string, number>>;
   backlog: Record<string, number>;
   growth: DashboardGrowthRow[];

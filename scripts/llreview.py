@@ -1969,23 +1969,14 @@ def learning_calibration_statuses_by_candidate(connection: sqlite3.Connection) -
         ORDER BY updated_at DESC, id DESC
         """
     ).fetchall()
-    rank = {"active": 0, "paused": 1, "retired": 2}
-    statuses: dict[str, tuple[int, str, str]] = {}
+    statuses: dict[str, str] = {}
     for row in rows:
         candidate_id = str(row["candidate_id"] or "")
         status = str(row["status"] or "")
         if not candidate_id or not status:
             continue
-        status_rank = rank.get(status, 9)
-        updated_at = str(row["updated_at"] or "")
-        current = statuses.get(candidate_id)
-        if (
-            current is None
-            or status_rank < current[0]
-            or (status_rank == current[0] and updated_at > current[2])
-        ):
-            statuses[candidate_id] = (status_rank, status, updated_at)
-    return {candidate_id: status for candidate_id, (_rank, status, _updated_at) in statuses.items()}
+        statuses.setdefault(candidate_id, status)
+    return statuses
 
 
 def apply_learning_calibration_statuses(
@@ -12361,7 +12352,10 @@ def github_paginated_request_limited(path: str, token: str, *, limit: int) -> li
 
 
 def normalized_repo_path(path: str) -> str:
-    return path.replace("\\", "/").lstrip("./").lower()
+    normalized = path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.lower()
 
 
 def is_backfill_doc_path(path: str) -> bool:

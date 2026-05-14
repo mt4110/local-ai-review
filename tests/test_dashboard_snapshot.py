@@ -90,6 +90,49 @@ class DashboardSnapshotTests(unittest.TestCase):
             else:
                 os.environ["OLLAMA_HOST"] = previous_host
 
+    def test_dashboard_path_class_preserves_dot_prefixed_paths(self) -> None:
+        self.assertEqual(
+            dashboard_snapshot.dashboard_path_class(".github/workflows/ci.yml"),
+            "ops_config",
+        )
+        self.assertEqual(
+            dashboard_snapshot.dashboard_path_class("./.github/workflows/ci.yml"),
+            "ops_config",
+        )
+        self.assertEqual(dashboard_snapshot.dashboard_path_class(".private_docs/roadmap.md"), "docs")
+        self.assertEqual(dashboard_snapshot.dashboard_path_class(".env.example"), "ops_config")
+
+    def test_latest_calibration_status_uses_newest_row_per_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "review.db"
+            with sqlite3.connect(db_path) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.executescript(
+                    """
+                    CREATE TABLE learning_calibrations (
+                        id INTEGER PRIMARY KEY,
+                        candidate_id TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    INSERT INTO learning_calibrations (
+                        id,
+                        candidate_id,
+                        status,
+                        updated_at
+                    ) VALUES
+                        (1, 'candidate-a', 'active', '2026-05-01T00:00:00Z'),
+                        (2, 'candidate-a', 'paused', '2026-05-02T00:00:00Z'),
+                        (3, 'candidate-b', 'retired', '2026-05-02T00:00:00Z'),
+                        (4, 'candidate-b', 'active', '2026-05-02T00:00:00Z');
+                    """
+                )
+
+                statuses = dashboard_snapshot.latest_calibration_statuses(connection)
+
+            self.assertEqual(statuses["candidate-a"], "paused")
+            self.assertEqual(statuses["candidate-b"], "active")
+
     def test_workspace_status_disables_external_diff_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / "repo"
@@ -365,13 +408,321 @@ class DashboardSnapshotTests(unittest.TestCase):
             self.assertEqual(payload["learning_readiness"]["training_ready_external_examples"], 1)
             self.assertEqual(payload["learning_readiness"]["human_gate_external_examples"], 1)
             self.assertEqual(payload["learning_readiness"]["covered_by_local"], 1)
+            self.assertEqual(payload["review_health"]["status"], "needs_scoring")
+            self.assertEqual(payload["review_health"]["missed"], 1)
+            self.assertEqual(payload["review_health"]["covered"], 1)
+            self.assertEqual(payload["stamp_stock"]["external_stamp_inbox"], 1)
+            self.assertEqual(payload["stamp_stock"]["unscored_runs"], 1)
+            self.assertEqual(payload["stamp_stock"]["candidate_activation_inbox"], 1)
             self.assertEqual(payload["backlog"]["backfill_pending"], 1)
             self.assertEqual(payload["calibrations"]["active"], 1)
+            self.assertEqual(payload["calibration_health"]["status"], "warming_up")
             self.assertNotIn("instruction", payload["calibrations"]["recent"][0])
             self.assertEqual(payload["growth"][0]["month"], "2026-05")
             self.assertIn("scoring-pump", payload["next_commands"][0]["command"])
             self.assertFalse(payload["policy"]["raw_bodies_included"])
             self.assertFalse(payload["policy"]["raw_diffs_included"])
+
+    def test_calibration_health_uses_activation_time_not_last_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "review.db"
+            with sqlite3.connect(db_path) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.executescript(
+                    """
+                    CREATE TABLE review_runs (
+                        id INTEGER PRIMARY KEY,
+                        created_at TEXT NOT NULL,
+                        repo TEXT NOT NULL
+                    );
+                    CREATE TABLE learning_calibrations (
+                        id INTEGER PRIMARY KEY,
+                        calibration_id TEXT NOT NULL,
+                        scope_repo TEXT NOT NULL DEFAULT '',
+                        path_class TEXT NOT NULL DEFAULT '',
+                        signal_kind TEXT NOT NULL DEFAULT '',
+                        evidence_count INTEGER NOT NULL DEFAULT 0,
+                        confidence TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL DEFAULT 'active',
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO review_runs (
+                        id,
+                        created_at,
+                        repo
+                    ) VALUES (1, '2026-05-03T00:00:00Z', 'owner/repo');
+                    INSERT INTO learning_calibrations (
+                        id,
+                        calibration_id,
+                        scope_repo,
+                        path_class,
+                        signal_kind,
+                        evidence_count,
+                        confidence,
+                        status,
+                        created_at,
+                        updated_at
+                    ) VALUES (
+                        1,
+                        'cal-created-at',
+                        'owner/repo',
+                        'code',
+                        'external_missed',
+                        3,
+                        'medium',
+                        'active',
+                        '2026-05-01T00:00:00Z',
+                        '2026-05-10T00:00:00Z'
+                    );
+                    """
+                )
+                objects = dashboard_snapshot.sqlite_objects(connection)
+
+                health = dashboard_snapshot.calibration_health_counts(
+                    connection,
+                    objects=objects,
+                    repo="owner/repo",
+                    limit=5,
+                )
+
+            self.assertEqual(health["status"], "supported")
+            self.assertEqual(health["with_recent_runs"], 1)
+            self.assertEqual(health["recent"][0]["runs_after"], 1)
+
+    def test_review_health_rates_use_scored_local_findings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "review.db"
+            with sqlite3.connect(db_path) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.executescript(
+                    """
+                    CREATE TABLE review_run_summary (
+                        id INTEGER PRIMARY KEY,
+                        repo TEXT NOT NULL,
+                        findings_count INTEGER,
+                        useful_findings_fixed INTEGER,
+                        false_positives INTEGER,
+                        unclear_findings INTEGER
+                    );
+                    INSERT INTO review_run_summary (
+                        id,
+                        repo,
+                        findings_count,
+                        useful_findings_fixed,
+                        false_positives,
+                        unclear_findings
+                    ) VALUES (1, 'owner/repo', 4, 1, 1, 0);
+                    """
+                )
+                objects = dashboard_snapshot.sqlite_objects(connection)
+
+                health = dashboard_snapshot.review_health_counts(
+                    connection,
+                    objects=objects,
+                    repo="owner/repo",
+                    external_stats={},
+                )
+
+            self.assertEqual(health["scored_local_findings"], 4)
+            self.assertEqual(health["useful_rate"], "25.0%")
+            self.assertEqual(health["false_positive_rate"], "25.0%")
+            self.assertEqual(health["unclear_rate"], "0.0%")
+
+    def test_calibration_health_uses_external_verdict_time_for_missed_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "review.db"
+            with sqlite3.connect(db_path) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.executescript(
+                    """
+                    CREATE TABLE review_runs (
+                        id INTEGER PRIMARY KEY,
+                        created_at TEXT NOT NULL,
+                        repo TEXT NOT NULL
+                    );
+                    CREATE TABLE external_items (
+                        id INTEGER PRIMARY KEY,
+                        repo TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        path TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    CREATE TABLE item_verdicts (
+                        id INTEGER PRIMARY KEY,
+                        target_kind TEXT NOT NULL,
+                        target_id INTEGER NOT NULL,
+                        verdict TEXT NOT NULL,
+                        reason TEXT NOT NULL DEFAULT '',
+                        scored_at TEXT NOT NULL DEFAULT ''
+                    );
+                    CREATE TABLE learning_calibrations (
+                        id INTEGER PRIMARY KEY,
+                        calibration_id TEXT NOT NULL,
+                        scope_repo TEXT NOT NULL DEFAULT '',
+                        path_class TEXT NOT NULL DEFAULT '',
+                        signal_kind TEXT NOT NULL DEFAULT '',
+                        evidence_count INTEGER NOT NULL DEFAULT 0,
+                        confidence TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL DEFAULT 'active',
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO review_runs (
+                        id,
+                        created_at,
+                        repo
+                    ) VALUES (1, '2026-05-03T00:00:00Z', 'owner/repo');
+                    INSERT INTO external_items (
+                        id,
+                        repo,
+                        source,
+                        path,
+                        created_at
+                    ) VALUES (1, 'owner/repo', 'teacher_model', 'src/app.py', '2026-04-30T00:00:00Z');
+                    INSERT INTO item_verdicts (
+                        id,
+                        target_kind,
+                        target_id,
+                        verdict,
+                        reason,
+                        scored_at
+                    ) VALUES (
+                        1,
+                        'external_item',
+                        1,
+                        'missed_by_local',
+                        'teacher_model_valid',
+                        '2026-05-04T00:00:00Z'
+                    );
+                    INSERT INTO learning_calibrations (
+                        id,
+                        calibration_id,
+                        scope_repo,
+                        path_class,
+                        signal_kind,
+                        evidence_count,
+                        confidence,
+                        status,
+                        created_at,
+                        updated_at
+                    ) VALUES (
+                        1,
+                        'cal-external-verdict-time',
+                        'owner/repo',
+                        'code',
+                        'external_missed',
+                        3,
+                        'medium',
+                        'active',
+                        '2026-05-01T00:00:00Z',
+                        '2026-05-01T00:00:00Z'
+                    );
+                    """
+                )
+                objects = dashboard_snapshot.sqlite_objects(connection)
+
+                health = dashboard_snapshot.calibration_health_counts(
+                    connection,
+                    objects=objects,
+                    repo="owner/repo",
+                    limit=5,
+                )
+
+            self.assertEqual(health["status"], "needs_audit")
+            self.assertEqual(health["recent"][0]["status"], "watch_missed")
+            self.assertEqual(health["recent"][0]["target_after"], 1)
+
+    def test_calibration_health_excludes_activation_time_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "review.db"
+            with sqlite3.connect(db_path) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.executescript(
+                    """
+                    CREATE TABLE review_runs (
+                        id INTEGER PRIMARY KEY,
+                        created_at TEXT NOT NULL,
+                        repo TEXT NOT NULL
+                    );
+                    CREATE TABLE review_items (
+                        id INTEGER PRIMARY KEY,
+                        run_id INTEGER NOT NULL,
+                        path TEXT NOT NULL DEFAULT ''
+                    );
+                    CREATE TABLE item_verdicts (
+                        id INTEGER PRIMARY KEY,
+                        target_kind TEXT NOT NULL,
+                        target_id INTEGER NOT NULL,
+                        verdict TEXT NOT NULL,
+                        scored_at TEXT NOT NULL DEFAULT ''
+                    );
+                    CREATE TABLE learning_calibrations (
+                        id INTEGER PRIMARY KEY,
+                        calibration_id TEXT NOT NULL,
+                        scope_repo TEXT NOT NULL DEFAULT '',
+                        path_class TEXT NOT NULL DEFAULT '',
+                        signal_kind TEXT NOT NULL DEFAULT '',
+                        evidence_count INTEGER NOT NULL DEFAULT 0,
+                        confidence TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL DEFAULT 'active',
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO review_runs (
+                        id,
+                        created_at,
+                        repo
+                    ) VALUES (1, '2026-05-01T00:00:00Z', 'owner/repo');
+                    INSERT INTO review_items (
+                        id,
+                        run_id,
+                        path
+                    ) VALUES (1, 1, 'src/app.py');
+                    INSERT INTO item_verdicts (
+                        id,
+                        target_kind,
+                        target_id,
+                        verdict,
+                        scored_at
+                    ) VALUES (1, 'review_item', 1, 'false_positive', '2026-05-01T00:00:00Z');
+                    INSERT INTO learning_calibrations (
+                        id,
+                        calibration_id,
+                        scope_repo,
+                        path_class,
+                        signal_kind,
+                        evidence_count,
+                        confidence,
+                        status,
+                        created_at,
+                        updated_at
+                    ) VALUES (
+                        1,
+                        'cal-activation-tie',
+                        'owner/repo',
+                        'code',
+                        'local_false_positive',
+                        3,
+                        'medium',
+                        'active',
+                        '2026-05-01T00:00:00Z',
+                        '2026-05-01T00:00:00Z'
+                    );
+                    """
+                )
+                objects = dashboard_snapshot.sqlite_objects(connection)
+
+                health = dashboard_snapshot.calibration_health_counts(
+                    connection,
+                    objects=objects,
+                    repo="owner/repo",
+                    limit=5,
+                )
+
+            self.assertEqual(health["status"], "warming_up")
+            self.assertEqual(health["recent"][0]["runs_after"], 0)
+            self.assertEqual(health["recent"][0]["target_after"], 0)
 
     def test_workspace_status_hashes_diff_without_exposing_body_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

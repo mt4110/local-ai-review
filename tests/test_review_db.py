@@ -29,7 +29,12 @@ from review_db import (  # noqa: E402
     sqlite_db_path,
     table_counts,
 )
-from llreview import POSTGRES_COPY_NULL, postgres_copy_value  # noqa: E402
+from llreview import (  # noqa: E402
+    POSTGRES_COPY_NULL,
+    learning_calibration_statuses_by_candidate,
+    postgres_copy_value,
+    review_path_class,
+)
 
 
 class ReviewDbDialectTests(unittest.TestCase):
@@ -46,6 +51,46 @@ class ReviewDbDialectTests(unittest.TestCase):
 
     def test_batched_values_deduplicates_in_order(self) -> None:
         self.assertEqual(batched_values([1, 2, 1, 3], batch_size=2), [[1, 2], [3]])
+
+    def test_review_path_class_preserves_dot_prefixed_paths(self) -> None:
+        self.assertEqual(review_path_class(".github/workflows/ci.yml"), "ops_config")
+        self.assertEqual(
+            review_path_class("./.github/workflows/ci.yml"),
+            "ops_config",
+        )
+        self.assertEqual(review_path_class(".private_docs/roadmap.md"), "docs")
+        self.assertEqual(review_path_class(".env.example"), "ops_config")
+
+    def test_learning_calibration_statuses_use_newest_row_per_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "review.db"
+            with sqlite3.connect(db_path) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.executescript(
+                    """
+                    CREATE TABLE learning_calibrations (
+                        id INTEGER PRIMARY KEY,
+                        candidate_id TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    INSERT INTO learning_calibrations (
+                        id,
+                        candidate_id,
+                        status,
+                        updated_at
+                    ) VALUES
+                        (1, 'candidate-a', 'active', '2026-05-01T00:00:00Z'),
+                        (2, 'candidate-a', 'retired', '2026-05-02T00:00:00Z'),
+                        (3, 'candidate-b', 'paused', '2026-05-02T00:00:00Z'),
+                        (4, 'candidate-b', 'active', '2026-05-02T00:00:00Z');
+                    """
+                )
+
+                statuses = learning_calibration_statuses_by_candidate(connection)
+
+            self.assertEqual(statuses["candidate-a"], "retired")
+            self.assertEqual(statuses["candidate-b"], "active")
 
 
 class ReviewDbConfigTests(unittest.TestCase):

@@ -48,6 +48,7 @@ AUTO_REVIEW_DIFF_BYTES_LIMIT = 150 * 1024
 AUTO_REVIEW_CHANGED_FILES_LIMIT = 50
 AUTO_REVIEW_MODEL_FILE_LIMIT = 50
 VALID_EXTERNAL_REASONS = {"teacher_model_valid", "external_valid"}
+LEARNING_CANDIDATE_THRESHOLD = 2
 REVIEW_HISTORY_TABLES = (
     "review_runs",
     "reviewed_files",
@@ -87,6 +88,12 @@ def bytes_label(value: int) -> str:
             return f"{amount:.1f} {unit}"
         amount /= 1024
     return f"{value} B"
+
+
+def percent_label(numerator: int | float, denominator: int | float) -> str:
+    if not denominator:
+        return "n/a"
+    return f"{(numerator / denominator) * 100:.1f}%"
 
 
 def shell_command(parts: list[Any]) -> str:
@@ -182,6 +189,80 @@ def repo_from_remote_url(value: str) -> str:
     if len(parts) >= 2 and parts[-2] and parts[-1]:
         return f"{parts[-2]}/{parts[-1]}"
     return ""
+
+
+def stable_fingerprint(*parts: Any) -> str:
+    normalized = "\n".join("" if part is None else str(part) for part in parts)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def normalized_repo_path(path: str) -> str:
+    normalized = path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.lower()
+
+
+def dashboard_doc_path(path: str) -> bool:
+    normalized = normalized_repo_path(path)
+    name = normalized.rsplit("/", 1)[-1]
+    return (
+        normalized.startswith(("docs/", "adr/", ".private_docs/"))
+        or name.startswith("readme")
+        or name.endswith((".md", ".mdx", ".rst"))
+    )
+
+
+def dashboard_generated_path(path: str) -> bool:
+    normalized = normalized_repo_path(path)
+    name = normalized.rsplit("/", 1)[-1]
+    if name in {"cargo.lock", "go.sum", "package-lock.json", "pnpm-lock.yaml", "poetry.lock", "uv.lock", "yarn.lock"}:
+        return True
+    return normalized.startswith(
+        (
+            "build/",
+            "coverage/",
+            "dist/",
+            "generated/",
+            "testdata/golden/",
+            "testdata/goldens/",
+            "third_party/",
+            "vendor/",
+            "__snapshots__/",
+        )
+    ) or normalized.endswith((".golden", ".snap"))
+
+
+def dashboard_path_class(path: str) -> str:
+    normalized = normalized_repo_path(path)
+    name = normalized.rsplit("/", 1)[-1]
+    if not normalized:
+        return "general"
+    if dashboard_generated_path(normalized):
+        return "generated"
+    if dashboard_doc_path(normalized):
+        return "docs"
+    if (
+        normalized.startswith((".github/", "config/", "infra/", "ops/", "scripts/"))
+        or name in {"dockerfile", "makefile"}
+        or name in {"package.json", "tsconfig.json", "jsconfig.json"}
+        or name.startswith(("eslint.config.", "playwright.config.", "vite.config."))
+        or name.endswith((".yml", ".yaml", ".toml", ".ini", ".env", ".env.example"))
+    ):
+        return "ops_config"
+    if (
+        "test" in normalized
+        or "spec" in normalized
+        or normalized.endswith(("_test.py", ".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx"))
+    ):
+        return "test"
+    if any(part in normalized for part in ("schema", "migration", "openapi", "protobuf", "proto/")):
+        return "schema"
+    if any(part in normalized for part in ("auth", "permission", "security", "token", "secret")):
+        return "auth"
+    if any(part in normalized for part in ("api/", "routes/", "controller", "client", "server")):
+        return "api"
+    return "code"
 
 
 def detect_repo_name(root: Path, repo_override: str) -> str:
@@ -836,6 +917,70 @@ def empty_calibration_counts() -> dict[str, Any]:
     return {"active": 0, "recent": []}
 
 
+def empty_review_health() -> dict[str, Any]:
+    return {
+        "status": "no_data",
+        "summary": "No scored review evidence is visible in this scope.",
+        "local_findings": 0,
+        "scored_local_findings": 0,
+        "useful": 0,
+        "false_positive": 0,
+        "unclear": 0,
+        "watch_only": 0,
+        "missed": 0,
+        "covered": 0,
+        "useful_rate": "n/a",
+        "false_positive_rate": "n/a",
+        "unclear_rate": "n/a",
+        "missed_to_covered_ratio": "n/a",
+        "local_item_verdicts": {},
+        "top_local_reasons": [],
+    }
+
+
+def empty_stamp_stock() -> dict[str, Any]:
+    return {
+        "external_stamp_inbox": 0,
+        "review_gap_stamp_inbox": 0,
+        "unscored_runs": 0,
+        "candidate_activation_inbox": 0,
+        "candidate_needs_data": 0,
+        "backfill_pending": 0,
+        "total": 0,
+    }
+
+
+def empty_learning_candidate_stock() -> dict[str, Any]:
+    return {
+        "threshold": LEARNING_CANDIDATE_THRESHOLD,
+        "total": 0,
+        "proposed": 0,
+        "active": 0,
+        "paused": 0,
+        "retired": 0,
+        "needs_more_data": 0,
+        "activation_inbox": 0,
+        "by_signal": {},
+    }
+
+
+def empty_calibration_health() -> dict[str, Any]:
+    return {
+        "status": "no_active",
+        "summary": "No active calibration is visible in this scope.",
+        "active": 0,
+        "supported": 0,
+        "promising": 0,
+        "insufficient_recent_runs": 0,
+        "thin_evidence": 0,
+        "watch_missed": 0,
+        "watch_false_positives": 0,
+        "needs_audit": 0,
+        "with_recent_runs": 0,
+        "recent": [],
+    }
+
+
 def safe_calibration_counts(raw: dict[str, Any]) -> dict[str, Any]:
     return {
         "active": int(raw.get("active") or 0),
@@ -883,6 +1028,18 @@ def sqlite_objects(connection: sqlite3.Connection) -> dict[str, set[str]]:
 
 def has_object(objects: dict[str, set[str]], name: str) -> bool:
     return name in objects.get("table", set()) or name in objects.get("view", set())
+
+
+def object_columns(connection: sqlite3.Connection, name: str) -> set[str]:
+    try:
+        rows = connection.execute(f"PRAGMA table_info({name})").fetchall()
+    except sqlite3.Error:
+        return set()
+    return {str(row["name"] if isinstance(row, sqlite3.Row) else row[1]) for row in rows}
+
+
+def has_columns(connection: sqlite3.Connection, name: str, required: set[str]) -> bool:
+    return required.issubset(object_columns(connection, name))
 
 
 def latest_external_verdict_stats(
@@ -935,10 +1092,13 @@ def latest_external_verdict_stats(
     label_counts = {
         "training_ready_external_examples": 0,
         "human_gate_external_examples": 0,
+        "missed_by_local": 0,
         "covered_by_local": 0,
         "teacher_false_positive": 0,
         "needs_human_review": 0,
         "unlabeled_external_items": 0,
+        "external_stamp_inbox": 0,
+        "review_gap_stamp_inbox": 0,
     }
     reason_counts: dict[str, int] = {}
     for row in rows:
@@ -950,21 +1110,699 @@ def latest_external_verdict_stats(
         if verdict == "covered_by_local" or linked:
             label_counts["covered_by_local"] += count
         elif verdict == "missed_by_local" and reason in VALID_EXTERNAL_REASONS:
+            label_counts["missed_by_local"] += count
             label_counts["training_ready_external_examples"] += count
         elif verdict == "missed_by_local":
+            label_counts["missed_by_local"] += count
+            label_counts["review_gap_stamp_inbox"] += count
             label_counts["human_gate_external_examples"] += count
         elif verdict == "teacher_false_positive":
             label_counts["teacher_false_positive"] += count
         elif verdict == "needs_human_review":
             label_counts["needs_human_review"] += count
+            label_counts["review_gap_stamp_inbox"] += count
             label_counts["human_gate_external_examples"] += count
         elif verdict == "unscored":
             label_counts["unlabeled_external_items"] += count
+            label_counts["external_stamp_inbox"] += count
             label_counts["human_gate_external_examples"] += count
     return {
         **label_counts,
         "reason_counts": dict(sorted(reason_counts.items(), key=lambda item: (-item[1], item[0]))[:12]),
     }
+
+
+def local_item_verdict_stats(
+    connection: sqlite3.Connection,
+    *,
+    objects: dict[str, set[str]],
+    repo: str,
+) -> dict[str, Any]:
+    if not (
+        has_object(objects, "item_verdicts")
+        and has_object(objects, "review_items")
+        and has_object(objects, "review_runs")
+        and has_columns(connection, "review_items", {"id", "run_id", "source", "path"})
+        and has_columns(connection, "review_runs", {"id", "repo"})
+        and has_columns(connection, "item_verdicts", {"id", "target_kind", "target_id", "verdict", "reason"})
+    ):
+        return {"verdict_counts": {}, "reason_rows": []}
+    repo_filter = ""
+    params: list[Any] = []
+    if repo:
+        repo_filter = "AND runs.repo = ?"
+        params.append(repo)
+    rows = connection.execute(
+        f"""
+        SELECT
+            verdicts.verdict,
+            COALESCE(NULLIF(verdicts.reason, ''), '(none)') AS reason,
+            items.source,
+            items.path,
+            COUNT(*) AS total
+        FROM item_verdicts AS verdicts
+        JOIN review_items AS items
+        ON items.id = verdicts.target_id
+        JOIN review_runs AS runs
+        ON runs.id = items.run_id
+        JOIN (
+            SELECT target_kind, target_id, MAX(id) AS id
+            FROM item_verdicts
+            GROUP BY target_kind, target_id
+        ) AS latest
+        ON latest.id = verdicts.id
+        WHERE verdicts.target_kind = 'review_item'
+          {repo_filter}
+        GROUP BY verdicts.verdict, reason, items.source, items.path
+        ORDER BY total DESC, verdicts.verdict, reason, items.source, items.path
+        """,
+        params,
+    ).fetchall()
+    verdict_counts: dict[str, int] = {}
+    reason_counts: dict[tuple[str, str], int] = {}
+    for row in rows:
+        verdict = str(row["verdict"] or "")
+        reason = str(row["reason"] or "(none)")
+        count = int(row["total"] or 0)
+        verdict_counts[verdict] = verdict_counts.get(verdict, 0) + count
+        if verdict in {"false_positive", "watch_only", "unclear"}:
+            reason_counts[(verdict, reason)] = reason_counts.get((verdict, reason), 0) + count
+    reason_rows = [
+        {"verdict": verdict, "reason": reason, "count": count}
+        for (verdict, reason), count in sorted(reason_counts.items(), key=lambda item: (-item[1], item[0]))
+    ][:8]
+    return {"verdict_counts": verdict_counts, "reason_rows": reason_rows}
+
+
+def review_health_counts(
+    connection: sqlite3.Connection,
+    *,
+    objects: dict[str, set[str]],
+    repo: str,
+    external_stats: dict[str, Any],
+) -> dict[str, Any]:
+    health = empty_review_health()
+    if has_object(objects, "review_run_summary"):
+        where = ""
+        params: list[Any] = []
+        if repo:
+            where = "WHERE repo = ?"
+            params.append(repo)
+        row = connection.execute(
+            f"""
+            SELECT
+                SUM(findings_count) AS local_findings,
+                SUM(
+                    CASE
+                        WHEN useful_findings_fixed IS NOT NULL THEN findings_count
+                        ELSE 0
+                    END
+                ) AS scored_local_findings,
+                SUM(useful_findings_fixed) AS useful,
+                SUM(false_positives) AS false_positive,
+                SUM(unclear_findings) AS unclear
+            FROM review_run_summary
+            {where}
+            """,
+            params,
+        ).fetchone()
+        health.update(
+            {
+                "local_findings": int((row or {})["local_findings"] or 0) if row else 0,
+                "scored_local_findings": int((row or {})["scored_local_findings"] or 0) if row else 0,
+                "useful": int((row or {})["useful"] or 0) if row else 0,
+                "false_positive": int((row or {})["false_positive"] or 0) if row else 0,
+                "unclear": int((row or {})["unclear"] or 0) if row else 0,
+            }
+        )
+    item_stats = local_item_verdict_stats(connection, objects=objects, repo=repo)
+    item_verdicts = item_stats.get("verdict_counts", {}) if isinstance(item_stats, dict) else {}
+    health["watch_only"] = int(item_verdicts.get("watch_only", 0) or 0)
+    health["local_item_verdicts"] = item_verdicts
+    health["top_local_reasons"] = item_stats.get("reason_rows", []) if isinstance(item_stats, dict) else []
+    health["missed"] = int(external_stats.get("missed_by_local") or 0)
+    health["covered"] = int(external_stats.get("covered_by_local") or 0)
+    local_feedback_total = int(health["useful"]) + int(health["false_positive"]) + int(health["unclear"])
+    scored_local_findings = int(health["scored_local_findings"])
+    local_rate_denominator = scored_local_findings or local_feedback_total
+    health["useful_rate"] = percent_label(int(health["useful"]), local_rate_denominator)
+    health["false_positive_rate"] = percent_label(int(health["false_positive"]), local_rate_denominator)
+    health["unclear_rate"] = percent_label(int(health["unclear"]), local_rate_denominator)
+    external_total = int(health["missed"]) + int(health["covered"])
+    health["missed_to_covered_ratio"] = percent_label(int(health["missed"]), external_total)
+
+    if not int(health["local_findings"]) and not external_total:
+        status = "no_data"
+        summary = "No scored review evidence is visible in this scope."
+    elif scored_local_findings == 0 and int(health["local_findings"]) > 0:
+        status = "needs_scoring"
+        summary = "Local findings exist, but run-level scoring is not complete yet."
+    elif int(health["false_positive"]) > int(health["useful"]) and int(health["false_positive"]) >= 3:
+        status = "watch_false_positive_rate"
+        summary = "False positives are outweighing useful findings in scored runs."
+    elif int(health["missed"]) > int(health["covered"]) and int(health["missed"]) >= 2:
+        status = "watch_recall"
+        summary = "Missed external examples are ahead of covered examples."
+    else:
+        status = "steady"
+        summary = "Scored review evidence is balanced enough for normal calibration work."
+    health["status"] = status
+    health["summary"] = summary
+    return health
+
+
+def latest_calibration_statuses(connection: sqlite3.Connection) -> dict[str, str]:
+    if not has_columns(connection, "learning_calibrations", {"candidate_id", "status", "updated_at", "id"}):
+        return {}
+    rows = connection.execute(
+        """
+        SELECT candidate_id, status, updated_at, id
+        FROM learning_calibrations
+        WHERE candidate_id != ''
+        ORDER BY updated_at DESC, id DESC
+        """
+    ).fetchall()
+    statuses: dict[str, str] = {}
+    for row in rows:
+        candidate_id = str(row["candidate_id"] or "")
+        status = str(row["status"] or "")
+        if not candidate_id or not status:
+            continue
+        statuses.setdefault(candidate_id, status)
+    return statuses
+
+
+def register_candidate(
+    counts: dict[str, Any],
+    *,
+    candidate_id: str,
+    candidate_kind: str,
+    signal_kind: str,
+    status: str,
+) -> None:
+    if status in {"active", "paused", "retired"}:
+        effective_status = status
+    elif candidate_kind == "needs_data":
+        effective_status = "needs_more_data"
+    else:
+        effective_status = "proposed"
+    counts["total"] += 1
+    counts[effective_status] = int(counts.get(effective_status, 0) or 0) + 1
+    counts["by_signal"][signal_kind] = counts["by_signal"].get(signal_kind, 0) + 1
+    if candidate_kind in {"prompt_candidate", "rule_candidate"} and effective_status == "proposed":
+        counts["activation_inbox"] += 1
+
+
+def calibration_cutoff_at(calibration: sqlite3.Row) -> str:
+    return str(sqlite_row_get(calibration, "created_at") or calibration["updated_at"] or "")
+
+
+def learning_candidate_stock(
+    connection: sqlite3.Connection,
+    *,
+    objects: dict[str, set[str]],
+    repo: str,
+    threshold: int = LEARNING_CANDIDATE_THRESHOLD,
+) -> dict[str, Any]:
+    counts = empty_learning_candidate_stock()
+    counts["threshold"] = threshold
+    statuses = latest_calibration_statuses(connection) if has_object(objects, "learning_calibrations") else {}
+    repo_label = repo or "global"
+
+    if (
+        has_object(objects, "item_verdicts")
+        and has_object(objects, "review_items")
+        and has_object(objects, "review_runs")
+        and has_columns(connection, "review_items", {"id", "run_id", "source", "path"})
+        and has_columns(connection, "review_runs", {"id", "repo"})
+        and has_columns(connection, "item_verdicts", {"id", "target_kind", "target_id", "verdict", "reason"})
+    ):
+        repo_filter = ""
+        params: list[Any] = []
+        if repo:
+            repo_filter = "AND runs.repo = ?"
+            params.append(repo)
+        rows = connection.execute(
+            f"""
+            SELECT
+                items.source,
+                verdicts.verdict,
+                COALESCE(NULLIF(verdicts.reason, ''), '(none)') AS reason,
+                items.path,
+                COUNT(*) AS total
+            FROM item_verdicts AS verdicts
+            JOIN review_items AS items
+            ON items.id = verdicts.target_id
+            JOIN review_runs AS runs
+            ON runs.id = items.run_id
+            JOIN (
+                SELECT target_kind, target_id, MAX(id) AS id
+                FROM item_verdicts
+                GROUP BY target_kind, target_id
+            ) AS latest
+            ON latest.id = verdicts.id
+            WHERE verdicts.target_kind = 'review_item'
+              AND verdicts.verdict IN ('false_positive', 'watch_only', 'unclear')
+              {repo_filter}
+            GROUP BY items.source, verdicts.verdict, reason, items.path
+            """,
+            params,
+        ).fetchall()
+        grouped: dict[tuple[str, str, str, str], int] = {}
+        for row in rows:
+            key = (
+                str(row["source"] or "model"),
+                str(row["verdict"] or ""),
+                str(row["reason"] or "(none)"),
+                dashboard_path_class(str(row["path"] or "")),
+            )
+            grouped[key] = grouped.get(key, 0) + int(row["total"] or 0)
+        for (source, verdict, reason, path_class), total in grouped.items():
+            if total < threshold:
+                continue
+            candidate_kind = "rule_candidate" if source == "static" else "prompt_candidate"
+            signal_kind = "local_false_positive" if verdict == "false_positive" else f"local_{verdict}"
+            candidate_id = stable_fingerprint(
+                "learning_candidate",
+                repo_label,
+                candidate_kind,
+                signal_kind,
+                source,
+                verdict,
+                reason,
+                path_class,
+            )
+            register_candidate(
+                counts,
+                candidate_id=candidate_id,
+                candidate_kind=candidate_kind,
+                signal_kind=signal_kind,
+                status=statuses.get(candidate_id, "proposed"),
+            )
+
+    if (
+        has_object(objects, "external_items")
+        and has_object(objects, "item_verdicts")
+        and has_columns(connection, "external_items", {"id", "repo", "source", "path"})
+        and has_columns(connection, "item_verdicts", {"id", "target_kind", "target_id", "verdict"})
+    ):
+        repo_filter = ""
+        params = []
+        if repo:
+            repo_filter = "WHERE external_items.repo = ?"
+            params.append(repo)
+        rows = connection.execute(
+            f"""
+            SELECT
+                COALESCE(NULLIF(verdicts.verdict, ''), 'unscored') AS verdict,
+                external_items.source,
+                external_items.path,
+                COUNT(*) AS total
+            FROM external_items
+            LEFT JOIN (
+                SELECT item_verdicts.*
+                FROM item_verdicts
+                JOIN (
+                    SELECT target_kind, target_id, MAX(id) AS id
+                    FROM item_verdicts
+                    GROUP BY target_kind, target_id
+                ) AS latest
+                ON latest.id = item_verdicts.id
+            ) AS verdicts
+            ON verdicts.target_kind = 'external_item'
+            AND verdicts.target_id = external_items.id
+            {repo_filter}
+            GROUP BY verdict, external_items.source, external_items.path
+            """,
+            params,
+        ).fetchall()
+        grouped: dict[tuple[str, str, str], int] = {}
+        for row in rows:
+            key = (
+                str(row["verdict"] or "unscored"),
+                str(row["source"] or "external"),
+                dashboard_path_class(str(row["path"] or "")),
+            )
+            grouped[key] = grouped.get(key, 0) + int(row["total"] or 0)
+        for (verdict, source, path_class), total in grouped.items():
+            if total < threshold:
+                continue
+            if verdict == "missed_by_local":
+                candidate_kind = "prompt_candidate"
+                signal_kind = "external_missed"
+                candidate_id = stable_fingerprint(
+                    "learning_candidate",
+                    repo_label,
+                    candidate_kind,
+                    signal_kind,
+                    source,
+                    verdict,
+                    path_class,
+                )
+            elif verdict in {"unscored", "out_of_scope"}:
+                candidate_kind = "needs_data"
+                signal_kind = "external_unscored"
+                candidate_id = stable_fingerprint(
+                    "learning_candidate",
+                    repo_label,
+                    candidate_kind,
+                    signal_kind,
+                    source,
+                    verdict,
+                    path_class,
+                )
+            else:
+                continue
+            register_candidate(
+                counts,
+                candidate_id=candidate_id,
+                candidate_kind=candidate_kind,
+                signal_kind=signal_kind,
+                status=statuses.get(candidate_id, "needs_more_data" if candidate_kind == "needs_data" else "proposed"),
+            )
+
+    if has_object(objects, "github_backfill_queue") and has_columns(
+        connection,
+        "github_backfill_queue",
+        {"repo", "source_kind", "state", "skip_reason", "actionable_external_comments"},
+    ):
+        repo_filter = ""
+        params = []
+        if repo:
+            repo_filter = "WHERE repo = ?"
+            params.append(repo)
+        rows = connection.execute(
+            f"""
+            SELECT
+                source_kind,
+                state,
+                COALESCE(NULLIF(skip_reason, ''), state) AS reason,
+                COUNT(*) AS row_count,
+                SUM(actionable_external_comments) AS signal_count
+            FROM github_backfill_queue
+            {repo_filter}
+            GROUP BY source_kind, state, reason
+            """,
+            params,
+        ).fetchall()
+        for row in rows:
+            state = str(row["state"] or "")
+            if state not in {"pending", "deferred", "failed_retryable"}:
+                continue
+            evidence = int(row["signal_count"] or 0) or int(row["row_count"] or 0)
+            if evidence < threshold:
+                continue
+            signal_kind = "backfill_queue"
+            candidate_id = stable_fingerprint(
+                "learning_candidate",
+                repo_label,
+                "needs_data",
+                signal_kind,
+                str(row["source_kind"] or ""),
+                state,
+                str(row["reason"] or ""),
+            )
+            register_candidate(
+                counts,
+                candidate_id=candidate_id,
+                candidate_kind="needs_data",
+                signal_kind=signal_kind,
+                status=statuses.get(candidate_id, "needs_more_data"),
+            )
+    return counts
+
+
+def calibration_recent_target_evidence(
+    connection: sqlite3.Connection,
+    *,
+    objects: dict[str, set[str]],
+    calibration: sqlite3.Row,
+    repo: str,
+) -> int:
+    signal_kind = str(calibration["signal_kind"] or "")
+    path_class = str(calibration["path_class"] or "")
+    cutoff_at = calibration_cutoff_at(calibration)
+    scope_repo = str(calibration["scope_repo"] or "")
+    repo_filter_value = repo or (scope_repo if scope_repo != "global" else "")
+
+    if signal_kind in {"local_false_positive", "local_watch_only", "local_unclear"}:
+        verdict = {
+            "local_false_positive": "false_positive",
+            "local_watch_only": "watch_only",
+            "local_unclear": "unclear",
+        }[signal_kind]
+        if not (
+            has_object(objects, "item_verdicts")
+            and has_object(objects, "review_items")
+            and has_object(objects, "review_runs")
+            and has_columns(connection, "review_items", {"id", "run_id", "path"})
+            and has_columns(connection, "review_runs", {"id", "repo"})
+            and has_columns(connection, "item_verdicts", {"id", "target_kind", "target_id", "verdict", "scored_at"})
+        ):
+            return 0
+        repo_filter = ""
+        params: list[Any] = [cutoff_at, verdict]
+        if repo_filter_value:
+            repo_filter = "AND runs.repo = ?"
+            params.append(repo_filter_value)
+        rows = connection.execute(
+            f"""
+            SELECT items.path, COUNT(*) AS total
+            FROM item_verdicts AS verdicts
+            JOIN review_items AS items
+            ON items.id = verdicts.target_id
+            JOIN review_runs AS runs
+            ON runs.id = items.run_id
+            JOIN (
+                SELECT target_kind, target_id, MAX(id) AS id
+                FROM item_verdicts
+                GROUP BY target_kind, target_id
+            ) AS latest
+            ON latest.id = verdicts.id
+            WHERE verdicts.target_kind = 'review_item'
+              AND verdicts.scored_at > ?
+              AND verdicts.verdict = ?
+              {repo_filter}
+            GROUP BY items.path
+            """,
+            params,
+        ).fetchall()
+        return sum(int(row["total"] or 0) for row in rows if dashboard_path_class(str(row["path"] or "")) == path_class)
+
+    if signal_kind == "external_missed":
+        if not (
+            has_object(objects, "external_items")
+            and has_object(objects, "item_verdicts")
+            and has_columns(connection, "external_items", {"id", "repo", "path"})
+            and has_columns(
+                connection,
+                "item_verdicts",
+                {"id", "target_kind", "target_id", "verdict", "scored_at"},
+            )
+        ):
+            return 0
+        repo_filter = ""
+        params = [cutoff_at]
+        if repo_filter_value:
+            repo_filter = "AND external_items.repo = ?"
+            params.append(repo_filter_value)
+        rows = connection.execute(
+            f"""
+            SELECT external_items.path, verdicts.verdict, COUNT(*) AS total
+            FROM external_items
+            LEFT JOIN (
+                SELECT item_verdicts.*
+                FROM item_verdicts
+                JOIN (
+                    SELECT target_kind, target_id, MAX(id) AS id
+                    FROM item_verdicts
+                    GROUP BY target_kind, target_id
+                ) AS latest
+                ON latest.id = item_verdicts.id
+            ) AS verdicts
+            ON verdicts.target_kind = 'external_item'
+            AND verdicts.target_id = external_items.id
+            WHERE verdicts.scored_at > ?
+              AND verdicts.verdict = 'missed_by_local'
+              {repo_filter}
+            GROUP BY external_items.path, verdicts.verdict
+            """,
+            params,
+        ).fetchall()
+        return sum(int(row["total"] or 0) for row in rows if dashboard_path_class(str(row["path"] or "")) == path_class)
+    return 0
+
+
+def calibration_runs_after(
+    connection: sqlite3.Connection,
+    *,
+    objects: dict[str, set[str]],
+    calibration: sqlite3.Row,
+    repo: str,
+) -> int:
+    if has_object(objects, "review_runs") and has_columns(connection, "review_runs", {"created_at", "repo"}):
+        table = "review_runs"
+    elif has_object(objects, "review_run_summary") and has_columns(
+        connection,
+        "review_run_summary",
+        {"created_at", "repo"},
+    ):
+        table = "review_run_summary"
+    else:
+        return 0
+    cutoff_at = calibration_cutoff_at(calibration)
+    scope_repo = str(calibration["scope_repo"] or "")
+    repo_filter_value = repo or (scope_repo if scope_repo != "global" else "")
+    repo_filter = ""
+    params: list[Any] = [cutoff_at]
+    if repo_filter_value:
+        repo_filter = "AND repo = ?"
+        params.append(repo_filter_value)
+    row = connection.execute(
+        f"""
+        SELECT COUNT(*) AS total
+        FROM {table}
+        WHERE created_at > ?
+          {repo_filter}
+        """,
+        params,
+    ).fetchone()
+    return int(row["total"] or 0) if row else 0
+
+
+def calibration_health_counts(
+    connection: sqlite3.Connection,
+    *,
+    objects: dict[str, set[str]],
+    repo: str,
+    limit: int,
+) -> dict[str, Any]:
+    health = empty_calibration_health()
+    if not (
+        has_object(objects, "learning_calibrations")
+        and has_columns(
+            connection,
+            "learning_calibrations",
+            {
+                "calibration_id",
+                "id",
+                "scope_repo",
+                "path_class",
+                "signal_kind",
+                "evidence_count",
+                "confidence",
+                "status",
+                "updated_at",
+            },
+        )
+    ):
+        return health
+    repo_filter = ""
+    params: list[Any] = []
+    if repo:
+        repo_filter = "AND (scope_repo = '' OR scope_repo = ?)"
+        params.append(repo)
+    rows = connection.execute(
+        f"""
+        SELECT *
+        FROM learning_calibrations
+        WHERE status = 'active'
+          {repo_filter}
+        ORDER BY updated_at DESC, id DESC
+        """,
+        params,
+    ).fetchall()
+    total = int(
+        connection.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM learning_calibrations
+            WHERE status = 'active'
+              {repo_filter}
+            """,
+            params,
+        ).fetchone()[0]
+    )
+    health["active"] = total
+    recent: list[dict[str, Any]] = []
+    status_counts: dict[str, int] = {}
+    for row in rows:
+        evidence_count = int(row["evidence_count"] or 0)
+        runs_after = calibration_runs_after(connection, objects=objects, calibration=row, repo=repo)
+        target_after = calibration_recent_target_evidence(connection, objects=objects, calibration=row, repo=repo)
+        if evidence_count < LEARNING_CANDIDATE_THRESHOLD:
+            status = "thin_evidence"
+        elif runs_after <= 0:
+            status = "insufficient_recent_runs"
+        elif target_after > 0 and str(row["signal_kind"] or "") == "external_missed":
+            status = "watch_missed"
+        elif target_after > 0 and str(row["signal_kind"] or "") in {
+            "local_false_positive",
+            "local_watch_only",
+            "local_unclear",
+        }:
+            status = "watch_false_positives"
+        else:
+            status = "promising"
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if runs_after > 0:
+            health["with_recent_runs"] += 1
+        recent.append(
+            {
+                "calibration_id": str(row["calibration_id"] or "")[:12],
+                "scope_repo": str(row["scope_repo"] or "") or "global",
+                "path_class": str(row["path_class"] or ""),
+                "signal_kind": str(row["signal_kind"] or ""),
+                "evidence_count": evidence_count,
+                "confidence": str(row["confidence"] or ""),
+                "updated_at": str(row["updated_at"] or ""),
+                "runs_after": runs_after,
+                "target_after": target_after,
+                "status": status,
+            }
+        )
+    for key in ("promising", "insufficient_recent_runs", "thin_evidence", "watch_missed", "watch_false_positives"):
+        health[key] = int(status_counts.get(key, 0))
+    health["supported"] = int(status_counts.get("promising", 0))
+    health["needs_audit"] = int(health["active"]) - int(health["supported"])
+    health["recent"] = recent[:limit] if limit > 0 else recent
+    if not total:
+        health["status"] = "no_active"
+        health["summary"] = "No active calibration is visible in this scope."
+    elif int(health["watch_missed"]) or int(health["watch_false_positives"]):
+        health["status"] = "needs_audit"
+        health["summary"] = "Some active calibrations have later same-class counter evidence."
+    elif int(health["insufficient_recent_runs"]) or int(health["thin_evidence"]):
+        health["status"] = "warming_up"
+        health["summary"] = "Active calibrations need more later runs before they look settled."
+    else:
+        health["status"] = "supported"
+        health["summary"] = "Active calibrations have later runs without same-class counter evidence."
+    return health
+
+
+def stamp_stock_counts(
+    *,
+    runs: dict[str, Any],
+    external_stats: dict[str, Any],
+    backfill: dict[str, Any],
+    candidate_stock: dict[str, Any],
+) -> dict[str, Any]:
+    stock = {
+        "external_stamp_inbox": int(external_stats.get("external_stamp_inbox") or 0),
+        "review_gap_stamp_inbox": int(external_stats.get("review_gap_stamp_inbox") or 0),
+        "unscored_runs": int(runs.get("unscored") or 0),
+        "candidate_activation_inbox": int(candidate_stock.get("activation_inbox") or 0),
+        "candidate_needs_data": int(candidate_stock.get("needs_more_data") or 0),
+        "backfill_pending": int(backfill.get("by_state", {}).get("pending", 0) or 0),
+    }
+    stock["total"] = (
+        stock["external_stamp_inbox"]
+        + stock["review_gap_stamp_inbox"]
+        + stock["unscored_runs"]
+        + stock["candidate_activation_inbox"]
+    )
+    return stock
 
 
 def review_history_growth(
@@ -1107,13 +1945,18 @@ def empty_snapshot_sections(*, postgres_status: str = "optional") -> dict[str, A
         "tables": {},
         "runs": empty_run_counts(),
         "external": empty_external_counts(),
+        "review_health": empty_review_health(),
+        "stamp_stock": empty_stamp_stock(),
         "backfill_queue": empty_backfill_counts(),
         "calibrations": empty_calibration_counts(),
+        "calibration_health": empty_calibration_health(),
+        "learning_candidates": empty_learning_candidate_stock(),
         "learning_readiness": {
             "training_ready_external_examples": 0,
             "human_gate_external_examples": 0,
             "covered_by_local": 0,
             "active_calibrations": 0,
+            "candidate_activation_inbox": 0,
             "postgres_optional_backend": postgres_status,
         },
         "backlog": {
@@ -1192,20 +2035,55 @@ def next_commands(payload: dict[str, Any]) -> list[dict[str, str]]:
             }
         )
     backlog = payload.get("backlog", {})
-    if int(backlog.get("unscored_runs") or 0) > 0:
+    stamp_stock = payload.get("stamp_stock") if isinstance(payload.get("stamp_stock"), dict) else {}
+    review_health = payload.get("review_health") if isinstance(payload.get("review_health"), dict) else {}
+    calibration_health = (
+        payload.get("calibration_health")
+        if isinstance(payload.get("calibration_health"), dict)
+        else {}
+    )
+    unscored_runs = int(stamp_stock.get("unscored_runs", backlog.get("unscored_runs", 0)) or 0)
+    if unscored_runs > 0:
         commands.append(
             {
                 "label": "Drain scoring inbox",
                 "command": shell_command(["llreview", "scoring-pump", *repo_parts]),
-                "reason": f"{backlog['unscored_runs']} run(s) are still unscored.",
+                "reason": f"{unscored_runs} run(s) are still unscored.",
             }
         )
-    if int(backlog.get("human_gate_external_examples") or 0) > 0:
+    external_stamps = int(stamp_stock.get("external_stamp_inbox") or 0)
+    if external_stamps > 0:
+        commands.append(
+            {
+                "label": "Open external stamp inbox",
+                "command": shell_command(["llreview", "learn-review", "--no-activate", *repo_parts]),
+                "reason": f"{external_stamps} external item(s) need an operator verdict before learning export.",
+            }
+        )
+    review_gap_stamps = int(stamp_stock.get("review_gap_stamp_inbox") or 0)
+    if review_gap_stamps > 0:
         commands.append(
             {
                 "label": "Stamp review gaps",
                 "command": shell_command(["llreview", "review-gap-stamp-pump", *repo_parts]),
-                "reason": f"{backlog['human_gate_external_examples']} external example(s) need an operator verdict.",
+                "reason": f"{review_gap_stamps} review-gap example(s) need a human gate.",
+            }
+        )
+    activation_inbox = int(stamp_stock.get("candidate_activation_inbox") or 0)
+    if activation_inbox > 0:
+        commands.append(
+            {
+                "label": "Preview next calibration",
+                "command": shell_command(["llreview", "learn-next", *repo_parts]),
+                "reason": f"{activation_inbox} proposed prompt/rule candidate(s) are waiting for risk review.",
+            }
+        )
+    if review_health.get("status") in {"watch_false_positive_rate", "watch_recall"}:
+        commands.append(
+            {
+                "label": "Refresh learning scoreboard",
+                "command": shell_command(["llreview", "learning-scoreboard", *repo_parts]),
+                "reason": str(review_health.get("summary") or "Review health needs aggregate inspection."),
             }
         )
     if int(backlog.get("backfill_pending") or 0) > 0:
@@ -1221,7 +2099,10 @@ def next_commands(payload: dict[str, Any]) -> list[dict[str, str]]:
             {
                 "label": "Audit active calibration",
                 "command": shell_command(["llreview", "learn-audit", *repo_parts]),
-                "reason": "Active DB calibrations should be checked against later evidence.",
+                "reason": str(
+                    calibration_health.get("summary")
+                    or "Active DB calibrations should be checked against later evidence."
+                ),
             }
         )
     if not commands:
@@ -1338,13 +2219,18 @@ def dashboard_snapshot(args: argparse.Namespace) -> dict[str, Any]:
                 "tables": {},
                 "runs": empty_run_counts(),
                 "external": empty_external_counts(),
+                "review_health": empty_review_health(),
+                "stamp_stock": empty_stamp_stock(),
                 "backfill_queue": empty_backfill_counts(),
                 "calibrations": empty_calibration_counts(),
+                "calibration_health": empty_calibration_health(),
+                "learning_candidates": empty_learning_candidate_stock(),
                 "learning_readiness": {
                     "training_ready_external_examples": 0,
                     "human_gate_external_examples": 0,
                     "covered_by_local": 0,
                     "active_calibrations": 0,
+                    "candidate_activation_inbox": 0,
                     "postgres_optional_backend": "not_ready",
                 },
                 "backlog": {
@@ -1381,6 +2267,38 @@ def dashboard_snapshot(args: argparse.Namespace) -> dict[str, Any]:
             safe_call({}, lambda: latest_external_verdict_stats(connection, repo=repo_scope))
             if has_object(objects, "external_items")
             else {}
+        )
+        review_health = safe_call(
+            empty_review_health(),
+            lambda: review_health_counts(
+                connection,
+                objects=objects,
+                repo=repo_scope,
+                external_stats=external_stats,
+            ),
+        )
+        candidate_stock = safe_call(
+            empty_learning_candidate_stock(),
+            lambda: learning_candidate_stock(
+                connection,
+                objects=objects,
+                repo=repo_scope,
+            ),
+        )
+        calibration_health = safe_call(
+            empty_calibration_health(),
+            lambda: calibration_health_counts(
+                connection,
+                objects=objects,
+                repo=repo_scope,
+                limit=args.limit,
+            ),
+        )
+        stamp_stock = stamp_stock_counts(
+            runs=runs,
+            external_stats=external_stats,
+            backfill=backfill,
+            candidate_stock=candidate_stock,
         )
         growth = (
             safe_call([], lambda: review_history_growth(connection, repo=repo_scope, limit=args.months))
@@ -1432,11 +2350,16 @@ def dashboard_snapshot(args: argparse.Namespace) -> dict[str, Any]:
             "tables": counts,
             "runs": runs,
             "external": external,
+            "review_health": review_health,
+            "stamp_stock": stamp_stock,
             "backfill_queue": backfill,
             "calibrations": calibrations,
+            "calibration_health": calibration_health,
+            "learning_candidates": candidate_stock,
             "learning_readiness": {
                 **external_stats,
                 "active_calibrations": int(calibrations.get("active") or 0),
+                "candidate_activation_inbox": int(candidate_stock.get("activation_inbox") or 0),
                 "postgres_optional_backend": "optional",
             },
             "backlog": {
