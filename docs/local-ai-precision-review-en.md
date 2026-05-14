@@ -185,6 +185,7 @@ llreview update
 llreview score
 llreview import-github-reviews 42
 llreview specbackfill-import-preview --specbackfill-json specbackfill.json
+llreview specbackfill-import-apply --specbackfill-json specbackfill.json --run <run-id>
 llreview training-export-splitter
 llreview learning-scoreboard
 llreview report
@@ -534,6 +535,16 @@ the run's current max finding ordinal. It does not write DB rows, call the
 GitHub API, check out PR code, execute PR code, post PR comments, or render raw
 body, raw evidence, or raw diff text. Use `--dry-run` to print the same preview
 without writing artifacts.
+
+`llreview specbackfill-import-apply --specbackfill-json specbackfill.json --run
+<run-id>` is the explicit opt-in write path. It reuses the same deterministic
+normalization and inserts only candidates whose preview action is
+`would_insert` into `review_items(source='specbackfill')`. It requires an
+existing `review_runs.id`, appends ordinals after the run's current max finding
+ordinal, and skips existing fingerprints and duplicate fingerprints in the same
+input. It still writes Markdown/JSON artifacts after the import, without
+rendering raw body text, raw evidence, or raw diff text. Use `--dry-run` to
+check the apply plan without writing rows or artifacts.
 
 For 20-minute scheduled operation, use `scripts/backfill-pump-scheduler.py`
 first. It is separate from the Discord watcher: a short one-shot launchd wrapper

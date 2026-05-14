@@ -140,6 +140,7 @@ llreview import-github-history --dry-run
 llreview backfill-pump
 llreview matcher-explain
 llreview specbackfill-import-preview --specbackfill-json specbackfill.json
+llreview specbackfill-import-apply --specbackfill-json specbackfill.json --run <run-id>
 llreview training-export-splitter
 llreview rule-candidate-extractor
 llreview learning-scoreboard
@@ -264,6 +265,8 @@ TTY では `llreview` が phase、elapsed、model-reviewed file count、finding/
 `llreview specbackfill-overlap --specbackfill-json specbackfill.json --repo owner/name --pr 42` は、`specbackfill check --format json --fail-on off` の findings と、既存DB内の local `review_items` / imported `external_items` の overlap を preview します。既定では local model finding だけを候補にし、DB writes、GitHub API、PR checkout、PR code execution、PR comment 投稿は行いません。結果は `out/review-history/specbackfill-overlap/` の Markdown/JSON artifact に保存され、raw body や raw diff ではなく id、path、line、rule id、digest だけを出します。確認だけなら `--dry-run` を使います。
 
 `llreview specbackfill-import-preview --specbackfill-json specbackfill.json --run <run-id>` は、`specbackfill` findings を `review_items(source='specbackfill')` の候補へ deterministic に正規化する import preview です。`run_id`、`item_type='finding'`、`source='specbackfill'`、path、line、rule id、fingerprint、evidence digest を artifact に出し、同じ run に同一 fingerprint がすでにある場合は `already_present`、入力内重複がある場合は `duplicate_input` として数えます。新規候補の ordinal は対象 run の既存 finding ordinal の後ろへ append する preview です。DB writes、GitHub API、PR checkout、PR code execution、PR comment 投稿は行わず、raw body / raw evidence / raw diff は出しません。`--dry-run` は artifact を書かずに同じ preview を表示します。
+
+`llreview specbackfill-import-apply --specbackfill-json specbackfill.json --run <run-id>` は、同じ deterministic 正規化を使って `preview_action='would_insert'` の候補だけを `review_items(source='specbackfill')` に保存する明示 opt-in command です。対象 run の既存 finding ordinal の後ろへ append し、既存 fingerprint や入力内 duplicate fingerprint は保存しません。保存後も Markdown/JSON artifact を書き、raw body / raw evidence / raw diff は出しません。確認だけなら `--dry-run` を使います。
 
 20分ごとの自動運用に載せる場合は、まず `scripts/backfill-pump-scheduler.py` を使います。これは Discord watcher とは別物で、短く起動して終了する launchd 用 one-shot wrapper です。既定は report-only、`LLREVIEW_BACKFILL_PUMP_MODE=dry-run` は一件 import の preview だけ、`LLREVIEW_BACKFILL_PUMP_MODE=import-one` だけが実 import です。wrapper は非 blocking lock で重複起動を避け、`llreview import-github-history --one` 本体も DB 横の import lock で並列 import を避けます。wrapper は `--min-interval-minutes 20` と `--retry-delay-minutes 60` を `llreview backfill-pump` に渡し、dry-run と queue refresh の同時指定を拒否します。通知を有効にしても、failure または imported/external item が増えた meaningful milestone だけを通知します。
 
