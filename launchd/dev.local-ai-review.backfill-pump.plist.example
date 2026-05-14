@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.local-ai-review.backfill-pump</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/YOU/dev/local-ai-review</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/YOU/dev/local-ai-review/scripts/backfill-pump-scheduler.py</string>
+    <string>--env-file</string>
+    <string>/Users/YOU/.config/local-ai-review-backfill-pump/env</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <key>StartInterval</key>
+  <integer>1200</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>/Users/YOU/Library/Logs/local-ai-review-backfill-pump/out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOU/Library/Logs/local-ai-review-backfill-pump/err.log</string>
+</dict>
+</plist>

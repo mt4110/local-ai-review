@@ -25,8 +25,11 @@ GitHub Actions の self-hosted runner で動かす、diff-only のローカル P
 - `.github/workflows/local-llm-review.yml`: MVP の GitHub Actions workflow。
 - `scripts/verify-workflow-policy.py`: workflow の静的セキュリティチェック。
 - `scripts/local-ai-review-watcher.py`: `status` / `wake-if-down` だけを実行する watcher。
+- `scripts/backfill-pump-scheduler.py`: `llreview backfill-pump` を launchd から安全に呼ぶ one-shot wrapper。
 - `config/local-ai-review-watcher.env.example`: watcher のローカル env file 例。
+- `config/local-ai-review-backfill-pump.env.example`: backfill pump scheduler の env file 例。
 - `launchd/dev.local-ai-review.watcher.discord.plist.example`: Discord interactions endpoint 用の launchd 例。
+- `launchd/dev.local-ai-review.backfill-pump.plist.example`: 20分間隔の backfill pump launchd 例。
 - `docs/local-llm-shutdown-runbook.md`: ローカル LLM を止めるための詳細手順書。
 - `docs/local-llm-watcher-design.md`: 常時監視 watcher / Discord 通知 / idle unload の設計。
 - `docs/local-llm-watcher-runtime-ops.md`: env file、Discord App、live status、launchd の運用手順。
