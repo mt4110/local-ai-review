@@ -602,6 +602,65 @@ class ImportGithubHistoryTests(unittest.TestCase):
             self.assertEqual(row[5], 100)
             self.assertIn("Preflight remote row: state=skipped", output.getvalue())
 
+    def test_one_real_reports_large_diff_as_deferred_before_import(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "review.db"
+            self.seed_remote_queue_row(db_path, changed_lines=10, signal=3)
+            args = self.import_history_args(db_path, dry_run=False)
+            args.max_changed_lines = 10
+
+            def fake_github_request(path: str, token: str) -> object:
+                if path == "/repos/mt4110/example":
+                    return {
+                        "full_name": "mt4110/example",
+                        "fork": False,
+                        "owner": {"login": "mt4110"},
+                    }
+                if path == "/repos/mt4110/example/pulls/42":
+                    return {
+                        "number": 42,
+                        "merged_at": "2026-05-02T00:00:00Z",
+                        "updated_at": "2026-05-03T00:00:00Z",
+                        "title": "Too large for one-at-a-time import",
+                        "head": {"sha": "def456"},
+                    }
+                raise AssertionError(path)
+
+            output = io.StringIO()
+            with mock.patch("llreview.github_token", return_value=("token", "test token")):
+                with mock.patch("llreview.github_request", side_effect=fake_github_request):
+                    with mock.patch(
+                        "llreview.github_paginated_request",
+                        return_value=[
+                            {
+                                "filename": "scripts/app.py",
+                                "changes": 20,
+                                "additions": 18,
+                                "deletions": 2,
+                                "status": "modified",
+                            }
+                        ],
+                    ):
+                        with mock.patch("llreview.backfill_actionable_external_count") as count_comments:
+                            with mock.patch("llreview.command_import_github_reviews") as importer:
+                                with contextlib.redirect_stdout(output):
+                                    command_import_github_history(args)
+
+            count_comments.assert_not_called()
+            importer.assert_not_called()
+            with sqlite_connection(db_path) as connection:
+                row = connection.execute(
+                    """
+                    SELECT state, skip_reason, attempt_count, actionable_external_comments
+                    FROM github_backfill_queue
+                    """
+                ).fetchone()
+
+            self.assertEqual(row, ("deferred", "deferred_large_diff", 1, 3))
+            self.assertIn("Preflight remote row: state=deferred", output.getvalue())
+            self.assertIn("DEFERRED: one-at-a-time import stopped before writes", output.getvalue())
+            self.assertNotIn("SKIPPED: one-at-a-time import stopped before writes", output.getvalue())
+
     def test_one_real_rechecks_generated_and_actionable_gates_before_import(self) -> None:
         cases = [
             (

@@ -13748,8 +13748,9 @@ def import_github_history_one(args: argparse.Namespace, *, db_path: Path) -> Non
                 f"files={candidate.changed_files} lines={candidate.changed_lines}"
             )
             if candidate.state != "pending":
+                status = "DEFERRED" if candidate.state == "deferred" else "SKIPPED"
                 print(
-                    "SKIPPED: one-at-a-time import stopped before writes "
+                    f"{status}: one-at-a-time import stopped before writes "
                     f"(reason={candidate.skip_reason or candidate.state})"
                 )
                 return
