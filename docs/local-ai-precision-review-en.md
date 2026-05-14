@@ -184,6 +184,7 @@ llreview calibration
 llreview update
 llreview score
 llreview import-github-reviews 42
+llreview specbackfill-import-preview --specbackfill-json specbackfill.json
 llreview training-export-splitter
 llreview learning-scoreboard
 llreview report
@@ -521,6 +522,18 @@ post PR comments, or mutate PR titles/bodies. The Markdown/JSON artifacts under
 `out/review-history/specbackfill-overlap/` render ids, paths, line numbers,
 rule ids, and digests instead of raw DB bodies or raw diff text. Use `--dry-run`
 to print the same preview without writing artifacts.
+
+`llreview specbackfill-import-preview --specbackfill-json specbackfill.json
+--run <run-id>` deterministically normalizes `specbackfill` findings into
+would-be `review_items(source='specbackfill')` records. It previews the run id,
+`item_type='finding'`, `source='specbackfill'`, path, line, rule id,
+fingerprint, and evidence digest, and marks matching fingerprints already
+present for the same run as `already_present` and duplicate fingerprints in the
+same input as `duplicate_input`. New candidates preview ordinals appended after
+the run's current max finding ordinal. It does not write DB rows, call the
+GitHub API, check out PR code, execute PR code, post PR comments, or render raw
+body, raw evidence, or raw diff text. Use `--dry-run` to print the same preview
+without writing artifacts.
 
 For 20-minute scheduled operation, use `scripts/backfill-pump-scheduler.py`
 first. It is separate from the Discord watcher: a short one-shot launchd wrapper

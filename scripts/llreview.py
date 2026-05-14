@@ -72,6 +72,7 @@ DEFAULT_CALIBRATION_RISK_GATE_DIR = TOOL_ROOT / "out" / "review-history" / "cali
 DEFAULT_PROMPT_REGRESSION_AUDIT_DIR = TOOL_ROOT / "out" / "review-history" / "prompt-regression-audit"
 DEFAULT_BACKFILL_PUMP_DIR = TOOL_ROOT / "out" / "review-history" / "backfill-pump"
 DEFAULT_SPECBACKFILL_OVERLAP_DIR = TOOL_ROOT / "out" / "review-history" / "specbackfill-overlap"
+DEFAULT_SPECBACKFILL_IMPORT_PREVIEW_DIR = TOOL_ROOT / "out" / "review-history" / "specbackfill-import-preview"
 DEFAULT_MATCHER_EXPLAIN_DIR = TOOL_ROOT / "out" / "review-history" / "matcher-explain"
 DEFAULT_TRAINING_EXPORT_DIR = TOOL_ROOT / "out" / "review-history" / "training-export"
 DEFAULT_RULE_CANDIDATE_EXTRACTOR_DIR = TOOL_ROOT / "out" / "review-history" / "rule-candidate-extractor"
@@ -437,6 +438,7 @@ class SpecbackfillFinding:
     title: str
     why: str
     expected_companions: tuple[str, ...]
+    evidence_digest: str
     fingerprint: str
 
 
@@ -11440,6 +11442,17 @@ def stable_fingerprint(*parts: Any) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def stable_json_digest(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def as_optional_int(value: Any) -> int | None:
     if value is None or value == "":
         return None
@@ -14616,6 +14629,14 @@ def specbackfill_first_evidence(finding: dict[str, Any]) -> tuple[str, int | Non
     return "", None
 
 
+def specbackfill_evidence_digest(finding: dict[str, Any]) -> str:
+    evidence = finding.get("evidence")
+    if not isinstance(evidence, list):
+        evidence = []
+    normalized = [item for item in evidence if isinstance(item, dict)]
+    return stable_json_digest(normalized)
+
+
 def parse_specbackfill_findings_payload(payload: Any) -> list[SpecbackfillFinding]:
     if isinstance(payload, dict):
         raw_findings = payload.get("findings", [])
@@ -14644,6 +14665,7 @@ def parse_specbackfill_findings_payload(payload: Any) -> list[SpecbackfillFindin
         confidence = str(raw.get("confidence") or "")
         title = str(raw.get("title") or rule_id or "specbackfill finding")
         why = str(raw.get("why") or raw.get("body") or "")
+        evidence_digest = specbackfill_evidence_digest(raw)
         fingerprint = specbackfill_normalized_fingerprint(
             finding_id=finding_id,
             omission_signature=omission_signature,
@@ -14669,6 +14691,7 @@ def parse_specbackfill_findings_payload(payload: Any) -> list[SpecbackfillFindin
                 title=title,
                 why=why,
                 expected_companions=expected_companions,
+                evidence_digest=evidence_digest,
                 fingerprint=fingerprint,
             )
         )
@@ -14978,9 +15001,105 @@ def specbackfill_finding_record(finding: SpecbackfillFinding) -> dict[str, Any]:
         "line": finding.line,
         "title_digest": learning_body_digest(finding.title),
         "body_digest": learning_body_digest(finding.why),
+        "evidence_digest": finding.evidence_digest,
         "expected_companions": list(finding.expected_companions),
         "fingerprint": finding.fingerprint,
     }
+
+
+def specbackfill_review_item_candidate_record(
+    finding: SpecbackfillFinding,
+    *,
+    run_id: int | None,
+    review_item_ordinal: int | None,
+    existing_record: dict[str, Any] | None = None,
+    preview_action_override: str | None = None,
+) -> dict[str, Any]:
+    if preview_action_override:
+        preview_action = preview_action_override
+    elif existing_record is not None:
+        preview_action = "already_present"
+    elif run_id is None:
+        preview_action = "needs_run_scope"
+    else:
+        preview_action = "would_insert"
+    return {
+        "candidate_kind": "review_item",
+        "preview_action": preview_action,
+        "run_id": run_id,
+        "item_type": "finding",
+        "ordinal": review_item_ordinal,
+        "specbackfill_ordinal": finding.ordinal,
+        "source": "specbackfill",
+        "severity": finding.severity,
+        "confidence": finding.confidence,
+        "path": finding.path,
+        "line": finding.line,
+        "rule_id": finding.rule_id,
+        "finding_id": finding.finding_id,
+        "omission_signature": finding.omission_signature,
+        "evidence_digest": finding.evidence_digest,
+        "title_digest": learning_body_digest(finding.title),
+        "body_digest": learning_body_digest(specbackfill_finding_body(finding)),
+        "fix_digest": learning_body_digest(""),
+        "verification_digest": learning_body_digest(""),
+        "fingerprint": finding.fingerprint,
+        "existing_review_item_id": existing_record.get("id") if existing_record else None,
+    }
+
+
+def specbackfill_review_item_import_state(
+    connection: sqlite3.Connection | None,
+    *,
+    run_id: int | None,
+    fingerprints: list[str],
+) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "existing_by_fingerprint": {},
+        "max_finding_ordinal": 0,
+    }
+    if connection is None or run_id is None:
+        return state
+    if not sqlite_table_exists(connection, "review_items"):
+        return state
+    max_row = connection.execute(
+        """
+        SELECT COALESCE(MAX(ordinal), 0) AS max_ordinal
+        FROM review_items
+        WHERE run_id = ?
+          AND item_type = 'finding'
+        """,
+        (run_id,),
+    ).fetchone()
+    state["max_finding_ordinal"] = int(max_row["max_ordinal"] or 0) if max_row is not None else 0
+    if not fingerprints:
+        return state
+
+    unique_fingerprints = list(dict.fromkeys(fingerprints))
+    existing: dict[str, dict[str, Any]] = {}
+    for index in range(0, len(unique_fingerprints), SQLITE_BIND_BATCH_SIZE):
+        batch = unique_fingerprints[index : index + SQLITE_BIND_BATCH_SIZE]
+        placeholders = sqlite_placeholders(len(batch))
+        rows = connection.execute(
+            f"""
+            SELECT id, ordinal, fingerprint
+            FROM review_items
+            WHERE run_id = ?
+              AND item_type = 'finding'
+              AND source = 'specbackfill'
+              AND fingerprint IN ({placeholders})
+            """,
+            [run_id, *batch],
+        ).fetchall()
+        for row in rows:
+            fingerprint = str(row["fingerprint"] or "")
+            if fingerprint:
+                existing[fingerprint] = {
+                    "id": int(row["id"]),
+                    "ordinal": int(row["ordinal"]),
+                }
+    state["existing_by_fingerprint"] = existing
+    return state
 
 
 def specbackfill_local_match_record(
@@ -15406,6 +15525,289 @@ def command_specbackfill_overlap(args: argparse.Namespace) -> None:
     else:
         print(report.rstrip())
         print(f"\nOK: specbackfill overlap report={report_path}")
+
+
+def specbackfill_import_preview_payload(
+    *,
+    db_path: Path,
+    db_available: bool,
+    scope: dict[str, Any],
+    specbackfill_input: dict[str, Any],
+    findings: list[SpecbackfillFinding],
+    import_state: dict[str, Any],
+) -> dict[str, Any]:
+    run_id = as_optional_int(scope.get("run_id"))
+    existing_by_fingerprint = import_state.get("existing_by_fingerprint") or {}
+    next_ordinal = int(import_state.get("max_finding_ordinal") or 0)
+    candidates: list[dict[str, Any]] = []
+    seen_input_fingerprints: set[str] = set()
+    for finding in findings:
+        existing_record = existing_by_fingerprint.get(finding.fingerprint)
+        preview_action_override = None
+        if finding.fingerprint in seen_input_fingerprints:
+            review_item_ordinal = (
+                as_optional_int(existing_record.get("ordinal"))
+                if existing_record is not None
+                else None
+            )
+            preview_action_override = "duplicate_input"
+        elif existing_record is not None:
+            review_item_ordinal = as_optional_int(existing_record.get("ordinal"))
+        elif run_id is None:
+            review_item_ordinal = None
+        else:
+            next_ordinal += 1
+            review_item_ordinal = next_ordinal
+        seen_input_fingerprints.add(finding.fingerprint)
+        candidates.append(
+            specbackfill_review_item_candidate_record(
+                finding,
+                run_id=run_id,
+                review_item_ordinal=review_item_ordinal,
+                existing_record=existing_record,
+                preview_action_override=preview_action_override,
+            )
+        )
+    action_counts: dict[str, int] = {}
+    rule_rows: dict[str, dict[str, Any]] = {}
+    for record in candidates:
+        action = str(record["preview_action"])
+        action_counts[action] = action_counts.get(action, 0) + 1
+        rule_id = str(record.get("rule_id") or "(none)")
+        row = rule_rows.setdefault(
+            rule_id,
+            {
+                "rule_id": rule_id,
+                "candidates": 0,
+                "would_insert": 0,
+                "already_present": 0,
+                "needs_run_scope": 0,
+                "duplicate_input": 0,
+            },
+        )
+        row["candidates"] += 1
+        if action in row:
+            row[action] += 1
+
+    return {
+        "schema_name": "local-ai-review-specbackfill-import-preview",
+        "schema_version": 1,
+        "created_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "db": str(db_path),
+        "db_available": db_available,
+        "specbackfill_available": bool(shutil.which("specbackfill")),
+        "specbackfill_input": specbackfill_input,
+        "scope": scope,
+        "policy": {
+            "db_writes": False,
+            "github_api_reads": False,
+            "pr_checkout": False,
+            "pr_code_execution": False,
+            "pr_comment_posting": False,
+            "pr_title_body_mutation": False,
+            "raw_body_or_diff_output": False,
+            "raw_specbackfill_evidence_output": False,
+        },
+        "review_item_shape": {
+            "table": "review_items",
+            "required_scope": "run_id",
+            "ordinal_strategy": "append_after_current_max_finding_ordinal_for_the_run",
+            "fixed_values": {
+                "item_type": "finding",
+                "source": "specbackfill",
+                "fix": "",
+                "verification": "",
+            },
+            "preview_omits_raw_columns": ["title", "body"],
+            "preview_digest_columns": ["title_digest", "body_digest", "evidence_digest"],
+        },
+        "import_state": {
+            "max_existing_finding_ordinal": int(import_state.get("max_finding_ordinal") or 0),
+            "existing_specbackfill_fingerprints": len(existing_by_fingerprint),
+        },
+        "counts": {
+            "specbackfill_findings": len(findings),
+            "review_item_candidates": len(candidates),
+            "would_insert": action_counts.get("would_insert", 0),
+            "already_present": action_counts.get("already_present", 0),
+            "needs_run_scope": action_counts.get("needs_run_scope", 0),
+            "duplicate_input": action_counts.get("duplicate_input", 0),
+        },
+        "rules": sorted(rule_rows.values(), key=lambda row: (-int(row["candidates"]), str(row["rule_id"]))),
+        "review_item_candidates": candidates,
+    }
+
+
+def specbackfill_import_preview_report(payload: dict[str, Any]) -> str:
+    counts = payload["counts"]
+    scope = payload["scope"]
+    input_record = payload.get("specbackfill_input") or {}
+    lines = [
+        "# Specbackfill Import Preview",
+        "",
+        "Report-only preview. This command normalizes specbackfill JSON findings into would-be `review_items(source='specbackfill')` rows and does not write DB rows or mutate GitHub.",
+        "",
+        "## Scope",
+        "",
+        f"- DB: `{payload['db']}`",
+        f"- DB available: `{payload['db_available']}`",
+        f"- Repository: `{scope.get('repo') or 'global'}`",
+        f"- PR: `{scope.get('pr_number') if scope.get('pr_number') is not None else 'all'}`",
+        f"- Head SHA: `{scope.get('head_sha') or ''}`",
+        f"- Run ID: `{scope.get('run_id') if scope.get('run_id') is not None else ''}`",
+        f"- specbackfill on PATH: `{payload.get('specbackfill_available')}`",
+        f"- specbackfill JSON: `{input_record.get('path', '(not provided)')}`",
+        "",
+        "## Counts",
+        "",
+        f"- specbackfill findings: {counts['specbackfill_findings']}",
+        f"- review item candidates: {counts['review_item_candidates']}",
+        f"- would insert with current scope: {counts['would_insert']}",
+        f"- already present for current run: {counts['already_present']}",
+        f"- needs run scope before insert: {counts['needs_run_scope']}",
+        f"- duplicate input fingerprints: {counts['duplicate_input']}",
+        "",
+        "## Review Item Shape",
+        "",
+        "- Table: `review_items`",
+        "- Fixed values: `item_type='finding'`, `source='specbackfill'`, empty `fix`, empty `verification`",
+        "- Ordinal strategy: append new specbackfill findings after the current max `finding` ordinal for the run.",
+        "- Duplicate fingerprints within the same specbackfill input are not counted as would-insert candidates.",
+        "- Stable fields: fingerprint, rule id, path, line, and evidence digest",
+        "- Raw title/body/evidence are not rendered in this artifact; digests are used instead.",
+    ]
+    if scope.get("run_id") is None and int(counts["review_item_candidates"] or 0):
+        lines.append("- A real import would need an explicit comparable `review_runs.id` because `review_items.run_id` is required.")
+
+    lines.extend(["", "## Rule Summary", ""])
+    rules = payload.get("rules") or []
+    if rules:
+        lines.append("| Rule | Candidates | Would insert | Already present | Needs run scope | Duplicate input |")
+        lines.append("|---|---:|---:|---:|---:|---:|")
+        for row in rules:
+            lines.append(
+                "| `{rule}` | {candidates} | {would_insert} | {already_present} | {needs_run_scope} | {duplicate_input} |".format(
+                    rule=markdown_cell(row.get("rule_id", "")),
+                    candidates=row.get("candidates", 0),
+                    would_insert=row.get("would_insert", 0),
+                    already_present=row.get("already_present", 0),
+                    needs_run_scope=row.get("needs_run_scope", 0),
+                    duplicate_input=row.get("duplicate_input", 0),
+                )
+            )
+    else:
+        lines.append("- No specbackfill findings were provided.")
+
+    candidates = payload.get("review_item_candidates") or []
+    lines.extend(["", "## Candidate Samples", ""])
+    if candidates:
+        lines.append("| Spec ordinal | Review ordinal | Action | Rule | Path | Line | Fingerprint | Evidence digest |")
+        lines.append("|---:|---:|---|---|---|---:|---|---|")
+        for record in candidates[:12]:
+            fingerprint = str(record.get("fingerprint") or "")
+            evidence_digest = str(record.get("evidence_digest") or "")
+            lines.append(
+                "| {spec_ordinal} | {review_ordinal} | `{action}` | `{rule}` | `{path}` | {line} | `{fingerprint}` | `{evidence}` |".format(
+                    spec_ordinal=record.get("specbackfill_ordinal", ""),
+                    review_ordinal=record.get("ordinal") if record.get("ordinal") is not None else "",
+                    action=markdown_cell(record.get("preview_action", "")),
+                    rule=markdown_cell(record.get("rule_id", "")),
+                    path=markdown_cell(record.get("path", "")),
+                    line=record.get("line") if record.get("line") is not None else "",
+                    fingerprint=markdown_cell(fingerprint[:16]),
+                    evidence=markdown_cell(evidence_digest[:16]),
+                )
+            )
+    else:
+        lines.append("- No review item candidates were produced.")
+
+    lines.extend(
+        [
+            "",
+            "## Safety",
+            "",
+            "- No DB writes.",
+            "- No GitHub API calls.",
+            "- No PR checkout or PR code execution.",
+            "- No PR comments, title edits, or body edits.",
+            "- The preview records ids, paths, line numbers, rule ids, fingerprints, and digests; raw DB bodies, raw specbackfill evidence, and raw diff text are not rendered.",
+        ]
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def command_specbackfill_import_preview(args: argparse.Namespace) -> None:
+    db_path = sqlite_db_path(args.db)
+    findings, specbackfill_input = load_specbackfill_findings(str(args.specbackfill_json or ""))
+    db_available = db_path.is_file()
+    if args.run is not None and not db_available:
+        raise SystemExit(f"review DB not found for --run {args.run}: {db_path}")
+    import_state: dict[str, Any] = {
+        "existing_by_fingerprint": {},
+        "max_finding_ordinal": 0,
+    }
+    connection_context = connect_review_db_readonly(db_path, row_factory=True) if db_available else None
+    if connection_context is None:
+        run_row = None
+        scope = specbackfill_overlap_scope(args=args, run_row=None)
+    else:
+        with managed_sqlite_connection(connection_context) as connection:
+            connection.row_factory = sqlite3.Row
+            run_row = specbackfill_overlap_run_row(connection, as_optional_int(args.run))
+            if args.run is not None and run_row is None:
+                raise SystemExit(f"review run not found: {args.run}")
+            scope = specbackfill_overlap_scope(args=args, run_row=run_row)
+            import_state = specbackfill_review_item_import_state(
+                connection,
+                run_id=as_optional_int(scope.get("run_id")),
+                fingerprints=[finding.fingerprint for finding in findings],
+            )
+
+    payload = specbackfill_import_preview_payload(
+        db_path=db_path,
+        db_available=db_available,
+        scope=scope,
+        specbackfill_input=specbackfill_input,
+        findings=findings,
+        import_state=import_state,
+    )
+    report = specbackfill_import_preview_report(payload)
+    if args.dry_run:
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        else:
+            print(report.rstrip())
+        return
+
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    repo_slug = slugify_path_part(str(scope.get("repo") or "global"))
+    pr_part = f"-pr-{scope['pr_number']}" if scope.get("pr_number") is not None else ""
+    stem = f"specbackfill-import-preview-{stamp}-{repo_slug}{pr_part}"
+    report_path = output_dir / f"{stem}.md"
+    json_path = output_dir / f"{stem}.json"
+    latest_report_path = output_dir / "latest.md"
+    latest_json_path = output_dir / "latest.json"
+    payload = {
+        **payload,
+        "artifact_paths": {
+            "report": str(report_path),
+            "json": str(json_path),
+            "latest_report": str(latest_report_path),
+            "latest_json": str(latest_json_path),
+        },
+    }
+    report = specbackfill_import_preview_report(payload)
+    report_path.write_text(report, encoding="utf-8")
+    write_json(json_path, payload)
+    latest_report_path.write_text(report, encoding="utf-8")
+    write_json(latest_json_path, payload)
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
+        print(report.rstrip())
+        print(f"\nOK: specbackfill import preview report={report_path}")
 
 
 def sha256_text(value: str) -> str:
@@ -20033,7 +20435,7 @@ def build_review_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Auto-detect and run local PR review",
         epilog=(
-            "Subcommands: status, target, daily, backup, db-plan, second-opinion, async-status, app-developer-review-status, external-verdict, stamp-assist, notify-test, calibration, score, scoring-pump, review-gap-stamp-pump, recall-pattern-miner, watch-sharpener, calibration-risk-gate, prompt-regression-audit, backfill-pump, matcher-explain, training-export-splitter, rule-candidate-extractor, learning-scoreboard, report, specbackfill-overlap, learn-preview, learn-candidates, learn-pump, learn-review, learn-propose, learn-next, learn-apply, learn-audit, export-jsonl, "
+            "Subcommands: status, target, daily, backup, db-plan, second-opinion, async-status, app-developer-review-status, external-verdict, stamp-assist, notify-test, calibration, score, scoring-pump, review-gap-stamp-pump, recall-pattern-miner, watch-sharpener, calibration-risk-gate, prompt-regression-audit, backfill-pump, matcher-explain, training-export-splitter, rule-candidate-extractor, learning-scoreboard, report, specbackfill-overlap, specbackfill-import-preview, learn-preview, learn-candidates, learn-pump, learn-review, learn-propose, learn-next, learn-apply, learn-audit, export-jsonl, "
             "import-github-reviews, import-github-history, install, update"
         ),
     )
@@ -21088,6 +21490,27 @@ def build_specbackfill_overlap_parser() -> argparse.ArgumentParser:
     return overlap
 
 
+def build_specbackfill_import_preview_parser() -> argparse.ArgumentParser:
+    preview = argparse.ArgumentParser(
+        description="Preview review_items(source='specbackfill') rows from specbackfill JSON without writing the DB"
+    )
+    preview.set_defaults(func=command_specbackfill_import_preview)
+    add_workspace_options(preview)
+    preview.add_argument(
+        "--specbackfill-json",
+        required=True,
+        help="Path to `specbackfill check --format json --fail-on off` output; use '-' for stdin",
+    )
+    preview.add_argument("--all-repos", action="store_true", help="Use global DB scope when --run/--repo are omitted")
+    preview.add_argument("--pr", type=parse_non_negative, help="Restrict the preview scope to one PR number")
+    preview.add_argument("--head-sha", help="Restrict the preview scope to a head SHA/import head SHA")
+    preview.add_argument("--run", type=parse_non_negative, help="Use one local review run as the future import anchor")
+    preview.add_argument("--output-dir", default=str(DEFAULT_SPECBACKFILL_IMPORT_PREVIEW_DIR))
+    preview.add_argument("--dry-run", action="store_true", help="Print the preview without writing artifact files")
+    preview.add_argument("--json", action="store_true", help="Print JSON payload instead of markdown")
+    return preview
+
+
 def build_calibration_parser() -> argparse.ArgumentParser:
     calibration = argparse.ArgumentParser(
         description="Write an artifact-only calibration report from existing local review history"
@@ -21717,6 +22140,7 @@ COMMAND_PARSERS = {
     "learning-scoreboard": build_learning_scoreboard_parser,
     "report": build_report_parser,
     "specbackfill-overlap": build_specbackfill_overlap_parser,
+    "specbackfill-import-preview": build_specbackfill_import_preview_parser,
     "learn-preview": build_learn_preview_parser,
     "learn-candidates": build_learn_candidates_parser,
     "learn-pump": build_learn_pump_parser,
