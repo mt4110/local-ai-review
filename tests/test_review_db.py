@@ -45,11 +45,13 @@ from llreview import (  # noqa: E402
     command_specbackfill_import_apply,
     command_specbackfill_import_preview,
     command_specbackfill_overlap,
+    dedupe_local_overlap_records,
     ensure_db_schema,
     external_items_from_comments,
     learning_calibration_statuses_by_candidate,
     postgres_copy_value,
     parse_specbackfill_findings_payload,
+    specbackfill_finding_from_review_item_row,
     review_path_class,
 )
 
@@ -146,6 +148,85 @@ class ReviewDbConfigTests(unittest.TestCase):
 
 
 class SpecbackfillOverlapTests(unittest.TestCase):
+    def test_dedupe_local_overlap_records_keeps_one_best_record_per_local_item(self) -> None:
+        records = [
+            {
+                "local_review_item_id": 10,
+                "specbackfill_ordinal": 1,
+                "score": 0.72,
+            },
+            {
+                "local_review_item_id": 10,
+                "specbackfill_ordinal": 2,
+                "score": 0.91,
+            },
+            {
+                "local_review_item_id": 12,
+                "specbackfill_ordinal": 3,
+                "score": 0.80,
+            },
+        ]
+
+        deduped = dedupe_local_overlap_records(records)
+
+        self.assertEqual(len(deduped), 2)
+        self.assertEqual(deduped[0]["local_review_item_id"], 10)
+        self.assertEqual(deduped[0]["specbackfill_ordinal"], 2)
+        self.assertEqual(deduped[1]["local_review_item_id"], 12)
+
+    def test_saved_specbackfill_fallback_fingerprint_ignores_row_id(self) -> None:
+        with sqlite_memory_connection() as connection:
+            connection.row_factory = sqlite3.Row
+            connection.executescript(
+                """
+                CREATE TABLE saved (
+                    id INTEGER,
+                    run_id INTEGER,
+                    severity TEXT,
+                    confidence TEXT,
+                    path TEXT,
+                    line INTEGER,
+                    title TEXT,
+                    body TEXT,
+                    fingerprint TEXT,
+                    latest_verdict TEXT,
+                    latest_reason TEXT
+                );
+                INSERT INTO saved VALUES (
+                    11,
+                    1,
+                    'error',
+                    'high',
+                    'schema.prisma',
+                    3,
+                    'Missing migration companion',
+                    'rule_id: DB001',
+                    '',
+                    '',
+                    ''
+                );
+                INSERT INTO saved VALUES (
+                    99,
+                    1,
+                    'error',
+                    'high',
+                    'schema.prisma',
+                    3,
+                    'Missing migration companion',
+                    'rule_id: DB001',
+                    '',
+                    '',
+                    ''
+                );
+                """
+            )
+            rows = connection.execute("SELECT * FROM saved ORDER BY id").fetchall()
+
+        first = specbackfill_finding_from_review_item_row(rows[0], ordinal=1)
+        second = specbackfill_finding_from_review_item_row(rows[1], ordinal=2)
+
+        self.assertEqual(first.fingerprint, second.fingerprint)
+
     def test_parse_specbackfill_findings_uses_evidence_anchor_and_stable_id(self) -> None:
         findings = parse_specbackfill_findings_payload(
             {
@@ -1165,6 +1246,1003 @@ class SpecbackfillOverlapTests(unittest.TestCase):
             with sqlite_connection(db_path) as connection:
                 link_count = connection.execute("SELECT COUNT(*) FROM item_links").fetchone()[0]
             self.assertEqual(link_count, 0)
+
+    def test_command_specbackfill_overlap_reads_saved_review_items_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db_path = root / "review.db"
+            ensure_db_schema(db_path)
+            with sqlite_connection(db_path) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO review_runs (
+                        id,
+                        repo,
+                        pr_number,
+                        diff_source,
+                        head_sha,
+                        model,
+                        ollama_base_url,
+                        diff_bytes,
+                        changed_files,
+                        reviewed_files_count,
+                        findings_count,
+                        watch_items_count,
+                        static_findings_count,
+                        model_findings_count,
+                        static_watch_items_count,
+                        model_watch_items_count,
+                        existing_review_comments_count,
+                        elapsed_seconds,
+                        report_markdown
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        1,
+                        "owner/repo",
+                        42,
+                        "diff",
+                        "abc123",
+                        "local-model",
+                        "http://127.0.0.1:11434",
+                        100,
+                        1,
+                        1,
+                        2,
+                        0,
+                        1,
+                        1,
+                        0,
+                        0,
+                        0,
+                        1.0,
+                        "report",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO review_items (
+                        id,
+                        run_id,
+                        item_type,
+                        ordinal,
+                        source,
+                        severity,
+                        confidence,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fix,
+                        verification,
+                        fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        10,
+                        1,
+                        "finding",
+                        1,
+                        "model",
+                        "P2",
+                        "medium",
+                        "unrelated.py",
+                        9,
+                        "Unrelated model finding",
+                        "A different model finding on another file.",
+                        "",
+                        "",
+                        "local-fp",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO review_items (
+                        id,
+                        run_id,
+                        item_type,
+                        ordinal,
+                        source,
+                        severity,
+                        confidence,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fix,
+                        verification,
+                        fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        11,
+                        1,
+                        "finding",
+                        2,
+                        "specbackfill",
+                        "error",
+                        "high",
+                        "schema.prisma",
+                        3,
+                        "Missing migration companion",
+                        "rule_id: DB001\nomission_signature: db001.schema_changed.migration_companion\nSchema-affecting lines moved without a migration companion.",
+                        "",
+                        "",
+                        "v0-db001",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO external_items (
+                        id,
+                        repo,
+                        pr_number,
+                        head_sha,
+                        import_head_sha,
+                        source,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        20,
+                        "owner/repo",
+                        42,
+                        "abc123",
+                        "abc123",
+                        "human",
+                        "schema.prisma",
+                        3,
+                        "Missing migration companion",
+                        "Schema-affecting lines moved without a migration companion.",
+                        "external-fp",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO item_verdicts (
+                        target_kind,
+                        target_id,
+                        verdict,
+                        reason,
+                        note,
+                        scorer
+                    ) VALUES ('review_item', ?, 'false_positive', 'covered_by_tests', '', 'manual')
+                    """,
+                    (11,),
+                )
+
+            args = argparse.Namespace(
+                db=str(db_path),
+                project_dir=None,
+                repo="owner/repo",
+                specbackfill_json=None,
+                all_repos=False,
+                pr=42,
+                head_sha="abc123",
+                run=1,
+                output_dir=str(root / "overlap"),
+                local_source="model",
+                include_watch=False,
+                limit=50,
+                match_limit=20,
+                min_link_score=0.55,
+                dry_run=True,
+                json=True,
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                command_specbackfill_overlap(args)
+
+            rendered = output.getvalue()
+            self.assertNotIn("Schema-affecting lines moved without a migration companion", rendered)
+            payload = json.loads(rendered)
+            self.assertEqual(payload["specbackfill_input"]["source"], "review_items")
+            self.assertEqual(payload["counts"]["specbackfill_findings"], 1)
+            self.assertEqual(payload["counts"]["specbackfill_local_overlaps"], 0)
+            self.assertEqual(payload["counts"]["specbackfill_external_overlaps"], 1)
+            self.assertEqual(payload["counts"]["external_local_candidate_overlaps"], 0)
+            self.assertEqual(payload["counts"]["external_items_missed_by_local"], 1)
+            self.assertEqual(payload["counts"]["external_items_covered_by_specbackfill"], 1)
+            self.assertEqual(
+                payload["counts"]["external_items_missed_by_local_but_covered_by_specbackfill"],
+                1,
+            )
+            self.assertEqual(payload["counts"]["specbackfill_false_positive_verdicts"], 1)
+            covered = payload["learning_signals"]["external_items_covered_by_specbackfill"][0]
+            false_positive = payload["learning_signals"]["specbackfill_false_positive_verdicts"][0]
+            self.assertEqual(covered["specbackfill_review_item_id"], 11)
+            self.assertEqual(false_positive["specbackfill_review_item_id"], 11)
+            self.assertEqual(false_positive["latest_reason"], "covered_by_tests")
+            with sqlite_connection(db_path) as connection:
+                link_count = connection.execute("SELECT COUNT(*) FROM item_links").fetchone()[0]
+            self.assertEqual(link_count, 0)
+
+    def test_specbackfill_overlap_existing_links_are_not_missed_by_local(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db_path = root / "review.db"
+            ensure_db_schema(db_path)
+            with sqlite_connection(db_path) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO review_runs (
+                        id,
+                        repo,
+                        pr_number,
+                        diff_source,
+                        head_sha,
+                        model,
+                        ollama_base_url,
+                        diff_bytes,
+                        changed_files,
+                        reviewed_files_count,
+                        findings_count,
+                        watch_items_count,
+                        static_findings_count,
+                        model_findings_count,
+                        static_watch_items_count,
+                        model_watch_items_count,
+                        existing_review_comments_count,
+                        elapsed_seconds,
+                        report_markdown
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        1,
+                        "owner/repo",
+                        42,
+                        "diff",
+                        "abc123",
+                        "local-model",
+                        "http://127.0.0.1:11434",
+                        100,
+                        1,
+                        1,
+                        2,
+                        0,
+                        1,
+                        1,
+                        0,
+                        0,
+                        0,
+                        1.0,
+                        "report",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO review_items (
+                        id,
+                        run_id,
+                        item_type,
+                        ordinal,
+                        source,
+                        severity,
+                        confidence,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fix,
+                        verification,
+                        fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        10,
+                        1,
+                        "finding",
+                        1,
+                        "model",
+                        "P2",
+                        "medium",
+                        "schema.prisma",
+                        3,
+                        "A linked but textually different model finding",
+                        "A prior importer already linked this finding to the external item.",
+                        "",
+                        "",
+                        "local-fp",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO review_items (
+                        id,
+                        run_id,
+                        item_type,
+                        ordinal,
+                        source,
+                        severity,
+                        confidence,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fix,
+                        verification,
+                        fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        11,
+                        1,
+                        "finding",
+                        2,
+                        "specbackfill",
+                        "error",
+                        "high",
+                        "schema.prisma",
+                        3,
+                        "Missing migration companion",
+                        "rule_id: DB001\nomission_signature: db001.schema_changed.migration_companion\nSchema changed without migration companion.",
+                        "",
+                        "",
+                        "v0-db001",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO external_items (
+                        id,
+                        repo,
+                        pr_number,
+                        head_sha,
+                        import_head_sha,
+                        source,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        20,
+                        "owner/repo",
+                        42,
+                        "abc123",
+                        "abc123",
+                        "human",
+                        "schema.prisma",
+                        3,
+                        "Missing migration companion",
+                        "Schema changed without migration companion.",
+                        "external-fp",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO item_links (
+                        review_item_id,
+                        external_item_id,
+                        relation,
+                        note
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (10, 20, "manual", "test existing link"),
+                )
+
+            args = argparse.Namespace(
+                db=str(db_path),
+                project_dir=None,
+                repo="owner/repo",
+                specbackfill_json=None,
+                all_repos=False,
+                pr=42,
+                head_sha="abc123",
+                run=1,
+                output_dir=str(root / "overlap"),
+                local_source="model",
+                include_watch=False,
+                limit=50,
+                match_limit=20,
+                min_link_score=0.99,
+                dry_run=True,
+                json=True,
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                command_specbackfill_overlap(args)
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["counts"]["existing_external_local_links"], 1)
+            self.assertEqual(payload["counts"]["external_items_covered_by_existing_links"], 1)
+            self.assertEqual(payload["counts"]["external_items_missed_by_local"], 0)
+            self.assertEqual(
+                payload["counts"]["external_items_missed_by_local_but_covered_by_specbackfill"],
+                0,
+            )
+
+    def test_specbackfill_overlap_excludes_external_false_positive_verdicts_from_signals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db_path = root / "review.db"
+            ensure_db_schema(db_path)
+            with sqlite_connection(db_path) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO review_runs (
+                        id,
+                        repo,
+                        pr_number,
+                        diff_source,
+                        head_sha,
+                        model,
+                        ollama_base_url,
+                        diff_bytes,
+                        changed_files,
+                        reviewed_files_count,
+                        findings_count,
+                        watch_items_count,
+                        static_findings_count,
+                        model_findings_count,
+                        static_watch_items_count,
+                        model_watch_items_count,
+                        existing_review_comments_count,
+                        elapsed_seconds,
+                        report_markdown
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        1,
+                        "owner/repo",
+                        42,
+                        "diff",
+                        "abc123",
+                        "local-model",
+                        "http://127.0.0.1:11434",
+                        100,
+                        1,
+                        1,
+                        1,
+                        0,
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        1.0,
+                        "report",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO review_items (
+                        id,
+                        run_id,
+                        item_type,
+                        ordinal,
+                        source,
+                        severity,
+                        confidence,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fix,
+                        verification,
+                        fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        11,
+                        1,
+                        "finding",
+                        1,
+                        "specbackfill",
+                        "error",
+                        "high",
+                        "schema.prisma",
+                        3,
+                        "Missing migration companion",
+                        "rule_id: DB001\nomission_signature: db001.schema_changed.migration_companion\nSchema changed without migration companion.",
+                        "",
+                        "",
+                        "v0-db001",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO external_items (
+                        id,
+                        repo,
+                        pr_number,
+                        head_sha,
+                        import_head_sha,
+                        source,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        20,
+                        "owner/repo",
+                        42,
+                        "abc123",
+                        "abc123",
+                        "teacher_model",
+                        "schema.prisma",
+                        3,
+                        "Missing migration companion",
+                        "Schema changed without migration companion.",
+                        "external-fp",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO item_verdicts (
+                        target_kind,
+                        target_id,
+                        verdict,
+                        reason,
+                        note,
+                        scorer
+                    ) VALUES ('external_item', ?, 'teacher_false_positive', 'teacher_model_false_positive', '', 'manual')
+                    """,
+                    (20,),
+                )
+
+            args = argparse.Namespace(
+                db=str(db_path),
+                project_dir=None,
+                repo="owner/repo",
+                specbackfill_json=None,
+                all_repos=False,
+                pr=42,
+                head_sha="abc123",
+                run=1,
+                output_dir=str(root / "overlap"),
+                local_source="model",
+                include_watch=False,
+                limit=50,
+                match_limit=20,
+                min_link_score=0.55,
+                dry_run=True,
+                json=True,
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                command_specbackfill_overlap(args)
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["counts"]["specbackfill_external_overlaps"], 1)
+            self.assertEqual(payload["counts"]["external_items_excluded_by_verdict"], 1)
+            self.assertEqual(payload["counts"]["external_items_missed_by_local"], 0)
+            self.assertEqual(payload["counts"]["external_items_covered_by_specbackfill"], 0)
+            self.assertEqual(
+                payload["counts"]["external_items_missed_by_local_but_covered_by_specbackfill"],
+                0,
+            )
+
+    def test_specbackfill_overlap_does_not_treat_specbackfill_link_as_local_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db_path = root / "review.db"
+            ensure_db_schema(db_path)
+            with sqlite_connection(db_path) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO review_runs (
+                        id,
+                        repo,
+                        pr_number,
+                        diff_source,
+                        head_sha,
+                        model,
+                        ollama_base_url,
+                        diff_bytes,
+                        changed_files,
+                        reviewed_files_count,
+                        findings_count,
+                        watch_items_count,
+                        static_findings_count,
+                        model_findings_count,
+                        static_watch_items_count,
+                        model_watch_items_count,
+                        existing_review_comments_count,
+                        elapsed_seconds,
+                        report_markdown
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        1,
+                        "owner/repo",
+                        42,
+                        "diff",
+                        "abc123",
+                        "local-model",
+                        "http://127.0.0.1:11434",
+                        100,
+                        1,
+                        1,
+                        1,
+                        0,
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        1.0,
+                        "report",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO review_items (
+                        id,
+                        run_id,
+                        item_type,
+                        ordinal,
+                        source,
+                        severity,
+                        confidence,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fix,
+                        verification,
+                        fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        11,
+                        1,
+                        "finding",
+                        1,
+                        "specbackfill",
+                        "error",
+                        "high",
+                        "schema.prisma",
+                        3,
+                        "Missing migration companion",
+                        "rule_id: DB001\nomission_signature: db001.schema_changed.migration_companion\nSchema changed without migration companion.",
+                        "",
+                        "",
+                        "v0-db001",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO external_items (
+                        id,
+                        repo,
+                        pr_number,
+                        head_sha,
+                        import_head_sha,
+                        source,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        20,
+                        "owner/repo",
+                        42,
+                        "abc123",
+                        "abc123",
+                        "human",
+                        "schema.prisma",
+                        3,
+                        "Missing migration companion",
+                        "Schema changed without migration companion.",
+                        "external-fp",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO item_links (
+                        review_item_id,
+                        external_item_id,
+                        relation,
+                        note
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (11, 20, "specbackfill", "future specbackfill link"),
+                )
+
+            args = argparse.Namespace(
+                db=str(db_path),
+                project_dir=None,
+                repo="owner/repo",
+                specbackfill_json=None,
+                all_repos=False,
+                pr=42,
+                head_sha="abc123",
+                run=1,
+                output_dir=str(root / "overlap"),
+                local_source="all",
+                include_watch=False,
+                limit=50,
+                match_limit=20,
+                min_link_score=0.55,
+                dry_run=True,
+                json=True,
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                command_specbackfill_overlap(args)
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["counts"]["existing_external_local_links"], 0)
+            self.assertEqual(payload["counts"]["external_items_covered_by_existing_links"], 0)
+            self.assertEqual(payload["counts"]["external_items_missed_by_local"], 1)
+            self.assertEqual(
+                payload["counts"]["external_items_missed_by_local_but_covered_by_specbackfill"],
+                1,
+            )
+
+    def test_specbackfill_overlap_json_excludes_saved_specbackfill_rows_from_local_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db_path = root / "review.db"
+            spec_path = root / "specbackfill.json"
+            ensure_db_schema(db_path)
+            spec_path.write_text(
+                json.dumps(
+                    {
+                        "version": "v0",
+                        "findings": [
+                            {
+                                "finding_id": "v0-db001",
+                                "omission_signature": "db001.schema_changed.migration_companion",
+                                "rule_id": "DB001",
+                                "severity": "error",
+                                "confidence": "high",
+                                "title": "Missing migration companion",
+                                "why": "Schema changed without migration companion.",
+                                "evidence": [{"file": "schema.prisma", "line": 3, "excerpt": "email String @unique"}],
+                                "expected_companions": ["migration file"],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with sqlite_connection(db_path) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO review_runs (
+                        id,
+                        repo,
+                        pr_number,
+                        diff_source,
+                        head_sha,
+                        model,
+                        ollama_base_url,
+                        diff_bytes,
+                        changed_files,
+                        reviewed_files_count,
+                        findings_count,
+                        watch_items_count,
+                        static_findings_count,
+                        model_findings_count,
+                        static_watch_items_count,
+                        model_watch_items_count,
+                        existing_review_comments_count,
+                        elapsed_seconds,
+                        report_markdown
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        1,
+                        "owner/repo",
+                        42,
+                        "diff",
+                        "abc123",
+                        "local-model",
+                        "http://127.0.0.1:11434",
+                        100,
+                        1,
+                        1,
+                        1,
+                        0,
+                        0,
+                        1,
+                        0,
+                        0,
+                        0,
+                        1.0,
+                        "report",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO review_items (
+                        id,
+                        run_id,
+                        item_type,
+                        ordinal,
+                        source,
+                        severity,
+                        confidence,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fix,
+                        verification,
+                        fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        11,
+                        1,
+                        "finding",
+                        1,
+                        "specbackfill",
+                        "error",
+                        "high",
+                        "schema.prisma",
+                        3,
+                        "Missing migration companion",
+                        "rule_id: DB001\nSchema changed without migration companion.",
+                        "",
+                        "",
+                        "v0-db001",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO external_items (
+                        id,
+                        repo,
+                        pr_number,
+                        head_sha,
+                        import_head_sha,
+                        source,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        20,
+                        "owner/repo",
+                        42,
+                        "abc123",
+                        "abc123",
+                        "human",
+                        "schema.prisma",
+                        3,
+                        "Missing migration companion",
+                        "Schema changed without migration companion.",
+                        "external-fp",
+                    ),
+                )
+
+            args = argparse.Namespace(
+                db=str(db_path),
+                project_dir=None,
+                repo="owner/repo",
+                specbackfill_json=str(spec_path),
+                all_repos=False,
+                pr=42,
+                head_sha="abc123",
+                run=1,
+                output_dir=str(root / "overlap"),
+                local_source="all",
+                include_watch=False,
+                limit=50,
+                match_limit=20,
+                min_link_score=0.55,
+                dry_run=True,
+                json=True,
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                command_specbackfill_overlap(args)
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["counts"]["external_local_candidate_overlaps"], 0)
+            self.assertEqual(payload["counts"]["external_items_missed_by_local"], 1)
+            self.assertEqual(payload["counts"]["external_items_covered_by_specbackfill"], 1)
+            self.assertEqual(
+                payload["counts"]["external_items_missed_by_local_but_covered_by_specbackfill"],
+                1,
+            )
+
+    def test_specbackfill_overlap_saved_rows_tolerates_missing_verdict_table(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db_path = root / "review.db"
+            with sqlite_connection(db_path) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE review_runs (
+                        id INTEGER PRIMARY KEY,
+                        repo TEXT NOT NULL,
+                        pr_number INTEGER,
+                        head_sha TEXT NOT NULL DEFAULT ''
+                    );
+                    CREATE TABLE review_items (
+                        id INTEGER PRIMARY KEY,
+                        run_id INTEGER NOT NULL,
+                        item_type TEXT NOT NULL,
+                        ordinal INTEGER NOT NULL,
+                        source TEXT NOT NULL,
+                        severity TEXT NOT NULL DEFAULT '',
+                        confidence TEXT NOT NULL DEFAULT '',
+                        path TEXT NOT NULL,
+                        line INTEGER,
+                        title TEXT NOT NULL,
+                        body TEXT NOT NULL,
+                        fix TEXT NOT NULL DEFAULT '',
+                        verification TEXT NOT NULL DEFAULT '',
+                        fingerprint TEXT NOT NULL
+                    );
+                    INSERT INTO review_runs (id, repo, pr_number, head_sha)
+                    VALUES (1, 'owner/repo', 42, 'abc123');
+                    INSERT INTO review_items (
+                        id,
+                        run_id,
+                        item_type,
+                        ordinal,
+                        source,
+                        severity,
+                        confidence,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fingerprint
+                    ) VALUES (
+                        11,
+                        1,
+                        'finding',
+                        1,
+                        'specbackfill',
+                        'error',
+                        'high',
+                        'schema.prisma',
+                        3,
+                        'Missing migration companion',
+                        'rule_id: DB001',
+                        'v0-db001'
+                    );
+                    """
+                )
+
+            args = argparse.Namespace(
+                db=str(db_path),
+                project_dir=None,
+                repo="owner/repo",
+                specbackfill_json=None,
+                all_repos=False,
+                pr=42,
+                head_sha="abc123",
+                run=1,
+                output_dir=str(root / "overlap"),
+                local_source="model",
+                include_watch=False,
+                limit=50,
+                match_limit=20,
+                min_link_score=0.55,
+                dry_run=True,
+                json=True,
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                command_specbackfill_overlap(args)
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["counts"]["specbackfill_findings"], 1)
+            finding = payload["specbackfill_findings"][0]
+            self.assertEqual(finding["latest_verdict"], "")
+            self.assertEqual(finding["latest_reason"], "")
 
     def test_specbackfill_overlap_match_limit_zero_keeps_report_truthful(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

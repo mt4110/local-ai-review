@@ -182,6 +182,7 @@ llreview import-github-reviews 42
 llreview import-github-history --dry-run
 llreview backfill-pump
 llreview matcher-explain
+llreview specbackfill-overlap --run <run-id>
 llreview specbackfill-import-preview --specbackfill-json specbackfill.json
 llreview specbackfill-import-apply --specbackfill-json specbackfill.json --run <run-id>
 llreview training-export-splitter
@@ -324,6 +325,8 @@ make review-db-down
 `llreview import-github-reviews 42` は GitHub の inline PR review comments を読み込み、Copilot / automated / human の指摘を `external_items` に保存します。既存の local `review_items` とは fingerprint、file、line、normalized text のゆるい一致で `item_links` に対応付けます。同じ comment id は update されるため、同じ PR を再 import しても外部項目は増殖しません。再 import では、今回の GitHub comment snapshot に含まれない古い GitHub 由来の external item も片付けます。top-level PR conversation comments も教材にしたい場合だけ `--include-issue-comments` を付けます。保存済み JSON で再現 import する場合、issue comments は `--issue-comments-json` で別ファイルを渡し、`--head-sha` は特定の local run SHA に固定したい場合だけ使います。
 
 `llreview import-github-history --dry-run` は、過去の merged PR と local git 履歴を教材候補として preview します。remote GitHub PR は `--remote-repo-limit` / `--remote-pr-limit` / `--remote-per-repo-pr-limit` で API 量を制限し、local git は `--local-repo-limit` / `--local-pr-limit` / `--local-per-repo-pr-limit` で CPU/output 量だけを制限します。local scan は GitHub API token を要求せず、preferred GitHub remote の owner が `mt4110` ではない repository は `skipped_owner_not_mt4110` で block します。skip reason を DB の `github_backfill_queue` に残したい場合は `--refresh-queue` を明示します。queue から remote candidate を1件だけ実 import する場合は `llreview import-github-history --one` を使います。`--one --dry-run` は選択されるPRと import/link 件数だけを確認し、実 import は20分に1件の limiter を既定で守ります。`llreview backfill-pump` はこの queue を日常運用向けにまとめ、before/after、rate gate、次候補、external item delta を `out/review-history/backfill-pump/` に保存します。通常は report-only、`--import-one` で一件だけ進め、`--import-one --dry-run` は external item / link / verdict / queue state を書きません。`llreview report` と `llreview export-jsonl` は queue state / skip reason も出力します。
+
+`llreview specbackfill-overlap --run <run-id>` は、保存済み `review_items(source='specbackfill')` を同じ scope の local model `review_items` / imported `external_items` と deterministic に照合する preview です。`--specbackfill-json` を渡した場合だけ JSON findings を override 入力として使えます。external missed by local、external covered by specbackfill、model/specbackfill overlap、specbackfill false-positive verdict を artifact に出しますが、外部 item が false-positive / not-actionable と判定済みなら missed/covered signal からは外します。DB writes、GitHub API、PR checkout、PR code execution、PR comment 投稿は行わず、raw body / raw evidence / raw diff も出しません。
 
 `llreview specbackfill-import-preview --specbackfill-json specbackfill.json --run <run-id>` は、`specbackfill check --format json --fail-on off` の findings を将来の `review_items(source='specbackfill')` 行にできるかを artifact-only で確認します。`run_id`、`item_type='finding'`、`source='specbackfill'`、path、line、rule id、fingerprint、evidence digest を正規化し、既存同一 fingerprint があれば `already_present`、入力内重複があれば `duplicate_input` として数えます。新規候補の ordinal は対象 run の既存 finding ordinal の後ろへ append する preview です。DB writes、GitHub API、PR checkout、PR code execution、PR comment 投稿は行わず、raw body / raw evidence / raw diff は出しません。`--dry-run` は artifact を書かずに同じ preview を表示します。
 

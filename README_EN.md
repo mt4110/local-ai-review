@@ -521,6 +521,17 @@ to fetch/match without writing external items, links, verdicts, or queue state.
 `llreview report` and `llreview export-jsonl` also include queue state and skip
 reasons, so skipped/deferred candidates remain part of the learning ledger.
 
+Use `llreview specbackfill-overlap --run <run-id>` to preview deterministic
+alignment between saved `review_items(source='specbackfill')` rows and existing
+local model `review_items` / imported `external_items` in the same scope. Pass
+`--specbackfill-json` only when you want JSON findings to override the saved DB
+input. The report surfaces external-missed-by-local, external-covered-by-specbackfill,
+model/specbackfill overlap, and specbackfill false-positive
+verdict signals. External items already judged false-positive or not-actionable
+are excluded from missed/covered signals. The command performs no DB writes,
+GitHub API calls, PR checkout/code execution, PR comments, or raw
+body/evidence/diff output.
+
 Use `llreview specbackfill-import-preview --specbackfill-json specbackfill.json
 --run <run-id>` to normalize `specbackfill check --format json --fail-on off`
 findings into would-be `review_items(source='specbackfill')` rows without DB
