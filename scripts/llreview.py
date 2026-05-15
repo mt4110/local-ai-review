@@ -15517,6 +15517,7 @@ def specbackfill_overlap_payload(
         candidate
         for candidate in specbackfill_overlap_link_candidates(local_rows)
         if candidate.id not in saved_spec_review_item_ids
+        and candidate.source != "specbackfill"
     ]
     external_items = external_items_from_rows(external_rows)
     spec_external_items = [
