@@ -184,6 +184,7 @@ llreview calibration
 llreview update
 llreview score
 llreview import-github-reviews 42
+llreview specbackfill-overlap --run <run-id>
 llreview specbackfill-import-preview --specbackfill-json specbackfill.json
 llreview specbackfill-import-apply --specbackfill-json specbackfill.json --run <run-id>
 llreview training-export-splitter
@@ -514,15 +515,20 @@ to fetch/match without writing external items, links, verdicts, or queue state.
 `llreview report` and `llreview export-jsonl` also include queue state and skip
 reasons so skipped/deferred candidates stay visible to the learning loop.
 
-`llreview specbackfill-overlap --specbackfill-json specbackfill.json --repo
-owner/name --pr 42` previews overlap between `specbackfill check --format json
---fail-on off` findings and existing local `review_items` / imported
-`external_items`. By default it compares against local model findings only. It
-does not write DB rows, call the GitHub API, check out PR code, execute PR code,
-post PR comments, or mutate PR titles/bodies. The Markdown/JSON artifacts under
-`out/review-history/specbackfill-overlap/` render ids, paths, line numbers,
-rule ids, and digests instead of raw DB bodies or raw diff text. Use `--dry-run`
-to print the same preview without writing artifacts.
+`llreview specbackfill-overlap --run <run-id>` previews overlap between saved
+`review_items(source='specbackfill')` rows and existing local `review_items` /
+imported `external_items`. Pass `--specbackfill-json specbackfill.json` only
+when `specbackfill check --format json --fail-on off` findings should override
+the saved DB input. By default it compares against local model findings only
+and reports external-missed-by-local, external-covered-by-specbackfill,
+model/specbackfill overlap, and specbackfill false-positive verdict signals.
+External items already judged false-positive or not-actionable are excluded
+from missed/covered signals. It does not write DB rows, call the GitHub API,
+check out PR code, execute PR code, post PR comments, or mutate PR titles/bodies.
+The Markdown/JSON artifacts under `out/review-history/specbackfill-overlap/`
+render ids, paths, line numbers, rule ids, and digests instead of raw DB
+bodies, raw evidence, or raw diff text. Use `--dry-run` to print the same
+preview without writing artifacts.
 
 `llreview specbackfill-import-preview --specbackfill-json specbackfill.json
 --run <run-id>` deterministically normalizes `specbackfill` findings into
