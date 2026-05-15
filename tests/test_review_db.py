@@ -49,6 +49,7 @@ from llreview import (  # noqa: E402
     ensure_db_schema,
     external_items_from_comments,
     learning_calibration_statuses_by_candidate,
+    load_link_candidates,
     postgres_copy_value,
     parse_specbackfill_findings_payload,
     specbackfill_finding_from_review_item_row,
@@ -580,7 +581,7 @@ class SpecbackfillOverlapTests(unittest.TestCase):
                         1,
                         "finding",
                         4,
-                        "specbackfill",
+                        "SpecBackfill",
                         "error",
                         "high",
                         "schema.prisma",
@@ -1359,7 +1360,7 @@ class SpecbackfillOverlapTests(unittest.TestCase):
                         1,
                         "finding",
                         2,
-                        "specbackfill",
+                        "SpecBackfill",
                         "error",
                         "high",
                         "schema.prisma",
@@ -1573,7 +1574,7 @@ class SpecbackfillOverlapTests(unittest.TestCase):
                         1,
                         "finding",
                         2,
-                        "specbackfill",
+                        "SpecBackfill",
                         "error",
                         "high",
                         "schema.prisma",
@@ -2482,6 +2483,293 @@ class SpecbackfillOverlapTests(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(SystemExit, "review DB not found for --run 1"):
+                command_specbackfill_overlap(args)
+
+    def test_specbackfill_rows_are_not_general_local_link_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db_path = root / "review.db"
+            ensure_db_schema(db_path)
+            with sqlite_connection(db_path) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.execute(
+                    """
+                    INSERT INTO review_runs (
+                        id,
+                        repo,
+                        pr_number,
+                        diff_source,
+                        head_sha,
+                        model,
+                        ollama_base_url,
+                        diff_bytes,
+                        changed_files,
+                        reviewed_files_count,
+                        findings_count,
+                        watch_items_count,
+                        static_findings_count,
+                        model_findings_count,
+                        static_watch_items_count,
+                        model_watch_items_count,
+                        existing_review_comments_count,
+                        elapsed_seconds,
+                        report_markdown
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        1,
+                        "owner/repo",
+                        42,
+                        "diff",
+                        "abc123",
+                        "local-model",
+                        "http://127.0.0.1:11434",
+                        100,
+                        1,
+                        1,
+                        2,
+                        0,
+                        1,
+                        1,
+                        0,
+                        0,
+                        0,
+                        1.0,
+                        "report",
+                    ),
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO review_items (
+                        id,
+                        run_id,
+                        item_type,
+                        ordinal,
+                        source,
+                        severity,
+                        confidence,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fix,
+                        verification,
+                        fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            10,
+                            1,
+                            "finding",
+                            1,
+                            "model",
+                            "P2",
+                            "high",
+                            "schema.prisma",
+                            3,
+                            "Model finding",
+                            "A model finding.",
+                            "",
+                            "",
+                            "model-fp",
+                        ),
+                        (
+                            11,
+                            1,
+                            "finding",
+                            2,
+                            "SpecBackfill",
+                            "error",
+                            "high",
+                            "schema.prisma",
+                            3,
+                            "Specbackfill finding",
+                            "rule_id: DB001",
+                            "",
+                            "",
+                            "spec-fp",
+                        ),
+                    ],
+                )
+
+                candidates = load_link_candidates(
+                    connection,
+                    repo="owner/repo",
+                    pr_number=42,
+                    head_shas={"abc123"},
+                    head_ref="",
+                    run_id=1,
+                    allow_pr_fallback=True,
+                )
+
+            self.assertEqual([candidate.id for candidate in candidates], [10])
+            self.assertEqual([candidate.source for candidate in candidates], ["model"])
+
+    def test_command_specbackfill_overlap_records_artifact_digests_when_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db_path = root / "review.db"
+            output_dir = root / "overlap"
+            ensure_db_schema(db_path)
+            with sqlite_connection(db_path) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO review_runs (
+                        id,
+                        repo,
+                        pr_number,
+                        diff_source,
+                        head_sha,
+                        model,
+                        ollama_base_url,
+                        diff_bytes,
+                        changed_files,
+                        reviewed_files_count,
+                        findings_count,
+                        watch_items_count,
+                        static_findings_count,
+                        model_findings_count,
+                        static_watch_items_count,
+                        model_watch_items_count,
+                        existing_review_comments_count,
+                        elapsed_seconds,
+                        report_markdown
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        1,
+                        "owner/repo",
+                        42,
+                        "diff",
+                        "abc123",
+                        "local-model",
+                        "http://127.0.0.1:11434",
+                        100,
+                        1,
+                        1,
+                        1,
+                        0,
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        1.0,
+                        "report",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO review_items (
+                        id,
+                        run_id,
+                        item_type,
+                        ordinal,
+                        source,
+                        severity,
+                        confidence,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fix,
+                        verification,
+                        fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        11,
+                        1,
+                        "finding",
+                        1,
+                        "specbackfill",
+                        "error",
+                        "high",
+                        "schema.prisma",
+                        3,
+                        "Missing migration companion",
+                        "rule_id: DB001\nSchema-affecting lines moved without a migration companion.",
+                        "",
+                        "",
+                        "v0-db001",
+                    ),
+                )
+
+            args = argparse.Namespace(
+                db=str(db_path),
+                project_dir=None,
+                repo="owner/repo",
+                specbackfill_json=None,
+                all_repos=False,
+                pr=42,
+                head_sha="abc123",
+                run=1,
+                output_dir=str(output_dir),
+                local_source="model",
+                include_watch=False,
+                limit=50,
+                match_limit=20,
+                min_link_score=0.55,
+                dry_run=False,
+                record_db_artifacts=True,
+                json=False,
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                command_specbackfill_overlap(args)
+
+            latest_json = (output_dir / "latest.json").read_text(encoding="utf-8")
+            latest_report = (output_dir / "latest.md").read_text(encoding="utf-8")
+            self.assertNotIn("Schema-affecting lines moved without a migration companion", latest_json)
+            self.assertNotIn("Schema-affecting lines moved without a migration companion", latest_report)
+            self.assertIn("records only artifact path/sha256 rows in the DB", latest_report)
+            self.assertNotIn("does not write DB rows or mutate GitHub", latest_report)
+            payload = json.loads(latest_json)
+            self.assertTrue(payload["policy"]["db_writes"])
+            self.assertFalse(payload["policy"]["item_links_writes"])
+            self.assertEqual(payload["policy"]["db_write_scope"], "artifacts(path, sha256) only")
+            self.assertEqual(payload["artifact_recording"]["run_id"], 1)
+            self.assertIn("DB artifact rows saved: 2", output.getvalue())
+
+            with sqlite_connection(db_path) as connection:
+                link_count = connection.execute("SELECT COUNT(*) FROM item_links").fetchone()[0]
+                artifact_rows = connection.execute(
+                    "SELECT run_id, kind, path, sha256 FROM artifacts ORDER BY kind"
+                ).fetchall()
+            self.assertEqual(link_count, 0)
+            self.assertEqual(len(artifact_rows), 2)
+            self.assertEqual({row[1] for row in artifact_rows}, {"specbackfill_overlap_json", "specbackfill_overlap_report"})
+            self.assertTrue(all(row[0] == 1 for row in artifact_rows))
+            self.assertTrue(all(Path(row[2]).is_file() for row in artifact_rows))
+            self.assertTrue(all(len(row[3]) == 64 for row in artifact_rows))
+
+    def test_specbackfill_overlap_artifact_recording_requires_run_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db_path = root / "review.db"
+            ensure_db_schema(db_path)
+            args = argparse.Namespace(
+                db=str(db_path),
+                project_dir=None,
+                repo="owner/repo",
+                specbackfill_json=None,
+                all_repos=False,
+                pr=42,
+                head_sha="abc123",
+                run=None,
+                output_dir=str(root / "overlap"),
+                local_source="model",
+                include_watch=False,
+                limit=50,
+                match_limit=20,
+                min_link_score=0.55,
+                dry_run=False,
+                record_db_artifacts=True,
+                json=False,
+            )
+
+            with self.assertRaisesRegex(SystemExit, "--record-db-artifacts requires --run"):
                 command_specbackfill_overlap(args)
 
 
