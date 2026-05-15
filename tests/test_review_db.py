@@ -48,11 +48,15 @@ from llreview import (  # noqa: E402
     command_specbackfill_overlap,
     dedupe_local_overlap_records,
     ensure_db_schema,
+    external_db_counts,
+    external_report_counts,
+    external_scope_counts,
     external_items_from_comments,
     learning_calibration_statuses_by_candidate,
     load_link_candidates,
     postgres_copy_value,
     parse_specbackfill_findings_payload,
+    review_gap_records,
     specbackfill_finding_from_review_item_row,
     review_path_class,
 )
@@ -2618,7 +2622,7 @@ class SpecbackfillOverlapTests(unittest.TestCase):
                             1,
                             "finding",
                             2,
-                            "SpecBackfill",
+                            " SpecBackfill ",
                             "error",
                             "high",
                             "schema.prisma",
@@ -2644,6 +2648,253 @@ class SpecbackfillOverlapTests(unittest.TestCase):
 
             self.assertEqual([candidate.id for candidate in candidates], [10])
             self.assertEqual([candidate.source for candidate in candidates], ["model"])
+
+    def test_review_gap_records_do_not_treat_specbackfill_links_as_local_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "review.db"
+            ensure_db_schema(db_path)
+            with sqlite_connection(db_path) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.execute(
+                    """
+                    INSERT INTO review_runs (
+                        id,
+                        repo,
+                        pr_number,
+                        diff_source,
+                        head_sha,
+                        model,
+                        ollama_base_url,
+                        diff_bytes,
+                        changed_files,
+                        reviewed_files_count,
+                        findings_count,
+                        watch_items_count,
+                        static_findings_count,
+                        model_findings_count,
+                        static_watch_items_count,
+                        model_watch_items_count,
+                        existing_review_comments_count,
+                        elapsed_seconds,
+                        report_markdown
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        1,
+                        "owner/repo",
+                        42,
+                        "diff",
+                        "abc123",
+                        "local-model",
+                        "http://127.0.0.1:11434",
+                        100,
+                        1,
+                        1,
+                        1,
+                        0,
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        1.0,
+                        "report",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO review_items (
+                        id,
+                        run_id,
+                        item_type,
+                        ordinal,
+                        source,
+                        severity,
+                        confidence,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fix,
+                        verification,
+                        fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        11,
+                        1,
+                        "finding",
+                        1,
+                        " specbackfill ",
+                        "error",
+                        "high",
+                        "schema.prisma",
+                        3,
+                        "Missing migration companion",
+                        "rule_id: DB001",
+                        "",
+                        "",
+                        "spec-fp",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO external_items (
+                        id,
+                        repo,
+                        pr_number,
+                        head_sha,
+                        import_head_sha,
+                        source,
+                        path,
+                        line,
+                        title,
+                        body,
+                        fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        20,
+                        "owner/repo",
+                        42,
+                        "abc123",
+                        "abc123",
+                        "human",
+                        "schema.prisma",
+                        3,
+                        "Missing migration companion",
+                        "Schema changed without migration companion.",
+                        "external-fp",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO item_verdicts (
+                        target_kind,
+                        target_id,
+                        verdict,
+                        reason,
+                        scorer
+                    ) VALUES ('external_item', ?, 'missed_by_local', 'external_valid', 'me')
+                    """,
+                    (20,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO item_links (
+                        review_item_id,
+                        external_item_id,
+                        relation,
+                        note
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (11, 20, "same_location", "future specbackfill link"),
+                )
+                records = review_gap_records(
+                    connection,
+                    repo="owner/repo",
+                    limit=10,
+                    min_link_score=0.55,
+                )
+
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["label"], "missed_by_local")
+            self.assertEqual(records[0]["label_quality"], "operator_validated")
+            self.assertEqual(records[0]["linked_review_item_ids"], [])
+            self.assertEqual(records[0]["finding_candidate_count"], 0)
+
+    def test_llreview_external_counts_ignore_specbackfill_links(self) -> None:
+        with sqlite_memory_connection() as connection:
+            connection.row_factory = sqlite3.Row
+            connection.executescript(
+                """
+                CREATE TABLE external_items (
+                    id INTEGER PRIMARY KEY,
+                    repo TEXT,
+                    pr_number INTEGER,
+                    head_sha TEXT,
+                    import_head_sha TEXT,
+                    source TEXT
+                );
+                CREATE TABLE review_items (
+                    id INTEGER PRIMARY KEY,
+                    source TEXT
+                );
+                CREATE TABLE item_links (
+                    review_item_id INTEGER,
+                    external_item_id INTEGER,
+                    relation TEXT
+                );
+                CREATE TABLE item_verdicts (
+                    id INTEGER PRIMARY KEY,
+                    target_kind TEXT,
+                    target_id INTEGER,
+                    verdict TEXT
+                );
+                INSERT INTO external_items VALUES
+                    (1, 'owner/repo', 42, '', '', 'human'),
+                    (2, 'owner/repo', 42, '', '', 'human');
+                INSERT INTO review_items VALUES
+                    (10, 'model'),
+                    (11, ' SpecBackfill ');
+                INSERT INTO item_links VALUES
+                    (10, 1, 'same_location'),
+                    (11, 2, 'same_location');
+                """
+            )
+            rows = connection.execute(
+                "SELECT 'owner/repo' AS repo, 42 AS pr_number, '' AS head_sha"
+            ).fetchall()
+
+            self.assertEqual(external_db_counts(connection), (2, 1))
+            self.assertEqual(
+                external_scope_counts(connection, repo="owner/repo", pr_number=42),
+                (2, 1),
+            )
+            total, linked, verdict_rows = external_report_counts(connection, rows)
+            self.assertEqual((total, linked), (2, 1))
+            self.assertEqual(verdict_rows, [])
+
+    def test_llreview_external_counts_tolerate_legacy_links_without_review_items(self) -> None:
+        with sqlite_memory_connection() as connection:
+            connection.row_factory = sqlite3.Row
+            connection.executescript(
+                """
+                CREATE TABLE external_items (
+                    id INTEGER PRIMARY KEY,
+                    repo TEXT,
+                    pr_number INTEGER,
+                    head_sha TEXT,
+                    import_head_sha TEXT,
+                    source TEXT
+                );
+                CREATE TABLE item_links (
+                    external_item_id INTEGER
+                );
+                CREATE TABLE item_verdicts (
+                    id INTEGER PRIMARY KEY,
+                    target_kind TEXT,
+                    target_id INTEGER,
+                    verdict TEXT
+                );
+                INSERT INTO external_items VALUES
+                    (1, 'owner/repo', 42, '', '', 'human'),
+                    (2, 'owner/repo', 42, '', '', 'human');
+                INSERT INTO item_links VALUES (1);
+                """
+            )
+            rows = connection.execute(
+                "SELECT 'owner/repo' AS repo, 42 AS pr_number, '' AS head_sha"
+            ).fetchall()
+
+            self.assertEqual(external_db_counts(connection), (2, 1))
+            self.assertEqual(
+                external_scope_counts(connection, repo="owner/repo", pr_number=42),
+                (2, 1),
+            )
+            total, linked, verdict_rows = external_report_counts(connection, rows)
+            self.assertEqual((total, linked), (2, 1))
+            self.assertEqual(verdict_rows, [])
 
     def test_specbackfill_only_rows_do_not_make_external_items_missed_by_local(self) -> None:
         with sqlite_memory_connection() as connection:
@@ -3831,6 +4082,10 @@ class ReviewDbAggregateTests(unittest.TestCase):
                     repo TEXT NOT NULL,
                     source TEXT NOT NULL
                 );
+                CREATE TABLE review_items (
+                    id INTEGER PRIMARY KEY,
+                    source TEXT NOT NULL
+                );
                 CREATE TABLE item_links (
                     id INTEGER PRIMARY KEY,
                     review_item_id INTEGER NOT NULL,
@@ -3854,8 +4109,16 @@ class ReviewDbAggregateTests(unittest.TestCase):
                 ],
             )
             connection.executemany(
+                "INSERT INTO review_items (id, source) VALUES (?, ?)",
+                [
+                    (10, "model"),
+                    (11, " SpecBackfill "),
+                    (12, "model"),
+                ],
+            )
+            connection.executemany(
                 "INSERT INTO item_links (review_item_id, external_item_id) VALUES (?, ?)",
-                [(10, 1), (11, 1), (12, 3)],
+                [(10, 1), (11, 2), (12, 3)],
             )
             connection.executemany(
                 """
@@ -3894,6 +4157,53 @@ class ReviewDbAggregateTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(external_link_health_counts(connection, repo="missing"), [])
+
+    def test_external_item_counts_tolerates_legacy_links_without_review_items(self) -> None:
+        with sqlite_memory_connection() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE external_items (
+                    id INTEGER PRIMARY KEY,
+                    repo TEXT NOT NULL,
+                    source TEXT NOT NULL
+                );
+                CREATE TABLE item_links (
+                    id INTEGER PRIMARY KEY,
+                    review_item_id INTEGER NOT NULL,
+                    external_item_id INTEGER NOT NULL
+                );
+                CREATE TABLE item_verdicts (
+                    id INTEGER PRIMARY KEY,
+                    target_kind TEXT NOT NULL,
+                    target_id INTEGER NOT NULL,
+                    verdict TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT ''
+                );
+                INSERT INTO external_items (id, repo, source) VALUES
+                    (1, 'owner/repo', 'github'),
+                    (2, 'owner/repo', 'github');
+                INSERT INTO item_links (review_item_id, external_item_id) VALUES
+                    (10, 1);
+                """
+            )
+
+            counts = external_item_counts(connection, repo="owner/repo")
+
+            self.assertEqual(counts["total"], 2)
+            self.assertEqual(counts["linked"], 1)
+            self.assertEqual(counts["unlinked"], 1)
+            self.assertEqual(
+                counts["verdict_rows"],
+                [
+                    {
+                        "source": "github",
+                        "verdict": "unscored",
+                        "reason": "(none)",
+                        "total": 2,
+                        "linked": 1,
+                    },
+                ],
+            )
 
     def test_backfill_queue_counts_group_records_and_totals(self) -> None:
         with sqlite_memory_connection() as connection:

@@ -211,6 +211,77 @@ def fetchall_mappings(cursor: sqlite3.Cursor) -> list[dict[str, Any]]:
     return [row_mapping(row, description) for row in cursor.fetchall()]
 
 
+def table_has_columns(connection: sqlite3.Connection, table: str, required: set[str]) -> bool:
+    try:
+        rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+    except sqlite3.Error:
+        return False
+    names = {
+        str(row["name"] if isinstance(row, sqlite3.Row) else row[1])
+        for row in rows
+    }
+    return required.issubset(names)
+
+
+def local_coverage_source_filter(source_sql: str) -> str:
+    return f"TRIM(LOWER(COALESCE({source_sql}, ''))) <> 'specbackfill'"
+
+
+def specbackfill_source_filter(source_sql: str) -> str:
+    return f"TRIM(LOWER(COALESCE({source_sql}, ''))) = 'specbackfill'"
+
+
+def local_coverage_linked_external_subquery(
+    connection: sqlite3.Connection,
+    *,
+    include_details: bool = False,
+) -> str:
+    select_columns = [
+        "links.external_item_id",
+    ]
+    if include_details:
+        relation_expr = (
+            "GROUP_CONCAT(DISTINCT links.relation)"
+            if table_has_columns(connection, "item_links", {"relation"})
+            else "''"
+        )
+        select_columns.extend(
+            [
+                "COUNT(DISTINCT links.review_item_id) AS link_count",
+                "GROUP_CONCAT(DISTINCT links.review_item_id) AS linked_review_item_ids",
+                f"{relation_expr} AS link_relations",
+            ]
+        )
+    select_sql = ",\n                    ".join(select_columns)
+    if table_has_columns(connection, "review_items", {"id", "source"}):
+        return f"""
+                SELECT {select_sql}
+                FROM item_links AS links
+                JOIN review_items AS linked_items
+                ON linked_items.id = links.review_item_id
+                WHERE {local_coverage_source_filter("linked_items.source")}
+                GROUP BY links.external_item_id
+            """
+    return f"""
+                SELECT {select_sql}
+                FROM item_links AS links
+                GROUP BY links.external_item_id
+            """
+
+
+def local_coverage_link_absence_filter(connection: sqlite3.Connection, external_id_sql: str) -> str:
+    links_sql = local_coverage_linked_external_subquery(connection)
+    return f"""
+            NOT EXISTS (
+                SELECT 1
+                FROM (
+                    {links_sql}
+                ) AS local_coverage_links
+                WHERE local_coverage_links.external_item_id = {external_id_sql}
+            )
+        """
+
+
 def review_run_counts(
     connection: sqlite3.Connection,
     *,
@@ -262,6 +333,7 @@ def external_link_health_counts(
     if repo:
         where = f"WHERE external_items.repo = {dialect.placeholder()}"
         params.append(repo)
+    linked_external_sql = local_coverage_linked_external_subquery(connection)
     rows = fetchall_mappings(
         connection.execute(
             f"""
@@ -273,9 +345,7 @@ def external_link_health_counts(
                 SUM(CASE WHEN linked_external.external_item_id IS NULL THEN 0 ELSE 1 END) AS linked
             FROM external_items
             LEFT JOIN (
-                SELECT external_item_id
-                FROM item_links
-                GROUP BY external_item_id
+                {linked_external_sql}
             ) AS linked_external
             ON linked_external.external_item_id = external_items.id
             LEFT JOIN (
@@ -328,16 +398,25 @@ def external_item_counts(
             params,
         ).fetchone()[0]
     )
-    linked_where = ""
+    linked_filters: list[str] = []
+    linked_review_items_join = ""
+    if table_has_columns(connection, "review_items", {"id", "source"}):
+        linked_review_items_join = """
+            JOIN review_items AS linked_items
+            ON linked_items.id = item_links.review_item_id
+        """
+        linked_filters.append(local_coverage_source_filter("linked_items.source"))
     linked_params: list[Any] = []
     if repo:
-        linked_where = f"WHERE external_items.repo = {dialect.placeholder()}"
+        linked_filters.append(f"external_items.repo = {dialect.placeholder()}")
         linked_params.append(repo)
+    linked_where = "WHERE " + " AND ".join(linked_filters) if linked_filters else ""
     linked = int(
         connection.execute(
             f"""
             SELECT COUNT(DISTINCT item_links.external_item_id)
             FROM item_links
+            {linked_review_items_join}
             JOIN external_items
             ON external_items.id = item_links.external_item_id
             {linked_where}

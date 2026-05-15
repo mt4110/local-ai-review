@@ -47,9 +47,13 @@ from review_db import (
     connect_review_db_readonly,
     count_rows,
     external_item_counts,
+    local_coverage_link_absence_filter,
+    local_coverage_linked_external_subquery,
+    local_coverage_source_filter,
     recent_item_verdicts,
     recent_review_runs,
     review_run_counts,
+    specbackfill_source_filter,
     sqlite_db_path,
     table_counts,
 )
@@ -4931,6 +4935,7 @@ def external_link_health_rows(
     if repo:
         repo_filter = "WHERE external_items.repo = ?"
         params.append(repo)
+    local_links_sql = local_coverage_linked_external_subquery(connection, include_details=True)
     return connection.execute(
         f"""
         SELECT
@@ -4938,10 +4943,12 @@ def external_link_health_rows(
             COALESCE(NULLIF(verdicts.verdict, ''), 'unscored') AS verdict,
             COALESCE(NULLIF(verdicts.reason, ''), '(none)') AS reason,
             COUNT(*) AS total,
-            COUNT(DISTINCT item_links.external_item_id) AS linked
+            SUM(CASE WHEN local_links.external_item_id IS NULL THEN 0 ELSE 1 END) AS linked
         FROM external_items
-        LEFT JOIN item_links
-        ON item_links.external_item_id = external_items.id
+        LEFT JOIN (
+            {local_links_sql}
+        ) AS local_links
+        ON local_links.external_item_id = external_items.id
         LEFT JOIN (
             SELECT item_verdicts.*
             FROM item_verdicts
@@ -5056,6 +5063,7 @@ def link_diagnostic_records(
     if repo:
         repo_filter = "AND external_items.repo = ?"
         params.append(repo)
+    local_link_absence_sql = local_coverage_link_absence_filter(connection, "external_items.id")
     rows = connection.execute(
         f"""
         SELECT
@@ -5075,11 +5083,7 @@ def link_diagnostic_records(
         ) AS verdicts
         ON verdicts.target_kind = 'external_item'
         AND verdicts.target_id = external_items.id
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM item_links
-            WHERE item_links.external_item_id = external_items.id
-        )
+        WHERE {local_link_absence_sql}
         {repo_filter}
         ORDER BY external_items.id DESC
         LIMIT ?
@@ -5261,7 +5265,7 @@ def matcher_explain_gap_class(
 
 def matcher_explain_gap_note(gap_class: str) -> str:
     notes = {
-        "already_linked": "The external item already has an item_links row.",
+        "already_linked": "The external item already has a local/model item_links row.",
         "no_comparable_local_run": "No local review run matched this external item scope, so matcher had nothing to compare.",
         "watch_only_no_finding": "Comparable local runs exist, but only watch items were nearby; local did not produce a finding candidate.",
         "no_local_finding_candidates": "Comparable local runs exist, but they produced no finding candidates for this scope.",
@@ -5291,15 +5295,7 @@ def matcher_explain_external_rows(
         filters.append("external_items.id = ?")
         params.append(external_id)
     elif not include_linked:
-        filters.append(
-            """
-            NOT EXISTS (
-                SELECT 1
-                FROM item_links
-                WHERE item_links.external_item_id = external_items.id
-            )
-            """
-        )
+        filters.append(local_coverage_link_absence_filter(connection, "external_items.id"))
     if repo and external_id is None:
         filters.append("external_items.repo = ?")
         params.append(repo)
@@ -5314,15 +5310,16 @@ def matcher_explain_external_rows(
     if limit > 0 and external_id is None:
         limit_sql = "LIMIT ?"
         limit_params.append(limit)
+    local_links_sql = local_coverage_linked_external_subquery(connection, include_details=True)
     return connection.execute(
         f"""
         SELECT
             external_items.*,
             COALESCE(NULLIF(verdicts.verdict, ''), 'unscored') AS verdict,
             COALESCE(NULLIF(verdicts.reason, ''), '(none)') AS reason,
-            COUNT(DISTINCT item_links.review_item_id) AS link_count,
-            GROUP_CONCAT(DISTINCT item_links.review_item_id) AS linked_review_item_ids,
-            GROUP_CONCAT(DISTINCT item_links.relation) AS link_relations
+            COALESCE(local_links.link_count, 0) AS link_count,
+            COALESCE(local_links.linked_review_item_ids, '') AS linked_review_item_ids,
+            COALESCE(local_links.link_relations, '') AS link_relations
         FROM external_items
         LEFT JOIN (
             SELECT item_verdicts.*
@@ -5336,8 +5333,10 @@ def matcher_explain_external_rows(
         ) AS verdicts
         ON verdicts.target_kind = 'external_item'
         AND verdicts.target_id = external_items.id
-        LEFT JOIN item_links
-        ON item_links.external_item_id = external_items.id
+        LEFT JOIN (
+            {local_links_sql}
+        ) AS local_links
+        ON local_links.external_item_id = external_items.id
         WHERE {" AND ".join(filters)}
         GROUP BY external_items.id
         ORDER BY external_items.id DESC
@@ -5693,6 +5692,7 @@ def review_gap_external_rows(
         repo_filter = "AND external_items.repo = ?"
         params.append(repo)
     limit_sql, limit_params = query_limit_clause(limit)
+    local_links_sql = local_coverage_linked_external_subquery(connection, include_details=True)
     return connection.execute(
         f"""
         SELECT
@@ -5701,12 +5701,14 @@ def review_gap_external_rows(
             COALESCE(NULLIF(verdicts.reason, ''), '(none)') AS reason,
             verdicts.scorer AS verdict_scorer,
             verdicts.scored_at AS verdict_scored_at,
-            COUNT(DISTINCT item_links.review_item_id) AS link_count,
-            GROUP_CONCAT(DISTINCT item_links.review_item_id) AS linked_review_item_ids,
-            GROUP_CONCAT(DISTINCT item_links.relation) AS link_relations
+            COALESCE(local_links.link_count, 0) AS link_count,
+            COALESCE(local_links.linked_review_item_ids, '') AS linked_review_item_ids,
+            COALESCE(local_links.link_relations, '') AS link_relations
         FROM external_items
-        LEFT JOIN item_links
-        ON item_links.external_item_id = external_items.id
+        LEFT JOIN (
+            {local_links_sql}
+        ) AS local_links
+        ON local_links.external_item_id = external_items.id
         LEFT JOIN (
             SELECT item_verdicts.*
             FROM item_verdicts
@@ -6218,20 +6220,23 @@ def stamp_assist_external_row(
     connection: sqlite3.Connection,
     external_item_id: int,
 ) -> sqlite3.Row:
+    local_links_sql = local_coverage_linked_external_subquery(connection, include_details=True)
     row = connection.execute(
-        """
+        f"""
         SELECT
             external_items.*,
             COALESCE(NULLIF(verdicts.verdict, ''), 'unscored') AS verdict,
             COALESCE(NULLIF(verdicts.reason, ''), '(none)') AS reason,
             verdicts.scorer AS verdict_scorer,
             verdicts.scored_at AS verdict_scored_at,
-            COUNT(DISTINCT item_links.review_item_id) AS link_count,
-            GROUP_CONCAT(DISTINCT item_links.review_item_id) AS linked_review_item_ids,
-            GROUP_CONCAT(DISTINCT item_links.relation) AS link_relations
+            COALESCE(local_links.link_count, 0) AS link_count,
+            COALESCE(local_links.linked_review_item_ids, '') AS linked_review_item_ids,
+            COALESCE(local_links.link_relations, '') AS link_relations
         FROM external_items
-        LEFT JOIN item_links
-        ON item_links.external_item_id = external_items.id
+        LEFT JOIN (
+            {local_links_sql}
+        ) AS local_links
+        ON local_links.external_item_id = external_items.id
         LEFT JOIN (
             SELECT item_verdicts.*
             FROM item_verdicts
@@ -6261,17 +6266,20 @@ def stamp_assist_bucket_counts(
     source: str,
     path_class: str,
 ) -> dict[str, Any]:
+    local_links_sql = local_coverage_linked_external_subquery(connection, include_details=True)
     rows = connection.execute(
-        """
+        f"""
         SELECT
             external_items.id,
             external_items.path,
             COALESCE(NULLIF(verdicts.verdict, ''), 'unscored') AS verdict,
             COALESCE(NULLIF(verdicts.reason, ''), '(none)') AS reason,
-            COUNT(DISTINCT item_links.review_item_id) AS link_count
+            COALESCE(local_links.link_count, 0) AS link_count
         FROM external_items
-        LEFT JOIN item_links
-        ON item_links.external_item_id = external_items.id
+        LEFT JOIN (
+            {local_links_sql}
+        ) AS local_links
+        ON local_links.external_item_id = external_items.id
         LEFT JOIN (
             SELECT item_verdicts.*
             FROM item_verdicts
@@ -9504,6 +9512,7 @@ def external_label_stats_for_risk(
         source_filter = "AND external_items.source = ?"
         params.append(source)
     limit_sql, limit_params = query_limit_clause(scan_limit)
+    local_links_sql = local_coverage_linked_external_subquery(connection, include_details=True)
     rows = connection.execute(
         f"""
         SELECT
@@ -9512,10 +9521,12 @@ def external_label_stats_for_risk(
             external_items.source,
             COALESCE(NULLIF(verdicts.verdict, ''), 'unscored') AS verdict,
             COALESCE(NULLIF(verdicts.reason, ''), '(none)') AS reason,
-            COUNT(DISTINCT item_links.review_item_id) AS link_count
+            COALESCE(local_links.link_count, 0) AS link_count
         FROM external_items
-        LEFT JOIN item_links
-        ON item_links.external_item_id = external_items.id
+        LEFT JOIN (
+            {local_links_sql}
+        ) AS local_links
+        ON local_links.external_item_id = external_items.id
         LEFT JOIN (
             SELECT item_verdicts.*
             FROM item_verdicts
@@ -10135,16 +10146,19 @@ def prompt_regression_external_counts(
     comparator = ">=" if direction == "after" else "<"
     order = "ASC" if direction == "after" else "DESC"
     limit_sql, limit_params = query_limit_clause(limit)
+    local_links_sql = local_coverage_linked_external_subquery(connection, include_details=True)
     rows = connection.execute(
         f"""
         SELECT
             external_items.path,
             COALESCE(NULLIF(verdicts.verdict, ''), 'unscored') AS verdict,
             COALESCE(NULLIF(verdicts.reason, ''), '(none)') AS reason,
-            COUNT(DISTINCT item_links.review_item_id) AS link_count
+            COALESCE(local_links.link_count, 0) AS link_count
         FROM external_items
-        LEFT JOIN item_links
-        ON item_links.external_item_id = external_items.id
+        LEFT JOIN (
+            {local_links_sql}
+        ) AS local_links
+        ON local_links.external_item_id = external_items.id
         LEFT JOIN (
             SELECT item_verdicts.*
             FROM item_verdicts
@@ -12051,7 +12065,7 @@ def load_link_candidates_for_item_types(
         ON runs.id = items.run_id
         WHERE {where_sql}
           AND items.item_type IN ({item_type_placeholders})
-          AND LOWER(items.source) <> 'specbackfill'
+          AND {local_coverage_source_filter("items.source")}
         ORDER BY runs.id DESC, items.item_type, items.ordinal
         """,
         [*params, *clean_item_types],
@@ -14468,13 +14482,16 @@ def external_scope_counts(
             params,
         ).fetchone()[0]
     )
+    local_links_sql = local_coverage_linked_external_subquery(connection)
     linked = int(
         connection.execute(
             f"""
             SELECT COUNT(DISTINCT external_items.id)
             FROM external_items
-            JOIN item_links
-            ON item_links.external_item_id = external_items.id
+            JOIN (
+                {local_links_sql}
+            ) AS local_coverage_links
+            ON local_coverage_links.external_item_id = external_items.id
             WHERE external_items.repo = ?{pr_filter}
             """,
             params,
@@ -14485,11 +14502,14 @@ def external_scope_counts(
 
 def external_db_counts(connection: sqlite3.Connection) -> tuple[int, int]:
     total = int(connection.execute("SELECT COUNT(*) FROM external_items").fetchone()[0])
+    local_links_sql = local_coverage_linked_external_subquery(connection)
     linked = int(
         connection.execute(
-            """
-            SELECT COUNT(DISTINCT external_item_id)
-            FROM item_links
+            f"""
+            SELECT COUNT(DISTINCT local_coverage_links.external_item_id)
+            FROM (
+                {local_links_sql}
+            ) AS local_coverage_links
             """
         ).fetchone()[0]
     )
@@ -14551,13 +14571,16 @@ def external_report_counts(
             params,
         ).fetchone()[0]
     )
+    local_links_sql = local_coverage_linked_external_subquery(connection)
     linked = int(
         connection.execute(
             f"""
             SELECT COUNT(DISTINCT external_items.id)
             FROM external_items
-            JOIN item_links
-            ON item_links.external_item_id = external_items.id
+            JOIN (
+                {local_links_sql}
+            ) AS local_coverage_links
+            ON local_coverage_links.external_item_id = external_items.id
             WHERE {where_sql}
             """,
             params,
@@ -14965,7 +14988,7 @@ def specbackfill_overlap_local_rows(
     if local_source == "model":
         filters.append("items.source = 'model'")
     elif local_source == "non-specbackfill":
-        filters.append("LOWER(items.source) <> 'specbackfill'")
+        filters.append(local_coverage_source_filter("items.source"))
     limit_sql, limit_params = query_limit_clause(limit)
     return connection.execute(
         f"""
@@ -14997,7 +15020,7 @@ def specbackfill_overlap_saved_rows(
         return []
     filters = [
         "items.item_type = 'finding'",
-        "LOWER(items.source) = 'specbackfill'",
+        specbackfill_source_filter("items.source"),
     ]
     params: list[Any] = []
     run_id = as_optional_int(scope.get("run_id"))
@@ -15349,7 +15372,7 @@ def specbackfill_review_item_import_state(
               AND item_type = 'finding'
               AND fingerprint IN ({placeholders})
             ORDER BY
-                CASE WHEN LOWER(source) = 'specbackfill' THEN 0 ELSE 1 END,
+                CASE WHEN {specbackfill_source_filter("source")} THEN 0 ELSE 1 END,
                 id
             """,
             [run_id, *batch],
@@ -18121,12 +18144,13 @@ def run_external_item_count(connection: sqlite3.Connection, row: sqlite3.Row) ->
 def run_linked_external_item_count(connection: sqlite3.Connection, run_id: int) -> int:
     return int(
         connection.execute(
-            """
+            f"""
             SELECT COUNT(DISTINCT links.external_item_id)
             FROM item_links AS links
             JOIN review_items AS items
             ON items.id = links.review_item_id
             WHERE items.run_id = ?
+              AND {local_coverage_source_filter("items.source")}
             """,
             (run_id,),
         ).fetchone()[0]
