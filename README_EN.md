@@ -534,6 +534,17 @@ body/evidence/diff output. Use explicit `--record-db-artifacts` with `--run`
 when you want only the preview artifact paths and sha256 digests recorded in the
 review DB; this still does not write `item_links` or `item_verdicts`.
 
+If a future apply path writes `item_links` from `specbackfill-overlap`, the
+default must remain preview-only with no DB writes, and persistence must require
+a separate command or explicit opt-in flag. Apply should only use candidates
+anchored to saved `review_items(source='specbackfill')` rows through `--run`,
+exclude external items already judged false-positive, not-actionable, or
+out-of-scope, and skip any existing `(review_item_id, external_item_id)` pair
+even when the stored relation differs. Reuse the matcher relation for
+`relation`, keep `source=specbackfill`, rule id, score, and match relation in
+the note, never count specbackfill links as local/model coverage, and do not
+auto-write `item_verdicts`.
+
 Use `llreview specbackfill-import-preview --specbackfill-json specbackfill.json
 --run <run-id>` to normalize `specbackfill check --format json --fail-on off`
 findings into would-be `review_items(source='specbackfill')` rows without DB
