@@ -56,20 +56,36 @@ ORDER BY runs.id DESC, artifacts.path
 LIMIT 50;
 
 -- Imported external review items and local-link coverage
+WITH local_coverage_links AS (
+  SELECT item_links.external_item_id
+  FROM item_links
+  JOIN review_items
+  ON review_items.id = item_links.review_item_id
+  WHERE TRIM(LOWER(COALESCE(review_items.source, ''))) <> 'specbackfill'
+  GROUP BY item_links.external_item_id
+)
 SELECT
   external_items.repo,
   external_items.pr_number,
   external_items.source,
   COUNT(DISTINCT external_items.id) AS external_items,
-  COUNT(DISTINCT item_links.external_item_id) AS linked_external_items,
-  COUNT(DISTINCT external_items.id) - COUNT(DISTINCT item_links.external_item_id) AS unlinked_external_items
+  COUNT(DISTINCT local_coverage_links.external_item_id) AS linked_external_items,
+  COUNT(DISTINCT external_items.id) - COUNT(DISTINCT local_coverage_links.external_item_id) AS unlinked_external_items
 FROM external_items
-LEFT JOIN item_links
-ON item_links.external_item_id = external_items.id
+LEFT JOIN local_coverage_links
+ON local_coverage_links.external_item_id = external_items.id
 GROUP BY external_items.repo, external_items.pr_number, external_items.source
 ORDER BY external_items.repo, external_items.pr_number DESC, external_items.source;
 
 -- External items that may represent local misses
+WITH local_coverage_links AS (
+  SELECT item_links.external_item_id
+  FROM item_links
+  JOIN review_items
+  ON review_items.id = item_links.review_item_id
+  WHERE TRIM(LOWER(COALESCE(review_items.source, ''))) <> 'specbackfill'
+  GROUP BY item_links.external_item_id
+)
 SELECT
   external_items.repo,
   external_items.pr_number,
@@ -80,8 +96,8 @@ SELECT
   verdicts.verdict,
   verdicts.reason
 FROM external_items
-LEFT JOIN item_links
-ON item_links.external_item_id = external_items.id
+LEFT JOIN local_coverage_links
+ON local_coverage_links.external_item_id = external_items.id
 LEFT JOIN (
   SELECT item_verdicts.*
   FROM item_verdicts
@@ -94,7 +110,7 @@ LEFT JOIN (
 ) AS verdicts
 ON verdicts.target_kind = 'external_item'
 AND verdicts.target_id = external_items.id
-WHERE item_links.id IS NULL
+WHERE local_coverage_links.external_item_id IS NULL
 ORDER BY external_items.created_at DESC
 LIMIT 50;
 

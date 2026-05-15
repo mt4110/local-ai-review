@@ -270,6 +270,10 @@ class DashboardSnapshotTests(unittest.TestCase):
                         source TEXT NOT NULL,
                         path TEXT NOT NULL DEFAULT ''
                     );
+                    CREATE TABLE review_items (
+                        id INTEGER PRIMARY KEY,
+                        source TEXT NOT NULL
+                    );
                     CREATE TABLE item_links (
                         id INTEGER PRIMARY KEY,
                         review_item_id INTEGER NOT NULL,
@@ -346,6 +350,13 @@ class DashboardSnapshotTests(unittest.TestCase):
                     ],
                 )
                 connection.executemany(
+                    "INSERT INTO review_items (id, source) VALUES (?, ?)",
+                    [
+                        (100, "model"),
+                        (101, " SpecBackfill "),
+                    ],
+                )
+                connection.executemany(
                     """
                     INSERT INTO item_verdicts (
                         id,
@@ -362,8 +373,12 @@ class DashboardSnapshotTests(unittest.TestCase):
                         (2, 3),
                     ],
                 )
-                connection.execute(
-                    "INSERT INTO item_links (review_item_id, external_item_id, relation) VALUES (100, 3, 'covered')"
+                connection.executemany(
+                    "INSERT INTO item_links (review_item_id, external_item_id, relation) VALUES (?, ?, ?)",
+                    [
+                        (100, 3, "covered"),
+                        (101, 1, "same_location"),
+                    ],
                 )
                 connection.execute(
                     """
@@ -802,7 +817,7 @@ class DashboardSnapshotTests(unittest.TestCase):
                 )
                 connection.execute("INSERT INTO review_runs (id, repo) VALUES (1, 'owner/repo')")
                 connection.execute(
-                    "INSERT INTO review_items (run_id, source, created_at) VALUES (1, 'specbackfill', '2026-05-01 00:00:00')"
+                    "INSERT INTO review_items (run_id, source, created_at) VALUES (1, ' SpecBackfill ', '2026-05-01 00:00:00')"
                 )
 
             payload = dashboard_snapshot.dashboard_snapshot(

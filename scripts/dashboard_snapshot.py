@@ -33,8 +33,10 @@ from review_db import (
     backfill_queue_counts,
     connect_review_db_readonly,
     external_item_counts,
+    local_coverage_linked_external_subquery,
     review_db_config,
     review_run_counts,
+    specbackfill_source_filter,
     table_counts,
 )
 
@@ -654,7 +656,7 @@ def specbackfill_db_status(
     status = empty_specbackfill_status()
     if not (has_object(objects, "review_items") and has_object(objects, "review_runs")):
         return status
-    where = "WHERE items.source = 'specbackfill'"
+    where = f"WHERE {specbackfill_source_filter('items.source')}"
     params: list[Any] = []
     if repo:
         where += " AND runs.repo = ?"
@@ -1052,6 +1054,7 @@ def latest_external_verdict_stats(
     if repo:
         where = "WHERE external_items.repo = ?"
         params.append(repo)
+    linked_external_sql = local_coverage_linked_external_subquery(connection)
     rows = connection.execute(
         f"""
         SELECT
@@ -1066,9 +1069,7 @@ def latest_external_verdict_stats(
                 CASE WHEN linked.external_item_id IS NULL THEN 0 ELSE 1 END AS linked
             FROM external_items
             LEFT JOIN (
-                SELECT external_item_id
-                FROM item_links
-                GROUP BY external_item_id
+                {linked_external_sql}
             ) AS linked
             ON linked.external_item_id = external_items.id
             LEFT JOIN (
