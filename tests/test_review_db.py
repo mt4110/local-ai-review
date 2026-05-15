@@ -45,6 +45,7 @@ from llreview import (  # noqa: E402
     command_specbackfill_import_apply,
     command_specbackfill_import_preview,
     command_specbackfill_overlap,
+    dedupe_local_overlap_records,
     ensure_db_schema,
     external_items_from_comments,
     learning_calibration_statuses_by_candidate,
@@ -147,6 +148,32 @@ class ReviewDbConfigTests(unittest.TestCase):
 
 
 class SpecbackfillOverlapTests(unittest.TestCase):
+    def test_dedupe_local_overlap_records_keeps_one_best_record_per_local_item(self) -> None:
+        records = [
+            {
+                "local_review_item_id": 10,
+                "specbackfill_ordinal": 1,
+                "score": 0.72,
+            },
+            {
+                "local_review_item_id": 10,
+                "specbackfill_ordinal": 2,
+                "score": 0.91,
+            },
+            {
+                "local_review_item_id": 12,
+                "specbackfill_ordinal": 3,
+                "score": 0.80,
+            },
+        ]
+
+        deduped = dedupe_local_overlap_records(records)
+
+        self.assertEqual(len(deduped), 2)
+        self.assertEqual(deduped[0]["local_review_item_id"], 10)
+        self.assertEqual(deduped[0]["specbackfill_ordinal"], 2)
+        self.assertEqual(deduped[1]["local_review_item_id"], 12)
+
     def test_saved_specbackfill_fallback_fingerprint_ignores_row_id(self) -> None:
         with sqlite_memory_connection() as connection:
             connection.row_factory = sqlite3.Row

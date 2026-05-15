@@ -15478,6 +15478,23 @@ def specbackfill_false_positive_signal_record(finding: SpecbackfillFinding) -> d
     }
 
 
+def dedupe_local_overlap_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    best_by_local_id: dict[int, dict[str, Any]] = {}
+    order: list[int] = []
+    for record in records:
+        local_id = as_optional_int(record.get("local_review_item_id"))
+        if local_id is None:
+            continue
+        existing = best_by_local_id.get(local_id)
+        if existing is None:
+            order.append(local_id)
+            best_by_local_id[local_id] = record
+            continue
+        if float(record.get("score") or 0.0) > float(existing.get("score") or 0.0):
+            best_by_local_id[local_id] = record
+    return [best_by_local_id[local_id] for local_id in order]
+
+
 def specbackfill_overlap_payload(
     *,
     args: argparse.Namespace,
@@ -15620,8 +15637,7 @@ def specbackfill_overlap_payload(
         if int(record["external_item_id"]) not in local_covered_external_ids
     ]
     local_overlapped_by_specbackfill = [
-        record
-        for record in spec_local_records
+        record for record in dedupe_local_overlap_records(spec_local_records)
         if int(record.get("local_review_item_id") or 0) in local_ids_matched_by_specbackfill
     ]
     specbackfill_false_positives = [
