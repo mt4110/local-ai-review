@@ -527,8 +527,13 @@ from missed/covered signals. It does not write DB rows, call the GitHub API,
 check out PR code, execute PR code, post PR comments, or mutate PR titles/bodies.
 The Markdown/JSON artifacts under `out/review-history/specbackfill-overlap/`
 render ids, paths, line numbers, rule ids, and digests instead of raw DB
-bodies, raw evidence, or raw diff text. Use `--dry-run` to print the same
-preview without writing artifacts.
+bodies, raw evidence, or raw diff text. The artifact also includes link
+readiness for a possible future `item_links` apply path, but the current
+decision remains preview-only and specbackfill links are explicitly not local or
+model coverage. With explicit `--record-db-artifacts`, it records only artifact
+path / sha256 rows in `artifacts`; it still does not write `item_links` or
+`item_verdicts`. Use `--dry-run` to print the same preview without writing
+artifacts.
 
 `llreview specbackfill-import-preview --specbackfill-json specbackfill.json
 --run <run-id>` deterministically normalizes `specbackfill` findings into

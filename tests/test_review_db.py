@@ -1244,6 +1244,21 @@ class SpecbackfillOverlapTests(unittest.TestCase):
             self.assertEqual(payload["counts"]["specbackfill_local_overlaps"], 1)
             self.assertEqual(payload["counts"]["specbackfill_external_overlaps"], 1)
             self.assertFalse(payload["policy"]["db_writes"])
+            self.assertFalse(payload["link_readiness"]["can_write_item_links_now"])
+            self.assertEqual(payload["link_readiness"]["decision"], "keep_preview_only")
+            self.assertEqual(
+                payload["link_readiness"]["counts"]["missing_specbackfill_review_item_id"],
+                1,
+            )
+            self.assertEqual(payload["link_readiness"]["counts"]["blocked_by_design_boundary"], 0)
+            self.assertEqual(
+                payload["link_readiness"]["candidates"][0]["preview_action"],
+                "blocked_no_saved_specbackfill_review_item",
+            )
+            self.assertEqual(
+                payload["link_readiness"]["candidates"][0]["proposed_relation"],
+                "same_location",
+            )
             self.assertIn("OK: specbackfill overlap report=", output.getvalue())
             with sqlite_connection(db_path) as connection:
                 link_count = connection.execute("SELECT COUNT(*) FROM item_links").fetchone()[0]
@@ -1459,6 +1474,15 @@ class SpecbackfillOverlapTests(unittest.TestCase):
             self.assertEqual(covered["specbackfill_review_item_id"], 11)
             self.assertEqual(false_positive["specbackfill_review_item_id"], 11)
             self.assertEqual(false_positive["latest_reason"], "covered_by_tests")
+            self.assertFalse(payload["link_readiness"]["can_write_item_links_now"])
+            self.assertEqual(payload["link_readiness"]["counts"]["future_apply_candidate_links"], 1)
+            self.assertEqual(payload["link_readiness"]["counts"]["blocked_by_design_boundary"], 1)
+            self.assertEqual(
+                payload["link_readiness"]["candidates"][0]["preview_action"],
+                "candidate_after_design_update",
+            )
+            self.assertFalse(payload["link_readiness"]["candidates"][0]["counts_as_local_model_coverage"])
+            self.assertIn("source=specbackfill", payload["link_readiness"]["candidates"][0]["proposed_note"])
             with sqlite_connection(db_path) as connection:
                 link_count = connection.execute("SELECT COUNT(*) FROM item_links").fetchone()[0]
             self.assertEqual(link_count, 0)
@@ -1823,6 +1847,9 @@ class SpecbackfillOverlapTests(unittest.TestCase):
                 payload["counts"]["external_items_missed_by_local_but_covered_by_specbackfill"],
                 0,
             )
+            self.assertEqual(payload["link_readiness"]["counts"]["actionable_external_candidates"], 0)
+            self.assertEqual(payload["link_readiness"]["counts"]["blocked_by_design_boundary"], 0)
+            self.assertEqual(payload["link_readiness"]["candidates"], [])
 
     def test_specbackfill_overlap_does_not_treat_specbackfill_link_as_local_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1979,11 +2006,20 @@ class SpecbackfillOverlapTests(unittest.TestCase):
             payload = json.loads(output.getvalue())
             self.assertEqual(payload["counts"]["existing_external_local_links"], 0)
             self.assertEqual(payload["counts"]["external_items_covered_by_existing_links"], 0)
+            self.assertEqual(payload["counts"]["existing_specbackfill_external_links"], 1)
             self.assertEqual(payload["counts"]["external_items_missed_by_local"], 1)
             self.assertEqual(
                 payload["counts"]["external_items_missed_by_local_but_covered_by_specbackfill"],
                 1,
             )
+            self.assertEqual(payload["link_readiness"]["counts"]["existing_pair_links"], 1)
+            self.assertEqual(payload["link_readiness"]["counts"]["future_apply_candidate_links"], 0)
+            self.assertEqual(payload["link_readiness"]["counts"]["blocked_by_design_boundary"], 0)
+            self.assertEqual(
+                payload["link_readiness"]["candidates"][0]["preview_action"],
+                "already_linked_pair",
+            )
+            self.assertEqual(payload["link_readiness"]["candidates"][0]["existing_relations"], ["specbackfill"])
 
     def test_specbackfill_overlap_json_excludes_saved_specbackfill_rows_from_local_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2379,6 +2415,8 @@ class SpecbackfillOverlapTests(unittest.TestCase):
                 command_specbackfill_overlap(args)
 
             rendered = output.getvalue()
+            self.assertIn("Report-only dry-run.", rendered)
+            self.assertIn("does not write artifact files, DB rows, or mutate GitHub", rendered)
             self.assertIn("specbackfill to local overlaps: 1", rendered)
             self.assertIn("Match samples were omitted by the current `--match-limit`.", rendered)
             self.assertNotIn("No deterministic overlaps reached the current threshold.", rendered)
