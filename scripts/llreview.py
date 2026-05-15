@@ -15206,6 +15206,43 @@ def specbackfill_overlap_existing_linked_external_ids(
     return linked_external_ids
 
 
+def specbackfill_overlap_existing_spec_external_links(
+    connection: sqlite3.Connection | None,
+    *,
+    findings: list["SpecbackfillFinding"],
+    external_rows: list[sqlite3.Row],
+) -> dict[tuple[int, int], list[str]]:
+    if connection is None or not sqlite_table_exists(connection, "item_links"):
+        return {}
+    spec_ids = [
+        int(finding.review_item_id)
+        for finding in findings
+        if finding.review_item_id is not None
+    ]
+    external_ids = [int(row["id"]) for row in external_rows]
+    if not spec_ids or not external_ids:
+        return {}
+    links: dict[tuple[int, int], list[str]] = {}
+    for spec_batch in sqlite_batched_values(spec_ids):
+        spec_placeholders = sqlite_placeholders(len(spec_batch))
+        for external_batch in sqlite_batched_values(external_ids):
+            external_placeholders = sqlite_placeholders(len(external_batch))
+            rows = connection.execute(
+                f"""
+                SELECT review_item_id, external_item_id, relation
+                FROM item_links
+                WHERE review_item_id IN ({spec_placeholders})
+                  AND external_item_id IN ({external_placeholders})
+                ORDER BY review_item_id, external_item_id, relation
+                """,
+                [*spec_batch, *external_batch],
+            ).fetchall()
+            for row in rows:
+                key = (int(row["review_item_id"]), int(row["external_item_id"]))
+                links.setdefault(key, []).append(str(row["relation"] or ""))
+    return links
+
+
 def specbackfill_finding_record(finding: SpecbackfillFinding) -> dict[str, Any]:
     return {
         "ordinal": finding.ordinal,
@@ -15500,6 +15537,103 @@ def dedupe_local_overlap_records(records: list[dict[str, Any]]) -> list[dict[str
     return [best_by_local_id[local_id] for local_id in order]
 
 
+def specbackfill_link_readiness_note(record: dict[str, Any]) -> str:
+    return (
+        "specbackfill_overlap: "
+        f"source=specbackfill "
+        f"rule_id={record.get('rule_id') or '(none)'} "
+        f"score={float(record.get('score') or 0.0):.2f} "
+        f"match_relation={record.get('relation') or ''}"
+    )
+
+
+def specbackfill_link_readiness_relation(record: dict[str, Any]) -> str:
+    relation = str(record.get("relation") or "").strip()
+    return relation or "related_risk"
+
+
+def specbackfill_link_readiness(
+    *,
+    spec_external_records: list[dict[str, Any]],
+    existing_spec_external_links: dict[tuple[int, int], list[str]],
+    actionable_external_ids: set[int],
+    match_limit: int,
+) -> dict[str, Any]:
+    candidates: list[dict[str, Any]] = []
+    counts = {
+        "specbackfill_external_overlap_candidates": len(spec_external_records),
+        "actionable_external_candidates": 0,
+        "missing_specbackfill_review_item_id": 0,
+        "existing_pair_links": 0,
+        "future_apply_candidate_links": 0,
+        "blocked_by_design_boundary": 0,
+    }
+    for record in spec_external_records:
+        external_id = as_optional_int(record.get("external_item_id"))
+        spec_review_item_id = as_optional_int(record.get("specbackfill_review_item_id"))
+        if external_id is None:
+            continue
+        if external_id not in actionable_external_ids:
+            continue
+        counts["actionable_external_candidates"] += 1
+        existing_relations = (
+            existing_spec_external_links.get((spec_review_item_id, external_id), [])
+            if spec_review_item_id is not None
+            else []
+        )
+        if spec_review_item_id is None:
+            preview_action = "blocked_no_saved_specbackfill_review_item"
+            counts["missing_specbackfill_review_item_id"] += 1
+        elif existing_relations:
+            preview_action = "already_linked_pair"
+            counts["existing_pair_links"] += 1
+        else:
+            preview_action = "candidate_after_design_update"
+            counts["future_apply_candidate_links"] += 1
+            counts["blocked_by_design_boundary"] += 1
+        proposed_relation = specbackfill_link_readiness_relation(record)
+        candidates.append(
+            {
+                "candidate_kind": "future_item_link",
+                "preview_action": preview_action,
+                "will_write": False,
+                "review_item_id": spec_review_item_id,
+                "review_item_source": "specbackfill",
+                "external_item_id": external_id,
+                "external_source": record.get("external_source", ""),
+                "rule_id": record.get("rule_id", ""),
+                "path": record.get("path", ""),
+                "line": record.get("line"),
+                "score": record.get("score"),
+                "match_relation": record.get("relation", ""),
+                "proposed_relation": proposed_relation,
+                "proposed_note": specbackfill_link_readiness_note(record),
+                "existing_relations": existing_relations,
+                "counts_as_local_model_coverage": False,
+                "requires_source_aware_link_consumers": True,
+            }
+        )
+    return {
+        "decision": "keep_preview_only",
+        "can_write_item_links_now": False,
+        "write_scope": "",
+        "reason": (
+            "Specbackfill overlap is deterministic evidence, but item_links writes are still "
+            "outside this phase. Future apply needs source-aware link consumers so a "
+            "specbackfill link is not counted as local/model coverage."
+        ),
+        "required_before_apply": [
+            "Keep specbackfill rows distinct from local/model coverage in every item_links consumer.",
+            "Treat existing review_item/external_item pairs as already linked regardless of relation to avoid duplicates.",
+            "Reuse the deterministic match relation and include source=specbackfill, rule_id, score, and match relation in the note.",
+            "Continue excluding false-positive or not-actionable external items from coverage signals.",
+        ],
+        "proposed_relation_strategy": "reuse_match_relation",
+        "counts": counts,
+        "candidates": candidates[:match_limit],
+    }
+
+
 def specbackfill_overlap_payload(
     *,
     args: argparse.Namespace,
@@ -15512,6 +15646,7 @@ def specbackfill_overlap_payload(
     external_rows: list[sqlite3.Row],
     existing_external_local_links: int,
     existing_linked_external_ids: set[int],
+    existing_spec_external_links: dict[tuple[int, int], list[str]],
 ) -> dict[str, Any]:
     saved_spec_review_item_ids = {
         int(finding.review_item_id)
@@ -15677,6 +15812,12 @@ def specbackfill_overlap_payload(
         if finding.ordinal not in local_matched_spec_ordinals
         and finding.ordinal not in external_matched_spec_ordinals
     ]
+    link_readiness = specbackfill_link_readiness(
+        spec_external_records=spec_external_records,
+        existing_spec_external_links=existing_spec_external_links,
+        actionable_external_ids=actionable_external_ids,
+        match_limit=args.match_limit,
+    )
     return {
         "schema_name": "local-ai-review-specbackfill-overlap-preview",
         "schema_version": 1,
@@ -15709,6 +15850,7 @@ def specbackfill_overlap_payload(
             "include_watch": bool(args.include_watch),
             "limit": args.limit,
             "match_limit": args.match_limit,
+            "dry_run": bool(args.dry_run),
             "record_db_artifacts": bool(getattr(args, "record_db_artifacts", False)),
         },
         "counts": {
@@ -15720,6 +15862,9 @@ def specbackfill_overlap_payload(
             "specbackfill_external_overlaps": len(spec_external_records),
             "external_local_candidate_overlaps": len(external_local_records),
             "external_items_covered_by_existing_links": len(existing_linked_external_ids),
+            "existing_specbackfill_external_links": sum(
+                len(relations) for relations in existing_spec_external_links.values()
+            ),
             "external_items_missed_by_local": len(external_missed_by_local),
             "external_items_covered_by_specbackfill": len(external_covered_by_specbackfill),
             "external_items_missed_by_local_but_covered_by_specbackfill": len(
@@ -15746,6 +15891,7 @@ def specbackfill_overlap_payload(
             "local_items_overlapped_by_specbackfill": local_overlapped_by_specbackfill[: args.match_limit],
             "specbackfill_false_positive_verdicts": specbackfill_false_positives[: args.match_limit],
         },
+        "link_readiness": link_readiness,
         "unmatched_specbackfill_findings": unmatched_spec[: args.match_limit],
     }
 
@@ -15755,12 +15901,25 @@ def specbackfill_overlap_report(payload: dict[str, Any]) -> str:
     scope = payload["scope"]
     input_record = payload.get("specbackfill_input") or {}
     policy = payload.get("policy") or {}
-    records_artifacts = bool((payload.get("options") or {}).get("record_db_artifacts"))
-    overview = (
-        "Report-only preview. This command reads the review-history DB and optional specbackfill JSON override, writes artifacts, and records only artifact path/sha256 rows in the DB. It does not write item links, item verdicts, or mutate GitHub."
-        if records_artifacts
-        else "Report-only preview. This command reads the review-history DB and optional specbackfill JSON override, writes artifacts, and does not write DB rows or mutate GitHub."
-    )
+    options = payload.get("options") or {}
+    records_artifacts = bool(options.get("record_db_artifacts"))
+    dry_run = bool(options.get("dry_run"))
+    if dry_run:
+        overview = (
+            "Report-only dry-run. This command reads the review-history DB and optional "
+            "specbackfill JSON override, and does not write artifact files, DB rows, or mutate GitHub."
+        )
+    elif records_artifacts:
+        overview = (
+            "Report-only preview. This command reads the review-history DB and optional "
+            "specbackfill JSON override, writes artifacts, and records only artifact path/sha256 "
+            "rows in the DB. It does not write item links, item verdicts, or mutate GitHub."
+        )
+    else:
+        overview = (
+            "Report-only preview. This command reads the review-history DB and optional "
+            "specbackfill JSON override, writes artifacts, and does not write DB rows or mutate GitHub."
+        )
     lines = [
         "# Specbackfill Overlap Preview",
         "",
@@ -15787,6 +15946,7 @@ def specbackfill_overlap_report(payload: dict[str, Any]) -> str:
         f"- specbackfill to external overlaps: {counts['specbackfill_external_overlaps']}",
         f"- external to local candidate overlaps: {counts['external_local_candidate_overlaps']}",
         f"- external items covered by existing links: {counts['external_items_covered_by_existing_links']}",
+        f"- existing specbackfill/external DB links: {counts.get('existing_specbackfill_external_links', 0)}",
         f"- external items missed by selected local items: {counts['external_items_missed_by_local']}",
         f"- external items covered by specbackfill: {counts['external_items_covered_by_specbackfill']}",
         f"- external missed by selected local items but covered by specbackfill: {counts['external_items_missed_by_local_but_covered_by_specbackfill']}",
@@ -15901,6 +16061,68 @@ def specbackfill_overlap_report(payload: dict[str, Any]) -> str:
         lines.extend(["", "### Signal Samples", *sample_lines[:12]])
     elif any(int(row[1] or 0) for row in signal_rows):
         lines.extend(["", "### Signal Samples", "- Signal samples were omitted by the current `--match-limit`."])
+    readiness = payload.get("link_readiness") or {}
+    readiness_counts = readiness.get("counts") or {}
+    readiness_candidates = readiness.get("candidates") or []
+    lines.extend(
+        [
+            "",
+            "## Link Write Readiness",
+            "",
+            "- Decision: `{}`.".format(markdown_cell(str(readiness.get("decision") or "keep_preview_only"))),
+            "- Can write item_links now: `{}`.".format(bool(readiness.get("can_write_item_links_now"))),
+            "- Proposed future relation strategy: `{}`.".format(
+                markdown_cell(str(readiness.get("proposed_relation_strategy") or "reuse_match_relation"))
+            ),
+            "- Reason: {}".format(markdown_cell(str(readiness.get("reason") or ""))),
+            "",
+            "| Check | Count |",
+            "|---|---:|",
+            "| `specbackfill_external_overlap_candidates` | {} |".format(
+                readiness_counts.get("specbackfill_external_overlap_candidates", 0)
+            ),
+            "| `actionable_external_candidates` | {} |".format(
+                readiness_counts.get("actionable_external_candidates", 0)
+            ),
+            "| `missing_specbackfill_review_item_id` | {} |".format(
+                readiness_counts.get("missing_specbackfill_review_item_id", 0)
+            ),
+            "| `existing_pair_links` | {} |".format(readiness_counts.get("existing_pair_links", 0)),
+            "| `future_apply_candidate_links` | {} |".format(
+                readiness_counts.get("future_apply_candidate_links", 0)
+            ),
+            "| `blocked_by_design_boundary` | {} |".format(
+                readiness_counts.get("blocked_by_design_boundary", 0)
+            ),
+            "",
+            "### Required Before Apply",
+        ]
+    )
+    required = readiness.get("required_before_apply") or []
+    if required:
+        lines.extend(f"- {markdown_cell(str(item))}" for item in required)
+    else:
+        lines.append("- No apply readiness requirements were emitted.")
+    lines.extend(["", "### Link Candidate Samples", ""])
+    if readiness_candidates:
+        lines.append("| Action | Review item | External | Rule | Path | Score | Proposed relation |")
+        lines.append("|---|---|---|---|---|---:|---|")
+        for record in readiness_candidates[:12]:
+            lines.append(
+                "| `{action}` | `{review}` | `{external}` | `{rule}` | `{path}` | {score:.2f} | `{relation}` |".format(
+                    action=markdown_cell(str(record.get("preview_action") or "")),
+                    review=markdown_cell(str(record.get("review_item_id") or "")),
+                    external=markdown_cell(str(record.get("external_item_id") or "")),
+                    rule=markdown_cell(str(record.get("rule_id") or "")),
+                    path=markdown_cell(str(record.get("path") or "")),
+                    score=float(record.get("score") or 0.0),
+                    relation=markdown_cell(str(record.get("proposed_relation") or "")),
+                )
+            )
+    elif int(readiness_counts.get("actionable_external_candidates") or 0):
+        lines.append("- Link candidate samples were omitted by the current `--match-limit`.")
+    else:
+        lines.append("- No actionable specbackfill/external link candidates were found.")
     unmatched = payload.get("unmatched_specbackfill_findings") or []
     lines.extend(["", "## Unmatched Specbackfill Findings", ""])
     if unmatched:
@@ -15964,6 +16186,7 @@ def command_specbackfill_overlap(args: argparse.Namespace) -> None:
         external_rows: list[sqlite3.Row] = []
         existing_links = 0
         existing_linked_external_ids: set[int] = set()
+        existing_spec_external_links: dict[tuple[int, int], list[str]] = {}
     else:
         with managed_sqlite_connection(connection_context) as connection:
             connection.row_factory = sqlite3.Row
@@ -16021,6 +16244,11 @@ def command_specbackfill_overlap(args: argparse.Namespace) -> None:
                 local_rows=selected_local_rows_for_links,
                 external_rows=external_rows,
             )
+            existing_spec_external_links = specbackfill_overlap_existing_spec_external_links(
+                connection,
+                findings=findings,
+                external_rows=external_rows,
+            )
     payload = specbackfill_overlap_payload(
         args=args,
         db_path=db_path,
@@ -16032,6 +16260,7 @@ def command_specbackfill_overlap(args: argparse.Namespace) -> None:
         external_rows=external_rows,
         existing_external_local_links=existing_links,
         existing_linked_external_ids=existing_linked_external_ids,
+        existing_spec_external_links=existing_spec_external_links,
     )
     if getattr(args, "record_db_artifacts", False):
         payload = {
