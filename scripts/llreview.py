@@ -17189,7 +17189,12 @@ def calibration_verdict_candidates(
             if db.get("item_link_id") is None:
                 candidate_link_external_ids.add(external_item_id)
     records: list[dict[str, Any]] = []
-    local_finding_count = sum(1 for row in local_rows if str(row["item_type"] or "") == "finding")
+    local_finding_count = sum(
+        1
+        for row in local_rows
+        if str(row["item_type"] or "") == "finding"
+        and source_counts_as_local_coverage(str(row["source"] or ""))
+    )
 
     for row in external_rows:
         external_id = int(row["id"])

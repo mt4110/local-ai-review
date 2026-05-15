@@ -39,6 +39,7 @@ from llreview import (  # noqa: E402
     POSTGRES_COPY_NULL,
     BACKFILL_DEFAULT_MAX_CHANGED_LINES,
     BACKFILL_DEFAULT_MIN_INTERVAL_MINUTES,
+    calibration_verdict_candidates,
     command_backfill_pump,
     command_import_github_history,
     command_import_github_reviews,
@@ -2605,6 +2606,60 @@ class SpecbackfillOverlapTests(unittest.TestCase):
 
             self.assertEqual([candidate.id for candidate in candidates], [10])
             self.assertEqual([candidate.source for candidate in candidates], ["model"])
+
+    def test_specbackfill_only_rows_do_not_make_external_items_missed_by_local(self) -> None:
+        with sqlite_memory_connection() as connection:
+            connection.row_factory = sqlite3.Row
+            connection.executescript(
+                """
+                CREATE TABLE local_items (
+                    id INTEGER,
+                    item_type TEXT,
+                    source TEXT,
+                    latest_verdict TEXT,
+                    latest_reason TEXT,
+                    fingerprint TEXT
+                );
+                CREATE TABLE external_rows (
+                    id INTEGER,
+                    source TEXT,
+                    latest_verdict TEXT,
+                    latest_reason TEXT,
+                    fingerprint TEXT
+                );
+                INSERT INTO local_items VALUES (
+                    11,
+                    'finding',
+                    'SpecBackfill',
+                    '',
+                    '',
+                    'spec-fp'
+                );
+                INSERT INTO external_rows VALUES (
+                    20,
+                    'human',
+                    '',
+                    '',
+                    'external-fp'
+                );
+                """
+            )
+            local_rows = connection.execute("SELECT * FROM local_items").fetchall()
+            external_rows = connection.execute("SELECT * FROM external_rows").fetchall()
+
+        candidates = calibration_verdict_candidates(
+            local_rows=local_rows,
+            external_rows=external_rows,
+            alignments=[],
+        )
+
+        external_candidate = next(
+            record
+            for record in candidates
+            if record["db"]["target_kind"] == "external_item"
+        )
+        self.assertEqual(external_candidate["candidate_verdict"], "needs_human_review")
+        self.assertEqual(external_candidate["reason"], "no_local_finding_candidates")
 
     def test_command_specbackfill_overlap_records_artifact_digests_when_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
