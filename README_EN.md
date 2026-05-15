@@ -528,9 +528,11 @@ local model `review_items` / imported `external_items` in the same scope. Pass
 input. The report surfaces external-missed-by-local, external-covered-by-specbackfill,
 model/specbackfill overlap, and specbackfill false-positive
 verdict signals. External items already judged false-positive or not-actionable
-are excluded from missed/covered signals. The command performs no DB writes,
-GitHub API calls, PR checkout/code execution, PR comments, or raw
-body/evidence/diff output.
+are excluded from missed/covered signals. By default, the command performs no
+DB writes, GitHub API calls, PR checkout/code execution, PR comments, or raw
+body/evidence/diff output. Use explicit `--record-db-artifacts` with `--run`
+when you want only the preview artifact paths and sha256 digests recorded in the
+review DB; this still does not write `item_links` or `item_verdicts`.
 
 Use `llreview specbackfill-import-preview --specbackfill-json specbackfill.json
 --run <run-id>` to normalize `specbackfill check --format json --fail-on off`

@@ -107,6 +107,10 @@ GITHUB_API = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("
 PROGRESS_PREFIX = "LLREVIEW_EVENT "
 IMPORT_LINK_NOTE_PREFIX = "github_importer:"
 APP_DEVELOPER_LINK_NOTE_PREFIX = "app_developer_importer:"
+SPECBACKFILL_OVERLAP_ARTIFACT_KINDS = (
+    ("specbackfill_overlap_report", "report"),
+    ("specbackfill_overlap_json", "json"),
+)
 IMPORTER_EXTERNAL_REASON_CODES = {"linked_by_importer", "no_local_match"}
 OPERATOR_EXTERNAL_REASON_CODES = {
     "teacher_model_valid",
@@ -12047,6 +12051,7 @@ def load_link_candidates_for_item_types(
         ON runs.id = items.run_id
         WHERE {where_sql}
           AND items.item_type IN ({item_type_placeholders})
+          AND LOWER(items.source) <> 'specbackfill'
         ORDER BY runs.id DESC, items.item_type, items.ordinal
         """,
         [*params, *clean_item_types],
@@ -14960,7 +14965,7 @@ def specbackfill_overlap_local_rows(
     if local_source == "model":
         filters.append("items.source = 'model'")
     elif local_source == "non-specbackfill":
-        filters.append("items.source <> 'specbackfill'")
+        filters.append("LOWER(items.source) <> 'specbackfill'")
     limit_sql, limit_params = query_limit_clause(limit)
     return connection.execute(
         f"""
@@ -14992,7 +14997,7 @@ def specbackfill_overlap_saved_rows(
         return []
     filters = [
         "items.item_type = 'finding'",
-        "items.source = 'specbackfill'",
+        "LOWER(items.source) = 'specbackfill'",
     ]
     params: list[Any] = []
     run_id = as_optional_int(scope.get("run_id"))
@@ -15307,7 +15312,7 @@ def specbackfill_review_item_import_state(
               AND item_type = 'finding'
               AND fingerprint IN ({placeholders})
             ORDER BY
-                CASE WHEN source = 'specbackfill' THEN 0 ELSE 1 END,
+                CASE WHEN LOWER(source) = 'specbackfill' THEN 0 ELSE 1 END,
                 id
             """,
             [run_id, *batch],
@@ -15322,10 +15327,10 @@ def specbackfill_review_item_import_state(
                 }
     state["existing_by_fingerprint"] = existing
     state["existing_specbackfill_fingerprint_count"] = sum(
-        1 for record in existing.values() if record.get("source") == "specbackfill"
+        1 for record in existing.values() if not source_counts_as_local_coverage(str(record.get("source") or ""))
     )
     state["existing_non_specbackfill_fingerprint_count"] = sum(
-        1 for record in existing.values() if record.get("source") != "specbackfill"
+        1 for record in existing.values() if source_counts_as_local_coverage(str(record.get("source") or ""))
     )
     return state
 
@@ -15517,7 +15522,7 @@ def specbackfill_overlap_payload(
         candidate
         for candidate in specbackfill_overlap_link_candidates(local_rows)
         if candidate.id not in saved_spec_review_item_ids
-        and candidate.source != "specbackfill"
+        and source_counts_as_local_coverage(candidate.source)
     ]
     external_items = external_items_from_rows(external_rows)
     spec_external_items = [
@@ -15682,7 +15687,14 @@ def specbackfill_overlap_payload(
         "specbackfill_input": specbackfill_input,
         "scope": scope,
         "policy": {
-            "db_writes": False,
+            "db_writes": bool(getattr(args, "record_db_artifacts", False)),
+            "db_write_scope": (
+                "artifacts(path, sha256) only"
+                if bool(getattr(args, "record_db_artifacts", False))
+                else ""
+            ),
+            "item_links_writes": False,
+            "item_verdict_writes": False,
             "github_api_reads": False,
             "pr_checkout": False,
             "pr_code_execution": False,
@@ -15697,6 +15709,7 @@ def specbackfill_overlap_payload(
             "include_watch": bool(args.include_watch),
             "limit": args.limit,
             "match_limit": args.match_limit,
+            "record_db_artifacts": bool(getattr(args, "record_db_artifacts", False)),
         },
         "counts": {
             "specbackfill_findings": len(findings),
@@ -15741,10 +15754,17 @@ def specbackfill_overlap_report(payload: dict[str, Any]) -> str:
     counts = payload["counts"]
     scope = payload["scope"]
     input_record = payload.get("specbackfill_input") or {}
+    policy = payload.get("policy") or {}
+    records_artifacts = bool((payload.get("options") or {}).get("record_db_artifacts"))
+    overview = (
+        "Report-only preview. This command reads the review-history DB and optional specbackfill JSON override, writes artifacts, and records only artifact path/sha256 rows in the DB. It does not write item links, item verdicts, or mutate GitHub."
+        if records_artifacts
+        else "Report-only preview. This command reads the review-history DB and optional specbackfill JSON override, writes artifacts, and does not write DB rows or mutate GitHub."
+    )
     lines = [
         "# Specbackfill Overlap Preview",
         "",
-        "Report-only preview. This command reads the review-history DB and optional specbackfill JSON override, writes artifacts, and does not write DB rows or mutate GitHub.",
+        overview,
         "",
         "## Scope",
         "",
@@ -15905,7 +15925,13 @@ def specbackfill_overlap_report(payload: dict[str, Any]) -> str:
             "",
             "## Safety",
             "",
-            "- No DB writes.",
+            (
+                "- DB writes are limited to `artifacts` path/sha256 rows because `--record-db-artifacts` was explicit."
+                if records_artifacts
+                else "- No DB writes."
+            ),
+            f"- Item link writes: `{bool(policy.get('item_links_writes'))}`.",
+            f"- Item verdict writes: `{bool(policy.get('item_verdict_writes'))}`.",
             "- No GitHub API calls.",
             "- No PR checkout or PR code execution.",
             "- No PR comments, title edits, or body edits.",
@@ -15916,6 +15942,10 @@ def specbackfill_overlap_report(payload: dict[str, Any]) -> str:
 
 
 def command_specbackfill_overlap(args: argparse.Namespace) -> None:
+    if getattr(args, "record_db_artifacts", False) and args.dry_run:
+        raise SystemExit("--record-db-artifacts cannot be combined with --dry-run because dry-run writes no artifacts")
+    if getattr(args, "record_db_artifacts", False) and args.run is None:
+        raise SystemExit("--record-db-artifacts requires --run so artifact digests have a review_runs.id anchor")
     db_path = sqlite_db_path(args.db)
     specbackfill_json = str(args.specbackfill_json or "")
     findings, specbackfill_input = load_specbackfill_findings(specbackfill_json)
@@ -15979,7 +16009,7 @@ def command_specbackfill_overlap(args: argparse.Namespace) -> None:
                 row
                 for row in local_rows
                 if int(row["id"]) not in saved_spec_review_item_ids
-                and str(row["source"] or "") != "specbackfill"
+                and source_counts_as_local_coverage(str(row["source"] or ""))
             ]
             existing_links = specbackfill_overlap_existing_link_count(
                 connection,
@@ -16003,6 +16033,16 @@ def command_specbackfill_overlap(args: argparse.Namespace) -> None:
         existing_external_local_links=existing_links,
         existing_linked_external_ids=existing_linked_external_ids,
     )
+    if getattr(args, "record_db_artifacts", False):
+        payload = {
+            **payload,
+            "artifact_recording": {
+                "requested": True,
+                "table": "artifacts",
+                "run_id": as_optional_int(scope.get("run_id")),
+                "kinds": [kind for kind, _key in SPECBACKFILL_OVERLAP_ARTIFACT_KINDS],
+            },
+        }
     report = specbackfill_overlap_report(payload)
     if args.dry_run:
         if args.json:
@@ -16035,11 +16075,29 @@ def command_specbackfill_overlap(args: argparse.Namespace) -> None:
     write_json(json_path, payload)
     latest_report_path.write_text(report, encoding="utf-8")
     write_json(latest_json_path, payload)
+    artifact_rows_saved = 0
+    if getattr(args, "record_db_artifacts", False):
+        run_id = as_optional_int(scope.get("run_id"))
+        if run_id is None:
+            raise SystemExit("--record-db-artifacts requires --run so artifact digests have a review_runs.id anchor")
+        with managed_sqlite_connection(
+            connect_review_db(db_path, row_factory=True, foreign_keys=True)
+        ) as connection:
+            artifact_rows_saved = calibration_record_artifacts(
+                connection,
+                run_id=run_id,
+                artifacts=[
+                    (kind, {"report": report_path, "json": json_path}[path_key])
+                    for kind, path_key in SPECBACKFILL_OVERLAP_ARTIFACT_KINDS
+                ],
+            )
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     else:
         print(report.rstrip())
         print(f"\nOK: specbackfill overlap report={report_path}")
+        if getattr(args, "record_db_artifacts", False):
+            print(f"DB artifact rows saved: {artifact_rows_saved}")
 
 
 def specbackfill_import_preview_payload(
@@ -16768,6 +16826,10 @@ def calibration_source_for_local_source(source: str) -> str:
     return "local_llm"
 
 
+def source_counts_as_local_coverage(source: str) -> bool:
+    return source.strip().lower() != "specbackfill"
+
+
 def calibration_lane_for_external_source(source: str) -> str:
     normalized = source.strip().lower()
     if normalized == "human":
@@ -16967,6 +17029,8 @@ def link_candidates_from_local_rows(rows: list[sqlite3.Row]) -> list[LinkCandida
     for row in rows:
         if str(row["item_type"] or "") != "finding":
             continue
+        if not source_counts_as_local_coverage(str(row["source"] or "")):
+            continue
         candidates.append(
             LinkCandidate(
                 id=int(row["id"]),
@@ -17051,6 +17115,8 @@ def calibration_existing_alignments(
                     "review_item_id": int(row["review_item_id"]),
                     "external_item_id": int(row["external_item_id"]),
                     "item_link_id": int(row["id"]),
+                    "left_source": str(row["left_source"] or ""),
+                    "right_source": str(row["right_source"] or ""),
                 },
             }
         )
@@ -17114,6 +17180,8 @@ def calibration_verdict_candidates(
         db = alignment.get("db") if isinstance(alignment.get("db"), dict) else {}
         review_item_id = as_optional_int(db.get("review_item_id"))
         external_item_id = as_optional_int(db.get("external_item_id"))
+        if not source_counts_as_local_coverage(str(db.get("left_source") or "")):
+            continue
         if review_item_id is not None:
             linked_local_ids.add(review_item_id)
         if external_item_id is not None:
@@ -17121,7 +17189,12 @@ def calibration_verdict_candidates(
             if db.get("item_link_id") is None:
                 candidate_link_external_ids.add(external_item_id)
     records: list[dict[str, Any]] = []
-    local_finding_count = sum(1 for row in local_rows if str(row["item_type"] or "") == "finding")
+    local_finding_count = sum(
+        1
+        for row in local_rows
+        if str(row["item_type"] or "") == "finding"
+        and source_counts_as_local_coverage(str(row["source"] or ""))
+    )
 
     for row in external_rows:
         external_id = int(row["id"])
@@ -22353,6 +22426,11 @@ def build_specbackfill_overlap_parser() -> argparse.ArgumentParser:
     overlap.add_argument("--match-limit", type=parse_non_negative, default=50, help="Match records to include per class")
     overlap.add_argument("--min-link-score", type=float, default=0.55)
     overlap.add_argument("--dry-run", action="store_true", help="Print the preview without writing artifact files")
+    overlap.add_argument(
+        "--record-db-artifacts",
+        action="store_true",
+        help="Explicitly record the generated overlap report/json path and sha256 in artifacts; requires --run and does not write item_links",
+    )
     overlap.add_argument("--json", action="store_true", help="Print JSON payload instead of markdown")
     return overlap
 
