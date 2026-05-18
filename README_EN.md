@@ -182,8 +182,9 @@ the later remote review.
 
 In pre-PR mode, `llreview` auto-loads Markdown files from the target workspace's
 `.private_docs/` directory as compact trusted design context when that directory
-exists. Context helps interpret visible diff evidence; it is not evidence by
-itself. The run stores context document path and sha256 records in
+exists and is not ignored by `.gitignore` (checked via `git check-ignore`). Context
+helps interpret visible diff evidence; it is not evidence by itself. The run
+stores context document path and sha256 records in
 `artifacts(kind='context_digest')`. Use `llreview --no-trusted-context` to
 disable this, or `llreview --trusted-context-dir /path/to/.private_docs` to pass
 an explicit trusted context directory.
