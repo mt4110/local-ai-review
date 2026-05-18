@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import urlparse
 
 from review_db import UnsupportedReviewDbBackendError, connect_review_db, sqlite_db_path
@@ -135,6 +135,9 @@ CREATE TABLE IF NOT EXISTS review_items (
     fix TEXT NOT NULL DEFAULT '',
     verification TEXT NOT NULL DEFAULT '',
     fingerprint TEXT NOT NULL,
+    actionability TEXT NOT NULL DEFAULT '',
+    false_positive_risk TEXT NOT NULL DEFAULT '',
+    evidence_refs TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -301,6 +304,15 @@ ON learning_calibrations(calibration_id);
 
 CREATE INDEX IF NOT EXISTS learning_calibrations_active_idx
 ON learning_calibrations(status, scope_repo, path_class);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS team_memory_docs USING fts5(
+    path UNINDEXED,
+    chunk_index UNINDEXED,
+    title,
+    body,
+    sha256 UNINDEXED,
+    created_at UNINDEXED
+);
 """
 
 
@@ -384,6 +396,12 @@ ITEM_VERDICTS_COLUMN_MIGRATIONS = (
     ("reason", "ALTER TABLE item_verdicts ADD COLUMN reason TEXT NOT NULL DEFAULT ''"),
 )
 
+REVIEW_ITEMS_COLUMN_MIGRATIONS = (
+    ("actionability", "ALTER TABLE review_items ADD COLUMN actionability TEXT NOT NULL DEFAULT ''"),
+    ("false_positive_risk", "ALTER TABLE review_items ADD COLUMN false_positive_risk TEXT NOT NULL DEFAULT ''"),
+    ("evidence_refs", "ALTER TABLE review_items ADD COLUMN evidence_refs TEXT NOT NULL DEFAULT '[]'"),
+)
+
 EXTERNAL_ITEMS_COLUMN_MIGRATIONS = (
     (
         "import_head_sha",
@@ -437,6 +455,9 @@ class Finding:
     title: str
     body: str
     fix: str
+    actionability: str = ""
+    false_positive_risk: str = ""
+    evidence_refs: str = "[]"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -478,6 +499,9 @@ def finding_fingerprint(item: Finding) -> str:
         item.title,
         item.body,
         item.fix,
+        item.actionability,
+        item.false_positive_risk,
+        item.evidence_refs,
     )
 
 
@@ -554,6 +578,57 @@ def markdown_context_summary(text: str, *, limit: int) -> str:
     return summary
 
 
+def filter_ignored_paths(base_dir: Path, paths: list[Path]) -> list[Path]:
+    if not paths:
+        return []
+
+    safe_paths: list[Path] = []
+    for p in paths:
+        parts = p.parts
+        if any(d in parts for d in (".git", "node_modules", "venv", ".venv", "out", "build", "dist")):
+            continue
+        safe_paths.append(p)
+
+    if not safe_paths:
+        return []
+
+    try:
+        env = os.environ.copy()
+        env["LC_ALL"] = "C"
+        process = subprocess.Popen(
+            ["git", "check-ignore", "-z", "--stdin"],
+            cwd=base_dir,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env
+        )
+        input_data = b"\0".join(str(p.resolve()).encode("utf-8") for p in safe_paths) + b"\0"
+        stdout, _ = process.communicate(input=input_data)
+        if process.returncode in (0, 1):
+            ignored = {b for b in stdout.split(b"\0") if b}
+            return [p for p in safe_paths if str(p.resolve()).encode("utf-8") not in ignored]
+    except Exception:
+        pass
+
+    return safe_paths
+
+
+def iter_markdown_paths(base_dir: Path) -> Iterator[Path]:
+    for root, dirs, files in os.walk(base_dir, topdown=True):
+        root_path = Path(root)
+
+        dir_candidates = [root_path / name for name in dirs]
+        allowed_dirs = filter_ignored_paths(base_dir, dir_candidates)
+        dirs[:] = sorted(path.name for path in allowed_dirs)
+
+        file_candidates = [
+            root_path / name for name in files if name.lower().endswith(".md")
+        ]
+        for path in sorted(filter_ignored_paths(base_dir, file_candidates)):
+            yield path
+
+
 def load_trusted_context_docs(
     context_dirs: list[str],
     *,
@@ -572,7 +647,7 @@ def load_trusted_context_docs(
         context_dir = raw_context_dir.resolve()
         if not context_dir.is_dir():
             raise SystemExit(f"trusted context dir does not exist or is not a directory: {context_dir}")
-        for path in sorted(context_dir.glob("*.md")):
+        for path in iter_markdown_paths(context_dir):
             # Reject workspace-controlled links before resolving; trusted context must stay in its root.
             if path.is_symlink():
                 continue
@@ -599,6 +674,44 @@ def load_trusted_context_docs(
             if len(docs) >= max_docs:
                 return docs
     return docs
+
+
+def chunk_markdown(text: str) -> list[tuple[str, str]]:
+    """Chunk markdown text into (title, body) pairs."""
+    chunks = []
+    current_title = "Document Root"
+    current_body = []
+    for line in text.splitlines():
+        if line.startswith("#"):
+            if current_body:
+                chunks.append((current_title, "\n".join(current_body).strip()))
+                current_body = []
+            current_title = line.lstrip("#").strip()
+        else:
+            current_body.append(line)
+    if current_body:
+        chunks.append((current_title, "\n".join(current_body).strip()))
+    return [c for c in chunks if c[1]]
+
+
+def ingest_team_memory_docs(connection: sqlite3.Connection, context_dir: Path) -> int:
+    import time
+    count = 0
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    connection.execute("DELETE FROM team_memory_docs")
+    for path in iter_markdown_paths(context_dir):
+        if path.is_file():
+            text = path.read_text(encoding="utf-8", errors="replace")
+            chunks = chunk_markdown(text)
+            rel_path = str(path.relative_to(context_dir))
+            for i, (title, body) in enumerate(chunks):
+                digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+                connection.execute(
+                    "INSERT INTO team_memory_docs (path, chunk_index, title, body, sha256, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (rel_path, i, title, body, digest, now)
+                )
+                count += 1
+    return count
 
 
 def trusted_context_prompt_section(context_docs: list[TrustedContextDoc]) -> str:
@@ -676,6 +789,13 @@ def migrate_db_schema(connection: sqlite3.Connection) -> None:
     }
     for column, statement in ITEM_VERDICTS_COLUMN_MIGRATIONS:
         if column not in item_verdict_columns:
+            connection.execute(statement)
+    review_item_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(review_items)").fetchall()
+    }
+    for column, statement in REVIEW_ITEMS_COLUMN_MIGRATIONS:
+        if column not in review_item_columns:
             connection.execute(statement)
     external_item_columns = {
         str(row[1])
@@ -1270,6 +1390,7 @@ def model_prompt(
     max_findings: int,
     trusted_context: str = "",
     history_calibration: str = "",
+    spec_text: str = "",
 ) -> str:
     trusted_context_block = (
         f"\nTrusted context:\n{trusted_context}\n"
@@ -1281,6 +1402,11 @@ def model_prompt(
         if history_calibration.strip()
         else ""
     )
+    spec_block = (
+        f"\nSPECLOCK MODE - SPECIFICATION DOCUMENT:\n{spec_text}\n\nTask: Compare the PR implementation against this specification. If the implementation diverges from the spec, output a finding with title 'Divergent: <reason>' and severity 'P0'. If it fully complies, output a finding with title 'Compliant: Meets spec' and severity 'P3'.\n"
+        if spec_text
+        else ""
+    )
     return f"""
 You are reviewing one changed file from a GitHub PR.
 
@@ -1289,6 +1415,7 @@ Do not assume repository files that are not visible in the hunk context.
 Do not invent line numbers. Use the new-line numbers visible from the hunk when possible.
 {trusted_context_block}
 {history_calibration_block}
+{spec_block}
 
 Calibration from prior high-signal reviews:
 - Catch API/schema drift, especially serde defaults that make public fields optional in OpenAPI.
@@ -1385,6 +1512,7 @@ def prompt_hash_for_run(
     max_findings: int,
     trusted_context: str,
     history_calibration: str = "",
+    spec_text: str = "",
 ) -> str:
     placeholder = FilePatch(
         path="<path>",
@@ -1393,8 +1521,16 @@ def prompt_hash_for_run(
         additions=0,
         deletions=0,
     )
-    return sha256_text(
-        model_prompt(placeholder, max_findings, trusted_context, history_calibration)
+    return sha256_json(
+        {
+            "prompt": model_prompt(
+                placeholder,
+                max_findings,
+                trusted_context,
+                history_calibration,
+            ),
+            "spec_sha256": sha256_text(spec_text),
+        }
     )
 
 
@@ -1445,6 +1581,7 @@ def model_review_file(
     file_patch: FilePatch,
     trusted_context: str,
     history_calibration: str,
+    spec_text: str = "",
 ) -> tuple[list[Finding], list[WatchItem]]:
     raw = ollama_chat(
         args.ollama_base_url,
@@ -1454,6 +1591,7 @@ def model_review_file(
             args.max_findings_per_file,
             trusted_context,
             history_calibration,
+            spec_text,
         ),
         num_ctx=args.ollama_num_ctx,
         temperature=args.temperature,
@@ -2143,8 +2281,11 @@ def persist_review_run(
                 body,
                 fix,
                 verification,
-                fingerprint
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                fingerprint,
+                actionability,
+                false_positive_risk,
+                evidence_refs
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -2161,6 +2302,9 @@ def persist_review_run(
                     item.fix,
                     "",
                     finding_fingerprint(item),
+                    item.actionability,
+                    item.false_positive_risk,
+                    item.evidence_refs,
                 )
                 for ordinal, item in enumerate(findings, start=1)
             ]
@@ -2179,6 +2323,9 @@ def persist_review_run(
                     "",
                     item.verification,
                     watch_item_fingerprint(item),
+                    "",
+                    "",
+                    "[]",
                 )
                 for ordinal, item in enumerate(watch_items, start=1)
             ],
@@ -2964,6 +3111,7 @@ def main() -> None:
     parser.add_argument("--diff-file", help="Review an existing diff file instead of fetching GitHub")
     parser.add_argument("--review-kind", default="precision", choices=["precision", "pre_pr"])
     parser.add_argument("--diff-source-label", help="Stable label to store instead of the diff file path")
+    parser.add_argument("--spec", help="Path to markdown spec document to lock review against")
     parser.add_argument("--base-ref", default="", help="Base ref for a local or pre-PR diff")
     parser.add_argument("--head-ref", default="", help="Head ref for a local or pre-PR diff")
     parser.add_argument("--head-sha", default="", help="Head commit SHA for a local or pre-PR diff")
@@ -3066,10 +3214,18 @@ def main() -> None:
         if history_calibration.strip() and args.history_calibration_file
         else ""
     )
+    spec_text = ""
+    if getattr(args, "spec", None):
+        try:
+            spec_path = Path(args.spec).resolve()
+            spec_text = spec_path.read_text(encoding="utf-8")
+        except Exception as e:
+            print(f"Warning: could not read spec file {args.spec}: {e}")
     prompt_hash = prompt_hash_for_run(
         args.max_findings_per_file,
         trusted_context,
         history_calibration,
+        spec_text,
     )
     model_options_hash_value = model_options_hash(
         num_ctx=args.ollama_num_ctx,
@@ -3120,6 +3276,7 @@ def main() -> None:
             file_patch,
             trusted_context,
             history_calibration,
+            spec_text,
         )
         findings.extend(file_findings)
         watch_items.extend(file_watch)

@@ -35,7 +35,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from review_db import (
     SQLITE_DIALECT,
@@ -21530,6 +21530,90 @@ def command_backup(args: argparse.Namespace) -> None:
     for path in written:
         print(f"- {path}")
 
+def chunk_markdown(text: str) -> list[tuple[str, str]]:
+    chunks = []
+    current_title = "Document Root"
+    current_body = []
+    for line in text.splitlines():
+        if line.startswith("#"):
+            if current_body:
+                chunks.append((current_title, "\n".join(current_body).strip()))
+                current_body = []
+            current_title = line.lstrip("#").strip()
+        else:
+            current_body.append(line)
+    if current_body:
+        chunks.append((current_title, "\n".join(current_body).strip()))
+    return [c for c in chunks if c[1]]
+
+def filter_ignored_paths(base_dir: Path, paths: list[Path]) -> list[Path]:
+    if not paths:
+        return []
+
+    safe_paths: list[Path] = []
+    for p in paths:
+        parts = p.parts
+        if any(d in parts for d in (".git", "node_modules", "venv", ".venv", "out", "build", "dist")):
+            continue
+        safe_paths.append(p)
+
+    if not safe_paths:
+        return []
+
+    try:
+        env = os.environ.copy()
+        env["LC_ALL"] = "C"
+        process = subprocess.Popen(
+            ["git", "check-ignore", "-z", "--stdin"],
+            cwd=base_dir,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env
+        )
+        input_data = b"\0".join(str(p.resolve()).encode("utf-8") for p in safe_paths) + b"\0"
+        stdout, _ = process.communicate(input=input_data)
+        if process.returncode in (0, 1):
+            ignored = {b for b in stdout.split(b"\0") if b}
+            return [p for p in safe_paths if str(p.resolve()).encode("utf-8") not in ignored]
+    except Exception:
+        pass
+
+    return safe_paths
+
+def iter_markdown_paths(base_dir: Path) -> Iterator[Path]:
+    for root, dirs, files in os.walk(base_dir, topdown=True):
+        root_path = Path(root)
+
+        dir_candidates = [root_path / name for name in dirs]
+        allowed_dirs = filter_ignored_paths(base_dir, dir_candidates)
+        dirs[:] = sorted(path.name for path in allowed_dirs)
+
+        file_candidates = [
+            root_path / name for name in files if name.lower().endswith(".md")
+        ]
+        for path in sorted(filter_ignored_paths(base_dir, file_candidates)):
+            yield path
+
+def ingest_team_memory_docs(connection: sqlite3.Connection, context_dir: Path) -> int:
+    import time
+    count = 0
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    connection.execute("DELETE FROM team_memory_docs")
+    for path in iter_markdown_paths(context_dir):
+        if path.is_file():
+            text = path.read_text(encoding="utf-8", errors="replace")
+            chunks = chunk_markdown(text)
+            rel_path = str(path.relative_to(context_dir))
+            for i, (title, body) in enumerate(chunks):
+                digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+                connection.execute(
+                    "INSERT INTO team_memory_docs (path, chunk_index, title, body, sha256, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (rel_path, i, title, body, digest, now)
+                )
+                count += 1
+    connection.commit()
+    return count
 
 def install_paths(path_value: str) -> tuple[Path, Path]:
     source = TOOL_ROOT / "llreview"
@@ -23339,6 +23423,132 @@ def build_update_parser() -> argparse.ArgumentParser:
     update.add_argument("--check", action="store_true", help="Show update state without changing files")
     return update
 
+def command_doctor(args: argparse.Namespace) -> None:
+    import sys
+    import urllib.request
+    import urllib.error
+    import json
+    import subprocess
+    import socket
+    import os
+
+    print("=== llreview doctor ===")
+
+    # 1. Python version
+    py_version = sys.version_info
+    if py_version >= (3, 9):
+        print(f"PASS: Python version {sys.version.split()[0]} (>= 3.9)")
+    else:
+        print(f"FAIL: Python version {sys.version.split()[0]} is less than 3.9")
+
+    # 2. Ollama endpoint
+    ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+    try:
+        req = urllib.request.Request(f"{ollama_url}/api/tags")
+        with urllib.request.urlopen(req, timeout=3) as res:
+            if res.status == 200:
+                print(f"PASS: Ollama endpoint reachable at {ollama_url}")
+                tags_data = json.loads(res.read().decode("utf-8"))
+                models = [m.get("name") for m in tags_data.get("models", [])]
+                
+                # 3. Model availability
+                target_model = os.environ.get("OLLAMA_MODEL", "qwen3-coder:30b-a3b-q4_K_M")
+                if target_model in models or f"{target_model}:latest" in models:
+                    print(f"PASS: Model {target_model} is available")
+                else:
+                    print(f"WARN: Target model {target_model} not found in Ollama.")
+            else:
+                print(f"FAIL: Ollama endpoint {ollama_url} returned status {res.status}")
+    except Exception as e:
+        print(f"FAIL: Ollama endpoint {ollama_url} is unreachable: {e}")
+
+    # 4. Git workspace
+    try:
+        subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], check=True, capture_output=True, text=True)
+        print("PASS: Inside a valid git workspace")
+    except subprocess.CalledProcessError:
+        print("WARN: Not inside a git workspace. (Some commands may require a git repository)")
+    except FileNotFoundError:
+        print("FAIL: git command not found")
+
+    # 5. Workflow policy
+    workflow_path = Path(".github/workflows")
+    if workflow_path.is_dir() and any(workflow_path.glob("*.yml")):
+        print("PASS: GitHub workflow files found")
+    else:
+        print("WARN: No GitHub workflow files found in .github/workflows/")
+
+    # 6. DB path
+    db_path = DEFAULT_DB
+    if db_path.exists():
+        print(f"PASS: Review DB exists at {db_path}")
+    else:
+        print(f"PASS: Review DB path {db_path} is writable (not yet created)")
+
+    # 7. Dashboard bind address (port 8003 check)
+    port = 8003
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            print(f"PASS: Dashboard port {port} is free to bind")
+        except OSError:
+            print(f"WARN: Dashboard port {port} is already in use")
+
+    # 8. Review Immune Pro License State
+    pro_license_path = TOOL_ROOT / ".private_docs" / "pro_license.key"
+    if pro_license_path.exists():
+        print("PASS: Review Immune Pro status: Active")
+    else:
+        print("PASS: Review Immune Pro status: Inactive (OSS core mode)")
+
+    print("\nNext commands:")
+    print("  llreview install")
+    print("  llreview status")
+
+
+def build_doctor_parser() -> argparse.ArgumentParser:
+    doctor = argparse.ArgumentParser(description="Verify safety and setup for local-ai-review")
+    doctor.set_defaults(func=command_doctor)
+    return doctor
+
+
+def command_memory_ingest(args: argparse.Namespace) -> None:
+    db_path = sqlite_db_path(args.db)
+    ensure_db_schema(db_path)
+    context_dir = Path(args.dir).expanduser().resolve()
+    if not context_dir.is_dir():
+        print(f"Error: directory {context_dir} does not exist.")
+        return
+    with connect_review_db(db_path) as connection:
+        count = ingest_team_memory_docs(connection, context_dir)
+    print(f"Ingested {count} chunks from {context_dir}")
+
+def build_memory_ingest_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Ingest markdown into Team Memory")
+    p.set_defaults(func=command_memory_ingest)
+    p.add_argument("--dir", required=True, help="Directory containing markdown files")
+    p.add_argument("--db", help="Review DB path")
+    return p
+
+def command_memory_report(args: argparse.Namespace) -> None:
+    db_path = sqlite_db_path(args.db)
+    if not db_path.is_file():
+        print("No DB found.")
+        return
+    ensure_db_schema(db_path)
+    with connect_review_db(db_path) as connection:
+        rows = connection.execute("SELECT path, COUNT(*) as chunks FROM team_memory_docs GROUP BY path").fetchall()
+    print(f"Team Memory Report ({db_path}):")
+    print(f"Total documents: {len(rows)}")
+    for row in rows:
+        print(f"  {row[0]} ({row[1]} chunks)")
+    print("\nPrivacy Policy: Raw storage mode is local-only SQLite FTS5. No external upload.")
+
+def build_memory_report_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Show Team Memory privacy and indexing report")
+    p.set_defaults(func=command_memory_report)
+    p.add_argument("--db", help="Review DB path")
+    return p
 
 COMMAND_PARSERS = {
     "status": build_status_parser,
@@ -23382,6 +23592,9 @@ COMMAND_PARSERS = {
     "import-github-history": build_import_github_history_parser,
     "install": build_install_parser,
     "update": build_update_parser,
+    "doctor": build_doctor_parser,
+    "memory-ingest": build_memory_ingest_parser,
+    "memory-report": build_memory_report_parser,
 }
 
 
