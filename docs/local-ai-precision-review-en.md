@@ -87,7 +87,8 @@ Pre-PR runs are stored with `review_kind=pre_pr`. The DB also keeps `base_ref`,
 preflight findings, false positives, and manual score against the later remote
 review.
 
-In pre-PR mode, if the target workspace contains `.private_docs/`, `llreview`
+In pre-PR mode, if the target workspace contains `.private_docs/` and it is not
+ignored by `.gitignore` (which is checked via `git check-ignore`), `llreview`
 summarizes its Markdown files as compact trusted design context for the model
 prompt. This context helps interpret visible diff evidence; it is not evidence
 by itself. The run stores only each context document path and sha256 in

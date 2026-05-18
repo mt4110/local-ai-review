@@ -77,7 +77,7 @@ make pre-pr-review-static \
 
 pre-PR run は DB に `review_kind=pre_pr` として保存されます。`base_ref`、`head_ref`、`head_sha`、`working_tree_included` も残るため、PR 作成前の空振り・実指摘・手動評価を、後で remote review の結果と照合できます。
 
-`llreview` の pre-PR mode では、対象 workspace の `.private_docs/` が存在する場合だけ、Markdown を compact な trusted design context に要約して model prompt に渡します。これは設計意図の参照用であり、finding は必ず diff に見える evidence に基づけます。使用した context document は本文ではなく `artifacts(kind='context_digest')` として path と sha256 を残します。無効化は `llreview --no-trusted-context`、明示指定は `llreview --trusted-context-dir /path/to/.private_docs` です。`scripts/local-ai-precision-review.py` を直接使う場合も `--trusted-context-dir` を渡せます。
+`llreview` の pre-PR mode では、対象 workspace の `.private_docs/` が存在し、かつ `.gitignore` で除外されていない場合だけ、Markdown を compact な trusted design context に要約して model prompt に渡します（`.gitignore` 対象パスは `git check-ignore` により自動でスキップされます）。これは設計意図の参照用であり、finding は必ず diff に見える evidence に基づけます。使用した context document は本文ではなく `artifacts(kind='context_digest')` として path と sha256 を残します。無効化は `llreview --no-trusted-context`、明示指定は `llreview --trusted-context-dir /path/to/.private_docs` です。`scripts/local-ai-precision-review.py` を直接使う場合も `--trusted-context-dir` を渡せます。
 
 ## Calibration Rules
 
