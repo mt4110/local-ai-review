@@ -6,6 +6,26 @@ GitHub Actions の self-hosted runner で動かす、diff-only のローカル P
 
 英語版: [README_EN.md](README_EN.md)
 
+## Current Status
+
+**Implemented:**
+- local diff-only review
+- SQLite Review DB
+- calibration/scoring/backfill basics
+- dashboard scaffold
+
+**Beta:**
+- local learning loop
+- team memory ingestion
+- PostgreSQL planning
+
+**Planned:**
+- encrypted SQLite by default
+- installed llreview workflow
+- Evidence Preview
+- signed .ipack packs
+- PostgreSQL Team Backend
+
 ## Why local-first
 
 クラウドAIに機密なソースコードを送信することなく、ローカルLLM（Ollama + Qwen3-Coder等）を用いて安全にレビューを行います。
