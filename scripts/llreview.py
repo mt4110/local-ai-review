@@ -35,7 +35,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from review_db import (
     SQLITE_DIALECT,
@@ -21581,16 +21581,30 @@ def filter_ignored_paths(base_dir: Path, paths: list[Path]) -> list[Path]:
 
     return safe_paths
 
+def iter_markdown_paths(base_dir: Path) -> Iterator[Path]:
+    for root, dirs, files in os.walk(base_dir, topdown=True):
+        root_path = Path(root)
+
+        dir_candidates = [root_path / name for name in dirs]
+        allowed_dirs = filter_ignored_paths(base_dir, dir_candidates)
+        dirs[:] = sorted(path.name for path in allowed_dirs)
+
+        file_candidates = [
+            root_path / name for name in files if name.lower().endswith(".md")
+        ]
+        for path in sorted(filter_ignored_paths(base_dir, file_candidates)):
+            yield path
+
 def ingest_team_memory_docs(connection: sqlite3.Connection, context_dir: Path) -> int:
     import time
     count = 0
     now = time.strftime("%Y-%m-%d %H:%M:%S")
-    for path in sorted(filter_ignored_paths(context_dir, list(context_dir.rglob("*.md")))):
+    connection.execute("DELETE FROM team_memory_docs")
+    for path in iter_markdown_paths(context_dir):
         if path.is_file():
             text = path.read_text(encoding="utf-8", errors="replace")
             chunks = chunk_markdown(text)
             rel_path = str(path.relative_to(context_dir))
-            connection.execute("DELETE FROM team_memory_docs WHERE path = ?", (rel_path,))
             for i, (title, body) in enumerate(chunks):
                 digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
                 connection.execute(
@@ -23521,6 +23535,7 @@ def command_memory_report(args: argparse.Namespace) -> None:
     if not db_path.is_file():
         print("No DB found.")
         return
+    ensure_db_schema(db_path)
     with connect_review_db(db_path) as connection:
         rows = connection.execute("SELECT path, COUNT(*) as chunks FROM team_memory_docs GROUP BY path").fetchall()
     print(f"Team Memory Report ({db_path}):")

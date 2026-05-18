@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import urlparse
 
 from review_db import UnsupportedReviewDbBackendError, connect_review_db, sqlite_db_path
@@ -614,6 +614,21 @@ def filter_ignored_paths(base_dir: Path, paths: list[Path]) -> list[Path]:
     return safe_paths
 
 
+def iter_markdown_paths(base_dir: Path) -> Iterator[Path]:
+    for root, dirs, files in os.walk(base_dir, topdown=True):
+        root_path = Path(root)
+
+        dir_candidates = [root_path / name for name in dirs]
+        allowed_dirs = filter_ignored_paths(base_dir, dir_candidates)
+        dirs[:] = sorted(path.name for path in allowed_dirs)
+
+        file_candidates = [
+            root_path / name for name in files if name.lower().endswith(".md")
+        ]
+        for path in sorted(filter_ignored_paths(base_dir, file_candidates)):
+            yield path
+
+
 def load_trusted_context_docs(
     context_dirs: list[str],
     *,
@@ -632,7 +647,7 @@ def load_trusted_context_docs(
         context_dir = raw_context_dir.resolve()
         if not context_dir.is_dir():
             raise SystemExit(f"trusted context dir does not exist or is not a directory: {context_dir}")
-        for path in sorted(filter_ignored_paths(context_dir, list(context_dir.rglob("*.md")))):
+        for path in iter_markdown_paths(context_dir):
             # Reject workspace-controlled links before resolving; trusted context must stay in its root.
             if path.is_symlink():
                 continue
@@ -683,12 +698,12 @@ def ingest_team_memory_docs(connection: sqlite3.Connection, context_dir: Path) -
     import time
     count = 0
     now = time.strftime("%Y-%m-%d %H:%M:%S")
-    for path in sorted(filter_ignored_paths(context_dir, list(context_dir.rglob("*.md")))):
+    connection.execute("DELETE FROM team_memory_docs")
+    for path in iter_markdown_paths(context_dir):
         if path.is_file():
             text = path.read_text(encoding="utf-8", errors="replace")
             chunks = chunk_markdown(text)
             rel_path = str(path.relative_to(context_dir))
-            connection.execute("DELETE FROM team_memory_docs WHERE path = ?", (rel_path,))
             for i, (title, body) in enumerate(chunks):
                 digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
                 connection.execute(
@@ -1497,6 +1512,7 @@ def prompt_hash_for_run(
     max_findings: int,
     trusted_context: str,
     history_calibration: str = "",
+    spec_text: str = "",
 ) -> str:
     placeholder = FilePatch(
         path="<path>",
@@ -1505,8 +1521,16 @@ def prompt_hash_for_run(
         additions=0,
         deletions=0,
     )
-    return sha256_text(
-        model_prompt(placeholder, max_findings, trusted_context, history_calibration)
+    return sha256_json(
+        {
+            "prompt": model_prompt(
+                placeholder,
+                max_findings,
+                trusted_context,
+                history_calibration,
+            ),
+            "spec_sha256": sha256_text(spec_text),
+        }
     )
 
 
@@ -3201,6 +3225,7 @@ def main() -> None:
         args.max_findings_per_file,
         trusted_context,
         history_calibration,
+        spec_text,
     )
     model_options_hash_value = model_options_hash(
         num_ctx=args.ollama_num_ctx,
