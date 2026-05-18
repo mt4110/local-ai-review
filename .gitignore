@@ -10,3 +10,4 @@ scripts/__pycache__/
 dashboard/node_modules/
 dashboard/.svelte-kit/
 dashboard/build/
+local-ai-review.code-workspace

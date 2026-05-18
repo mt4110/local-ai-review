@@ -125,3 +125,10 @@ Private docs should explain why the architecture must stay shaped a certain way.
 
 When a public README claims a capability, the code and `.private_docs` must agree.
 Do not market future research ideas as implemented behavior.
+
+## 9. AI Assistant Workflow Constraints
+
+When acting as an AI assistant in this repository:
+
+- Stashing changes (`git stash`) is permitted, but deleting a stash (`git stash drop` or `git stash clear`) is strictly forbidden so the user can review past AI work.
+- Always ask for explicit user confirmation before executing `git commit` or `git push`. This ensures the user can review the AI's changes before they are recorded or pushed.
